@@ -1,0 +1,12 @@
+node_modules
+dist
+release
+src/config.js
+.parcel-cache
+.DS_Store
+*.log
+# Test files
+search_test.*
+puter_test.html
+temp_genai_repo
+docs.md

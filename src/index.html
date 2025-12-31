@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>JARVIS - Neural Link</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700&family=Rajdhani:wght@300;400;500;600&display=swap');
+
+    html,
+    body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      background: transparent !important;
+      background-color: transparent !important;
+      overflow: hidden;
+      font-family: 'Rajdhani', sans-serif;
+    }
+
+    canvas {
+      display: block;
+      position: absolute;
+      top: 0;
+      left: 0;
+      z-index: 1;
+      background: transparent !important;
+      background-color: rgba(0, 0, 0, 0) !important;
+    }
+
+    /* Jarvis Text Display - Glossy Orb Style */
+    #jarvis-display {
+      position: fixed;
+      bottom: 140px;
+      left: 50%;
+      transform: translateX(-50%);
+      width: 80%;
+      max-width: 800px;
+      min-height: 80px;
+      background: rgba(6, 182, 212, 0.1);
+      /* Slightly more visible for floating effect */
+      backdrop-filter: blur(10px);
+      border: 1px solid rgba(6, 182, 212, 0.1);
+      border-radius: 30px;
+      padding: 25px 40px;
+      color: #e2e8f0;
+      font-size: 20px;
+      line-height: 1.6;
+      z-index: 1000;
+      display: none;
+      box-shadow: 0 0 30px rgba(0, 0, 0, 0.5), inset 0 0 20px rgba(6, 182, 212, 0.1);
+      text-align: center;
+      transition: all 0.5s ease;
+    }
+
+    #jarvis-display.active {
+      display: block;
+      animation: float 3s ease-in-out infinite;
+    }
+
+    @keyframes float {
+
+      0%,
+      100% {
+        transform: translate(-50%, 0px);
+      }
+
+      50% {
+        transform: translate(-50%, -10px);
+      }
+    }
+
+    #jarvis-text {
+      margin: 0;
+      word-wrap: break-word;
+      text-shadow: 0 0 10px rgba(34, 211, 238, 0.3);
+    }
+
+    .typing-cursor {
+      display: inline-block;
+      width: 2px;
+      height: 20px;
+      background: #00ffff;
+      animation: blink 1s infinite;
+      margin-left: 5px;
+      vertical-align: middle;
+    }
+
+    @keyframes blink {
+
+      0%,
+      50% {
+        opacity: 1;
+      }
+
+      51%,
+      100% {
+        opacity: 0;
+      }
+    }
+
+    /* Command Input Box - Orb Aesthetic */
+    #command-input-container {
+      position: fixed;
+      bottom: 40px;
+      left: 50%;
+      transform: translateX(-50%);
+      width: 60%;
+      max-width: 600px;
+      z-index: 1001;
+      transition: all 0.3s ease;
+    }
+
+    #command-input {
+      width: 100%;
+      padding: 18px 30px;
+      background: rgba(0, 0, 0, 0.6);
+      backdrop-filter: blur(20px);
+      border: 1px solid rgba(6, 182, 212, 0.3);
+      border-radius: 40px;
+      color: #fff;
+      font-size: 16px;
+      font-family: 'Orbitron', sans-serif;
+      outline: none;
+      box-shadow: 0 0 20px rgba(0, 0, 0, 0.5), inset 0 0 10px rgba(6, 182, 212, 0.1);
+      letter-spacing: 1px;
+      text-align: center;
+      transition: all 0.3s ease;
+    }
+
+    #command-input::placeholder {
+      color: rgba(6, 182, 212, 0.4);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 2px;
+    }
+
+    #command-input:focus {
+      border-color: #06b6d4;
+      box-shadow: 0 0 30px rgba(6, 182, 212, 0.3), inset 0 0 15px rgba(6, 182, 212, 0.1);
+      width: 110%;
+    }
+
+    /* Camera Feed HUD */
+    #camera-container {
+      position: fixed;
+      top: 30px;
+      right: 30px;
+      width: 220px;
+      height: 160px;
+      border: 1px solid rgba(6, 182, 212, 0.3);
+      border-radius: 20px;
+      overflow: hidden;
+      display: none;
+      z-index: 1002;
+      box-shadow: 0 0 20px rgba(0, 0, 0, 0.4);
+      background: #000;
+      backdrop-filter: blur(10px);
+    }
+
+    #camera-feed {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      opacity: 0.8;
+    }
+
+    #camera-container.active {
+      display: block;
+    }
+
+    #media-output-container {
+      position: fixed;
+      top: 50%;
+      right: 40px;
+      transform: translateY(-50%);
+      width: 350px;
+      height: auto;
+      z-index: 1003;
+      display: none;
+      pointer-events: none;
+      transition: all 0.5s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+    }
+
+    #media-output-container.active {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      pointer-events: auto;
+    }
+
+    #media-image {
+      width: 100%;
+      border-radius: 15px;
+      border: 2px solid rgba(6, 182, 212, 0.4);
+      box-shadow: 0 0 30px rgba(0, 0, 0, 0.6), 0 0 20px rgba(6, 182, 212, 0.2);
+    }
+
+    #media-loading {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      gap: 15px;
+      width: 100%;
+    }
+
+    #media-output-container.loading #media-loading {
+      display: flex;
+    }
+
+    #media-output-container.loading #media-image {
+      opacity: 0.3;
+      filter: blur(5px);
+    }
+
+    .neural-spinner {
+      width: 40px;
+      height: 40px;
+      border: 3px solid rgba(6, 182, 212, 0.1);
+      border-top-color: #06b6d4;
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+    }
+
+    .loading-text {
+      font-family: 'Orbitron', sans-serif;
+      font-size: 10px;
+      color: #06b6d4;
+      text-transform: uppercase;
+      letter-spacing: 2px;
+      text-shadow: 0 0 10px rgba(6, 182, 212, 0.5);
+    }
+
+    @keyframes spin {
+      to {
+        transform: rotate(360deg);
+      }
+    }
+
+    /* Status Bar HUD */
+    #status-hud {
+      position: fixed;
+      top: 30px;
+      left: 30px;
+      z-index: 1004;
+      pointer-events: none;
+    }
+
+    .hud-stat {
+      font-family: 'Orbitron', sans-serif;
+      font-size: 10px;
+      color: rgba(6, 182, 212, 0.6);
+      text-transform: uppercase;
+      letter-spacing: 2px;
+      margin-bottom: 5px;
+    }
+
+    #connection-indicator {
+      width: 100px;
+      height: 2px;
+      background: rgba(255, 255, 255, 0.1);
+      border-radius: 2px;
+      overflow: hidden;
+    }
+
+    #status-progress {
+      width: 0%;
+      height: 100%;
+      background: #06b6d4;
+      transition: width 0.5s ease;
+      box-shadow: 0 0 10px #06b6d4;
+    }
+
+    /* Grounded Sources HUD */
+    #sources-container {
+      position: fixed;
+      left: 30px;
+      bottom: 250px;
+      width: 250px;
+      z-index: 1005;
+      pointer-events: auto;
+      transition: all 0.5s ease;
+      opacity: 0;
+      transform: translateX(-20px);
+    }
+
+    #sources-container.active {
+      opacity: 1;
+      transform: translateX(0);
+    }
+
+    .hud-header {
+      font-family: 'Orbitron', sans-serif;
+      font-size: 10px;
+      color: #06b6d4;
+      text-transform: uppercase;
+      letter-spacing: 2px;
+      margin-bottom: 10px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .hud-header::after {
+      content: '';
+      flex: 1;
+      height: 1px;
+      background: linear-gradient(90deg, rgba(6, 182, 212, 0.5), transparent);
+    }
+
+    #sources-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .source-card {
+      background: rgba(15, 23, 42, 0.6);
+      backdrop-filter: blur(10px);
+      border: 1px solid rgba(6, 182, 212, 0.2);
+      border-radius: 8px;
+      padding: 10px;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      animation: slideIn 0.3s ease-out forwards;
+    }
+
+    .source-card:hover {
+      background: rgba(6, 182, 212, 0.1);
+      border-color: rgba(6, 182, 212, 0.5);
+      transform: translateX(5px);
+    }
+
+    .source-title {
+      font-size: 11px;
+      color: #e2e8f0;
+      font-weight: 600;
+      margin-bottom: 2px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .source-url {
+      font-size: 9px;
+      color: #64748b;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    @keyframes slideIn {
+      from {
+        opacity: 0;
+        transform: translateX(-10px);
+      }
+
+      to {
+        opacity: 1;
+        transform: translateX(0);
+      }
+    }
+  </style>
+</head>
+
+<body>
+  <!-- Shaders -->
+  <script id="vertexshader" type="x-shader/x-vertex">
+    uniform float u_time;
+    uniform float u_frequency;
+
+    vec3 mod289(vec3 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+    vec4 mod289(vec4 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+    vec4 permute(vec4 x) { return mod289(((x*34.0)+10.0)*x); }
+    vec4 taylorInvSqrt(vec4 r) { return 1.79284291400159 - 0.85373472095314 * r; }
+    vec3 fade(vec3 t) { return t*t*t*(t*(t*6.0-15.0)+10.0); }
+
+    float pnoise(vec3 P, vec3 rep) {
+      vec3 Pi0 = mod(floor(P), rep);
+      vec3 Pi1 = mod(Pi0 + vec3(1.0), rep);
+      Pi0 = mod289(Pi0);
+      Pi1 = mod289(Pi1);
+      vec3 Pf0 = fract(P);
+      vec3 Pf1 = Pf0 - vec3(1.0);
+
+      vec4 ix = vec4(Pi0.x, Pi1.x, Pi0.x, Pi1.x);
+      vec4 iy = vec4(Pi0.yy, Pi1.yy);
+      vec4 iz0 = Pi0.zzzz;
+      vec4 iz1 = Pi1.zzzz;
+
+      vec4 ixy = permute(permute(ix) + iy);
+      vec4 ixy0 = permute(ixy + iz0);
+      vec4 ixy1 = permute(ixy + iz1);
+
+      vec4 gx0 = ixy0 * (1.0 / 7.0);
+      vec4 gy0 = fract(floor(gx0) * (1.0 / 7.0)) - 0.5;
+      gx0 = fract(gx0);
+      vec4 gz0 = vec4(0.5) - abs(gx0) - abs(gy0);
+      vec4 sz0 = step(gz0, vec4(0.0));
+      gx0 -= sz0 * (step(0.0, gx0) - 0.5);
+      gy0 -= sz0 * (step(0.0, gy0) - 0.5);
+
+      vec4 gx1 = ixy1 * (1.0 / 7.0);
+      vec4 gy1 = fract(floor(gx1) * (1.0 / 7.0)) - 0.5;
+      gx1 = fract(gx1);
+      vec4 gz1 = vec4(0.5) - abs(gx1) - abs(gy1);
+      vec4 sz1 = step(gz1, vec4(0.0));
+      gx1 -= sz1 * (step(0.0, gx1) - 0.5);
+      gy1 -= sz1 * (step(0.0, gy1) - 0.5);
+
+      vec3 g000 = vec3(gx0.x,gy0.x,gz0.x);
+      vec3 g100 = vec3(gx0.y,gy0.y,gz0.y);
+      vec3 g010 = vec3(gx0.z,gy0.z,gz0.z);
+      vec3 g110 = vec3(gx0.w,gy0.w,gz0.w);
+      vec3 g001 = vec3(gx1.x,gy1.x,gz1.x);
+      vec3 g101 = vec3(gx1.y,gy1.y,gz1.y);
+      vec3 g011 = vec3(gx1.z,gy1.z,gz1.z);
+      vec3 g111 = vec3(gx1.w,gy1.w,gz1.w);
+
+      vec4 norm0 = taylorInvSqrt(vec4(dot(g000, g000), dot(g010, g010), dot(g100, g100), dot(g110, g110)));
+      g000 *= norm0.x;
+      g010 *= norm0.y;
+      g100 *= norm0.z;
+      g110 *= norm0.w;
+      vec4 norm1 = taylorInvSqrt(vec4(dot(g001, g001), dot(g011, g011), dot(g101, g101), dot(g111, g111)));
+      g001 *= norm1.x;
+      g011 *= norm1.y;
+      g101 *= norm1.z;
+      g111 *= norm1.w;
+
+      float n000 = dot(g000, Pf0);
+      float n100 = dot(g100, vec3(Pf1.x, Pf0.yz));
+      float n010 = dot(g010, vec3(Pf0.x, Pf1.y, Pf0.z));
+      float n110 = dot(g110, vec3(Pf1.xy, Pf0.z));
+      float n001 = dot(g001, vec3(Pf0.xy, Pf1.z));
+      float n101 = dot(g101, vec3(Pf1.x, Pf0.y, Pf1.z));
+      float n011 = dot(g011, vec3(Pf0.x, Pf1.yz));
+      float n111 = dot(g111, Pf1);
+
+      vec3 fade_xyz = fade(Pf0);
+      vec4 n_z = mix(vec4(n000, n100, n010, n110), vec4(n001, n101, n011, n111), fade_xyz.z);
+      vec2 n_yz = mix(n_z.xy, n_z.zw, fade_xyz.y);
+      float n_xyz = mix(n_yz.x, n_yz.y, fade_xyz.x); 
+      return 2.2 * n_xyz;
+    }
+
+    void main() {
+      float noise = 3.0 * pnoise(position + u_time, vec3(10.0));
+      float displacement = (u_frequency / 30.) * (noise / 10.);
+      vec3 newPosition = position + normal * displacement;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(newPosition, 1.0);
+    }
+  </script>
+
+  <script id="fragmentshader" type="x-shader/x-fragment">
+    uniform float u_red;
+    uniform float u_green;
+    uniform float u_blue;
+    void main() {
+      gl_FragColor = vec4(u_red, u_green, u_blue, 0.85);
+    }
+  </script>
+
+  <!-- HUD Control -->
+  <div id="status-hud">
+    <div class="hud-stat">Neural Link: <span id="status-text">OFFLINE</span></div>
+    <div id="connection-indicator">
+      <div id="status-progress"></div>
+    </div>
+  </div>
+
+  <!-- Jarvis Text Display -->
+  <div id="jarvis-display">
+    <p id="jarvis-text"></p>
+  </div>
+
+  <!-- Command Input -->
+  <div id="command-input-container">
+    <input type="text" id="command-input" placeholder="Communicate with Jarvis...">
+  </div>
+
+  <!-- Camera HUD -->
+  <div id="camera-container">
+    <video id="camera-feed" autoplay playsinline muted></video>
+  </div>
+
+  <!-- Media Overlay -->
+  <div id="media-output-container">
+    <div id="media-loading">
+      <div class="neural-spinner"></div>
+      <div class="loading-text">Neural Synthesis...</div>
+    </div>
+    <img id="media-image" src="" alt="Gemini Output">
+  </div>
+
+  <!-- Grounded Intelligence HUD -->
+  <div id="sources-container">
+    <div class="hud-header">Grounded Intel</div>
+    <div id="sources-list"></div>
+  </div>
+
+  <script type="module" src="./js/scripts.js"></script>
+</body>
+
+</html>
