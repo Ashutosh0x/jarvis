@@ -67,7 +67,8 @@ JARVIS is designed to act as a central nervous system for your desktop environme
 1. Run npm run electron:build to generate the standalone Windows installer.
 2. The executable will be located in the release folder.
 
-## Distribution and Licensing
-This project is licensed under the ISC License. Contributions are welcome to enhance the neural link and visual capabilities of Jarvis.
+## Labels
+AI Assistant, Audio Visualizer, Electron, Three.js, Gemini AI, Productivity
 
-Developed by Ashutosh Kumar Singh (Ashutosh0x)
+---
+Developed with 💖 by **Ashutosh Kumar Singh**
