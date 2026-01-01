@@ -1,6 +1,6 @@
-const { app, BrowserWindow, ipcMain, desktopCapturer, clipboard } = require('electron');
+const { app, BrowserWindow, ipcMain, desktopCapturer, clipboard, shell } = require('electron');
 const path = require('path');
-const { exec } = require('child_process');
+const { exec, execFile } = require('child_process');
 const os = require('os');
 const fs = require('fs').promises;
 
@@ -9,6 +9,64 @@ const fs = require('fs').promises;
 // app.disableHardwareAcceleration();
 
 let mainWindow;
+
+/* =========================
+   SECURITY UTILITIES
+========================= */
+
+// Whitelist of allowed applications (CRITICAL: no arbitrary execution)
+const ALLOWED_APPS = {
+    chrome: { path: 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe', args: [] },
+    notepad: { path: 'notepad.exe', args: [] },
+    explorer: { path: 'explorer.exe', args: [] },
+    vscode: { path: 'code', args: [] },
+    downloads: { path: 'explorer.exe', args: [] },
+    calculator: { path: 'calc.exe', args: [] },
+    paint: { path: 'mspaint.exe', args: [] }
+};
+
+// Validate and sanitize file paths to prevent path traversal
+function validatePath(requestedPath) {
+    const homedir = os.homedir();
+    const allowedRoots = [
+        path.join(homedir, 'Downloads'),
+        path.join(homedir, 'Documents'),
+        path.join(homedir, 'Desktop'),
+        path.join(homedir, 'Pictures'),
+        path.join(homedir, 'Videos'),
+        path.join(homedir, 'Music')
+    ];
+
+    // Normalize and resolve the path
+    const resolvedPath = path.resolve(requestedPath);
+
+    // Check if path is within allowed directories
+    const isAllowed = allowedRoots.some(root => resolvedPath.startsWith(root));
+
+    if (!isAllowed) {
+        throw new Error(`Access denied: Path '${requestedPath}' is outside allowed directories`);
+    }
+
+    // Block path traversal attempts
+    if (requestedPath.includes('..') || requestedPath.includes('%')) {
+        throw new Error('Invalid path: Path traversal not allowed');
+    }
+
+    return resolvedPath;
+}
+
+// Validate URL format
+function validateUrl(url) {
+    try {
+        const parsed = new URL(url);
+        if (!['http:', 'https:'].includes(parsed.protocol)) {
+            throw new Error('Only HTTP and HTTPS URLs are allowed');
+        }
+        return parsed.href;
+    } catch (e) {
+        throw new Error(`Invalid URL: ${url}`);
+    }
+}
 
 function createWindow() {
     mainWindow = new BrowserWindow({
@@ -78,74 +136,116 @@ app.on('window-all-closed', () => {
    IPC / SYSTEM HANDLERS
 ========================= */
 
-const apps = {
-    chrome: 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-    notepad: 'notepad.exe',
-    explorer: 'explorer.exe',
-    vscode: 'code',
-    downloads: 'explorer.exe'
-};
-
+// SECURITY: Use whitelist-only app launching - NO arbitrary command execution
 ipcMain.on('open-app', (event, appName) => {
     try {
-        if (appName === 'downloads') {
-            const downloadsPath = path.join(os.homedir(), 'Downloads');
-            exec(`explorer "${downloadsPath}"`);
-        } else if (appName === 'vscode') {
-            exec('code');
-        } else if (apps[appName]) {
-            exec(`"${apps[appName]}"`);
-        } else {
-            exec(appName);
+        // Sanitize input - only allow alphanumeric app names
+        const sanitizedName = String(appName).toLowerCase().replace(/[^a-z0-9]/g, '');
+
+        if (!ALLOWED_APPS[sanitizedName]) {
+            event.reply('app-opened', {
+                success: false,
+                error: `Application '${appName}' is not in the allowed list`
+            });
+            return;
         }
-        event.reply('app-opened', { success: true, app: appName });
+
+        const appConfig = ALLOWED_APPS[sanitizedName];
+
+        if (sanitizedName === 'downloads') {
+            const downloadsPath = path.join(os.homedir(), 'Downloads');
+            // Use shell.openPath for safe directory opening
+            shell.openPath(downloadsPath);
+        } else if (sanitizedName === 'vscode') {
+            // VS Code uses 'code' command
+            exec('code', (error) => {
+                if (error) console.warn('VS Code launch warning:', error.message);
+            });
+        } else {
+            // Use execFile for other apps (safer than exec)
+            execFile(appConfig.path, appConfig.args, (error) => {
+                if (error) console.warn(`App launch warning for ${sanitizedName}:`, error.message);
+            });
+        }
+
+        event.reply('app-opened', { success: true, app: sanitizedName });
     } catch (error) {
         event.reply('app-opened', { success: false, error: error.message });
     }
 });
 
+// SECURITY: Only allow whitelisted system commands with proper error handling
 ipcMain.on('system-command', (event, command) => {
+    const sanitizedCmd = String(command).toLowerCase().replace(/[^a-z-]/g, '');
+
+    const executeCommand = (cmd, successMsg) => {
+        exec(cmd, (error, stdout, stderr) => {
+            if (error) {
+                console.error(`System command error (${sanitizedCmd}):`, error.message);
+                event.reply('system-command-result', { success: false, error: error.message });
+            } else {
+                event.reply('system-command-result', { success: true, command: sanitizedCmd });
+            }
+        });
+    };
+
     try {
-        switch (command) {
+        switch (sanitizedCmd) {
             case 'shutdown':
-                exec('shutdown /s /t 5');
+                executeCommand('shutdown /s /t 5');
                 break;
             case 'restart':
-                exec('shutdown /r /t 5');
+                executeCommand('shutdown /r /t 5');
                 break;
             case 'mute':
-                exec('nircmd mutesysvolume 1');
+                // Use PowerShell instead of nircmd (native, no external dependency)
+                executeCommand('powershell -Command "(New-Object -ComObject WScript.Shell).SendKeys([char]173)"');
                 break;
             case 'volume-up':
-                exec('nircmd changesysvolume 2000');
+                // Use PowerShell for volume control
+                executeCommand('powershell -Command "(New-Object -ComObject WScript.Shell).SendKeys([char]175)"');
                 break;
             case 'brightness-up':
-                exec('powershell -Command "(Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightnessMethods).WmiSetBrightness(1,80)"');
+                executeCommand('powershell -Command "(Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightnessMethods).WmiSetBrightness(1,80)"');
                 break;
             default:
-                console.log('Unknown command:', command);
+                console.log('Unknown/disallowed command:', command);
+                event.reply('system-command-result', { success: false, error: 'Unknown command' });
+                return;
         }
-        event.reply('system-command-result', { success: true, command });
     } catch (error) {
         event.reply('system-command-result', { success: false, error: error.message });
     }
 });
 
-// Screen Capture Handler
+// Screen Capture Handler - Returns actual screenshot as base64
 ipcMain.handle('capture-screen', async () => {
     try {
-        const sources = await desktopCapturer.getSources({ types: ['screen'] });
+        const sources = await desktopCapturer.getSources({
+            types: ['screen'],
+            thumbnailSize: { width: 1920, height: 1080 }
+        });
+
         if (sources.length === 0) {
             throw new Error('No screen sources available');
         }
 
         const primarySource = sources[0];
-        const screenshotPath = path.join(os.tmpdir(), `jarvis-screenshot-${Date.now()}.png`);
 
-        return { sourceId: primarySource.id, path: screenshotPath };
+        // Get the thumbnail as a NativeImage and convert to base64
+        const thumbnail = primarySource.thumbnail;
+        const base64Image = thumbnail.toDataURL();
+
+        return {
+            success: true,
+            sourceId: primarySource.id,
+            image: base64Image,
+            width: thumbnail.getSize().width,
+            height: thumbnail.getSize().height
+        };
     } catch (error) {
         console.error('Screen capture error:', error);
-        throw error;
+        return { success: false, error: error.message };
     }
 });
 
@@ -159,38 +259,50 @@ ipcMain.handle('perform-ocr', async (event, imagePath) => {
     }
 });
 
-// File Operations Handler
+// File Operations Handler - SECURITY: All paths validated against allowed directories
 ipcMain.handle('file-operation', async (event, operation, ...args) => {
     try {
-        switch (operation) {
-            case 'create-folder':
-                const folderPath = args[0];
+        const sanitizedOp = String(operation).toLowerCase().replace(/[^a-z-]/g, '');
+
+        switch (sanitizedOp) {
+            case 'create-folder': {
+                const folderPath = validatePath(args[0]);
                 await fs.mkdir(folderPath, { recursive: true });
                 return { success: true, path: folderPath };
+            }
 
-            case 'delete-file':
-                const filePath = args[0];
+            case 'delete-file': {
+                const filePath = validatePath(args[0]);
+                // Extra safety: only allow deletion of files in Downloads
+                if (!filePath.includes(path.join(os.homedir(), 'Downloads'))) {
+                    throw new Error('File deletion only allowed in Downloads folder');
+                }
                 await fs.unlink(filePath);
                 return { success: true, path: filePath };
+            }
 
-            case 'list-files':
-                const dirPath = args[0] || os.homedir();
+            case 'list-files': {
+                const dirPath = args[0] ? validatePath(args[0]) : path.join(os.homedir(), 'Downloads');
                 const files = await fs.readdir(dirPath);
                 return { success: true, files };
+            }
 
-            case 'read-file':
-                const readPath = args[0];
+            case 'read-file': {
+                const readPath = validatePath(args[0]);
                 const content = await fs.readFile(readPath, 'utf-8');
                 return { success: true, content };
+            }
 
-            case 'search-files':
-                const searchDir = args[0] || os.homedir();
-                const pattern = args[1] || '*';
+            case 'search-files': {
+                const searchDir = args[0] ? validatePath(args[0]) : path.join(os.homedir(), 'Downloads');
+                // Sanitize search pattern to prevent regex injection
+                const pattern = String(args[1] || '').replace(/[^a-zA-Z0-9._-]/g, '');
                 const allFiles = await fs.readdir(searchDir, { withFileTypes: true });
                 const matchingFiles = allFiles
-                    .filter(file => file.name.includes(pattern))
+                    .filter(file => file.name.toLowerCase().includes(pattern.toLowerCase()))
                     .map(file => file.name);
                 return { success: true, files: matchingFiles };
+            }
 
             default:
                 throw new Error(`Unknown file operation: ${operation}`);
@@ -201,12 +313,14 @@ ipcMain.handle('file-operation', async (event, operation, ...args) => {
     }
 });
 
-// Website Opening Handler
+// Website Opening Handler - SECURITY: Validate URL and use shell.openExternal (safe)
 ipcMain.on('open-website', (event, url) => {
     try {
-        exec(`start ${url}`);
-        event.reply('website-opened', { success: true, url });
+        const safeUrl = validateUrl(url);
+        shell.openExternal(safeUrl);
+        event.reply('website-opened', { success: true, url: safeUrl });
     } catch (error) {
+        console.error('Website open error:', error.message);
         event.reply('website-opened', { success: false, error: error.message });
     }
 });

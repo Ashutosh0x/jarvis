@@ -44,32 +44,42 @@ class AudioStreamer {
         this.audioWorklet = null;
         this.mediaStream = null;
         this.isStreaming = false;
+        this.isMuted = false; // 🔥 FIX: Initialize as NOT muted
         this.sampleRate = 16000;
+        console.log("🎙️ [INIT] AudioStreamer created, isMuted:", this.isMuted);
     }
 
     async start() {
         try {
+            console.log("🎙️ [START] Requesting microphone access...");
             this.mediaStream = await navigator.mediaDevices.getUserMedia({
                 audio: {
                     sampleRate: this.sampleRate,
-                    echoCancellation: true,
-                    noiseSuppression: true,
-                    autoGainControl: true,
+                    // ✅ OPTIMIZATION: Disable all browser-level processing for near-zero latency
+                    echoCancellation: false,
+                    noiseSuppression: false,
+                    autoGainControl: false,
                 },
             });
+            console.log("🎙️ [START] Microphone access GRANTED");
 
             this.audioContext = new (window.AudioContext || window.webkitAudioContext)({
                 sampleRate: this.sampleRate,
             });
+            console.log("🎙️ [START] AudioContext created, state:", this.audioContext.state);
 
             // ✅ Bypass autoplay policy
             if (this.audioContext.state === 'suspended') {
+                console.log("🎙️ [START] AudioContext suspended, resuming...");
                 await this.audioContext.resume();
             }
+            console.log("🎙️ [START] AudioContext state:", this.audioContext.state);
 
             await this.audioContext.audioWorklet.addModule(captureProcessorUrl);
+            console.log("🎙️ [START] AudioWorklet module loaded");
 
             this.audioWorklet = new AudioWorkletNode(this.audioContext, "audio-capture-processor");
+            console.log("🎙️ [START] AudioWorkletNode created, isMuted:", this.isMuted);
 
             this.audioWorklet.port.onmessage = (event) => {
                 if (!this.isStreaming) return;
@@ -77,13 +87,31 @@ class AudioStreamer {
                 if (event.data.type === "audio") {
                     const float32Array = event.data.data;
 
-                    // Volume calculation
+                    // Volume calculation (always calculate for visualization)
                     let sum = 0;
                     for (let i = 0; i < float32Array.length; i++) {
                         sum += float32Array[i] * float32Array[i];
                     }
                     const rms = Math.sqrt(sum / float32Array.length);
                     this.onVolume(rms * 100);
+
+                    // Skip audio sending if muted (Push-to-Talk)
+                    if (this.isMuted) {
+                        // 🔇 VERBOSE: Log that we're muted and not sending
+                        if (!this._mutedLogThrottle) {
+                            console.log("🔇 [VERBOSE] Mic is MUTED - not sending audio");
+                            this._mutedLogThrottle = true;
+                            setTimeout(() => this._mutedLogThrottle = false, 3000);
+                        }
+                        return;
+                    }
+
+                    // 🎤 VERBOSE: Log that we're sending audio
+                    if (!this._audioLogThrottle) {
+                        console.log("🎤 [VERBOSE] Sending audio chunk to Gemini, size:", float32Array.length);
+                        this._audioLogThrottle = true;
+                        setTimeout(() => this._audioLogThrottle = false, 2000);
+                    }
 
                     // Float32 to PCM16
                     const int16Array = new Int16Array(float32Array.length);
@@ -99,9 +127,15 @@ class AudioStreamer {
 
             const source = this.audioContext.createMediaStreamSource(this.mediaStream);
             source.connect(this.audioWorklet);
-            this.audioWorklet.connect(this.audioContext.destination);
+
+            // ✅ FIX: Routing mic-to-speaker causes echo and latency. Use a silent gain node.
+            const silentGain = this.audioContext.createGain();
+            silentGain.gain.value = 0;
+            this.audioWorklet.connect(silentGain);
+            silentGain.connect(this.audioContext.destination);
 
             this.isStreaming = true;
+            this.isMuted = false;
             console.log("LiveService: Audio capture started");
         } catch (error) {
             console.error("LiveService: Failed to start audio capture", error);
@@ -109,8 +143,21 @@ class AudioStreamer {
         }
     }
 
+    // Push-to-Talk: Mute microphone (stop sending audio)
+    mute() {
+        this.isMuted = true;
+        console.log("🔇 [VERBOSE] AudioStreamer: Microphone MUTED");
+    }
+
+    // Push-to-Talk: Unmute microphone (resume sending audio)
+    unmute() {
+        this.isMuted = false;
+        console.log("🎤 [VERBOSE] AudioStreamer: Microphone UNMUTED - now sending audio");
+    }
+
     stop() {
         this.isStreaming = false;
+        this.isMuted = false;
         if (this.audioWorklet) {
             this.audioWorklet.disconnect();
             this.audioWorklet = null;
@@ -305,10 +352,6 @@ export class LiveService {
                         this.isConnected = false;
                         this.onStateChange('DISCONNECTED');
                         this.stopAll();
-
-                        if (wasExceeded && this.retryCount < this.maxRetries) {
-                            this.handleRetry();
-                        }
                     },
                     onerror: (err) => {
                         console.error("LiveService: Session error", err);
@@ -318,6 +361,7 @@ export class LiveService {
                 },
                 config: {
                     responseModalities: ["audio"],
+                    inputAudioTranscription: {},
                     speechConfig: {
                         voiceConfig: {
                             prebuiltVoiceConfig: {
@@ -367,6 +411,24 @@ export class LiveService {
         this.isConnected = false;
     }
 
+    // Push-to-Talk: Mute microphone
+    muteMic() {
+        if (this.streamer) {
+            this.streamer.mute();
+        }
+    }
+
+    // Push-to-Talk: Unmute microphone
+    unmuteMic() {
+        if (this.streamer) {
+            this.streamer.unmute();
+        }
+    }
+
+    // Check if mic is muted
+    get isMicMuted() {
+        return this.streamer ? this.streamer.isMuted : true;
+    }
 
     sendText(text) {
         if (this.isSessionLive()) {
@@ -380,11 +442,37 @@ export class LiveService {
         }
     }
 
+    // 🔥 NEW: Explicitly end turn for near-zero latency response
+    sendTurnComplete() {
+        if (this.isSessionLive()) {
+            console.log("🎙️ [SEND] Manually finalizing turn...");
+            this.session.sendClientContent({
+                turns: [{ role: "user", parts: [{ text: "" }] }],
+                turnComplete: true
+            });
+        }
+    }
+
     async handleMessage(message) {
         // Handle Setup Complete
         if (message.setupComplete) {
             console.log("LiveService: Setup complete");
             return;
+        }
+
+        // Handle Real-time User Speech Transcription (display as user speaks)
+        if (message.serverContent?.inputTranscript) {
+            const transcript = message.serverContent.inputTranscript;
+            console.log("LiveService: User transcript:", transcript);
+            // Display user's speech in real-time
+            this.onMessage({ role: 'user', text: transcript, isTranscript: true });
+        }
+
+        // Handle Real-time AI Output Transcription
+        if (message.serverContent?.outputTranscript) {
+            const transcript = message.serverContent.outputTranscript;
+            console.log("LiveService: AI transcript:", transcript);
+            // This arrives with audio, so text will also be shown
         }
 
         // Handle Interrupted
