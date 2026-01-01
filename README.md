@@ -14,6 +14,10 @@ https://github.com/user-attachments/assets/d450733c-f145-4122-a327-05e669a18c1a
 
 
 
+https://github.com/user-attachments/assets/040a7aa9-1f30-447b-af90-8fe85d9587c9
+
+
+
 
 ## Project Vision
 
@@ -78,3 +82,4 @@ AI Assistant, Audio Visualizer, Electron, Three.js, Gemini AI, Productivity
 
 ---
 Developed with 💖 by **Ashutosh Kumar Singh** ([Ashutosh0x](https://github.com/Ashutosh0x))
+
