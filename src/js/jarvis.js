@@ -62,9 +62,81 @@ class Jarvis {
         // this.initializeVoice(); // Voice is now handled by Gemini Audio
         // this.initializeSpeechRecognition(); // Replaced by LiveService
         this.initializeCommandInput();
+        this.initializePushToTalk();
         this.speakStartupGreeting();
         // Start Gemini connection
         this.liveService.connect();
+    }
+
+    // Initialize Push-to-Talk (Space key to activate mic)
+    initializePushToTalk() {
+        // PTT mode: false = always listening (default), true = hold space to talk
+        this.pttMode = this.settings.get('pttMode') ?? false;
+        this.pttActive = false;
+        this.pttIndicator = document.getElementById('ptt-indicator');
+
+        // Update indicator based on mode
+        if (this.pttMode) {
+            // PTT mode: start muted
+            setTimeout(() => {
+                if (this.liveService && this.liveService.streamer) {
+                    this.liveService.muteMic();
+                }
+                this.updatePTTIndicator(false);
+            }, 2000);
+        } else {
+            // Always-on mode: hide PTT indicator, mic is always active
+            if (this.pttIndicator) {
+                this.pttIndicator.textContent = '🎙️ ALWAYS LISTENING';
+                this.pttIndicator.classList.add('active');
+            }
+        }
+
+        // Space key handlers
+        document.addEventListener('keydown', (e) => {
+            // Don't trigger PTT if typing in input
+            if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+
+            if (e.code === 'Space' && this.pttMode && !this.pttActive) {
+                e.preventDefault();
+                this.pttActive = true;
+                this.liveService.unmuteMic();
+                this.updatePTTIndicator(true);
+                console.log('PTT: Microphone activated');
+            }
+        });
+
+        document.addEventListener('keyup', (e) => {
+            if (e.code === 'Space' && this.pttMode && this.pttActive) {
+                e.preventDefault();
+                this.pttActive = false;
+                this.liveService.muteMic();
+                // 🔥 FIX: Send explicit turn complete when user stops speaking for faster response
+                this.liveService.sendTurnComplete();
+                this.updatePTTIndicator(false);
+                console.log('PTT: Microphone deactivated & Turn completed');
+            }
+        });
+
+        console.log('Push-to-Talk initialized (Space key)');
+    }
+
+    // Update PTT visual indicator
+    updatePTTIndicator(active) {
+        if (this.pttIndicator) {
+            if (active) {
+                this.pttIndicator.classList.add('active');
+                this.pttIndicator.textContent = '🎙️ SPEAKING';
+            } else {
+                this.pttIndicator.classList.remove('active');
+                this.pttIndicator.textContent = '⏸️ HOLD SPACE TO TALK';
+            }
+        }
+
+        // Also update status bar color
+        if (this.statusBar) {
+            this.statusBar.style.background = active ? '#22c55e' : '#06b6d4';
+        }
     }
 
     // Apply settings to Jarvis
@@ -170,6 +242,16 @@ class Jarvis {
 
             if (state === 'CONNECTED') {
                 this.displayText("Systems online. Neural link established.", null);
+
+                // 🔥 AUTO-UNMUTE: If in always-on mode, ensure mic is active
+                if (!this.pttMode) {
+                    setTimeout(() => {
+                        if (this.liveService) {
+                            this.liveService.unmuteMic();
+                            console.log("🎙️ Always-on mode: Mic unmuted");
+                        }
+                    }, 500);
+                }
             } else if (state === 'RETRYING') {
                 this.displayText("Quota exceeded. Recalibrating link...", null);
             } else if (state === 'ERROR') {
@@ -178,10 +260,46 @@ class Jarvis {
         };
 
         this.liveService.onMessage = (msg) => {
+            // 🔥 DEBUG: Log all incoming messages
+            console.log("GEMINI EVENT:", msg);
+
+            // 🔥 REAL-TIME USER SPEECH TRANSCRIPTION (event-based)
+            // Check for type field (event-based Gemini Live format)
+            if (msg.type === 'input_audio_transcription.result') {
+                if (msg.text && msg.text.trim()) {
+                    console.log("🎤 [TRANSCRIPT] User said:", msg.text);
+                    this.appendLiveTranscript(msg.text);
+                    this.logToHUD(msg.text, 'user');
+                }
+                return;
+            }
+
+            // Also check serverContent.inputTranscript (SDK format)
+            if (msg.serverContent?.inputTranscript) {
+                const transcript = msg.serverContent.inputTranscript;
+                console.log("🎤 [TRANSCRIPT] User said:", transcript);
+                this.appendLiveTranscript(transcript);
+                this.logToHUD(transcript, 'user');
+                return;
+            }
+
+            // Model audio/text output from serverContent
+            if (msg.serverContent?.modelTurn?.parts) {
+                for (const part of msg.serverContent.modelTurn.parts) {
+                    if (part.text) {
+                        this.displayText(part.text, null);
+                        this.logToHUD(part.text, 'model');
+                    }
+                }
+            }
+
+            // Model responses (processed format from liveService)
             if (msg.role === 'model') {
                 if (msg.text) this.displayText(msg.text, null);
                 if (msg.metadata) this.handleRichMedia(msg.metadata);
-            } else if (msg.role === 'system' && msg.metadata?.type === 'search') {
+            }
+            // Search grounding
+            else if (msg.role === 'system' && msg.metadata?.type === 'search') {
                 this.displaySources(msg.metadata.sources);
             }
         };
@@ -191,6 +309,37 @@ class Jarvis {
                 window.visualizerVolume = vol;
             }
         };
+    }
+
+    // 🔥 NEW: Append live transcript (streaming text, no animation)
+    appendLiveTranscript(text) {
+        if (!this.textElement || !this.displayElement) return;
+
+        this.displayElement.classList.add('active');
+
+        // Create live transcript element if not exists
+        if (!this.liveTranscriptElement) {
+            this.liveTranscriptElement = document.createElement('span');
+            this.liveTranscriptElement.id = 'live-transcript';
+            this.liveTranscriptElement.style.color = '#94a3b8';
+            this.liveTranscriptElement.style.fontStyle = 'italic';
+        }
+
+        // Append to existing transcript (streaming effect)
+        this.liveTranscriptElement.textContent += text + ' ';
+
+        // Show in text element if not already there
+        if (!this.textElement.contains(this.liveTranscriptElement)) {
+            this.textElement.innerHTML = '';
+            this.textElement.appendChild(this.liveTranscriptElement);
+        }
+    }
+
+    // Clear live transcript when AI starts responding
+    clearLiveTranscript() {
+        if (this.liveTranscriptElement) {
+            this.liveTranscriptElement.textContent = '';
+        }
     }
 
     updateHUDStatus(state) {
@@ -1076,19 +1225,55 @@ class Jarvis {
         }
     }
 
+    // Screen Analysis Handler - Uses Gemini Vision for OCR + Analysis
     async handleReadScreen() {
         try {
-            this.displayText('Reading screen...', null);
-            if (window.electronAPI && window.electronAPI.captureScreen && window.electronAPI.performOCR) {
-                const screenshot = await window.electronAPI.captureScreen();
-                const ocrText = await window.electronAPI.performOCR(screenshot.path);
-                this.speak(ocrText || 'Could not read text from screen');
+            this.displayText('Analyzing your screen...', null);
+
+            if (!window.electronAPI || !window.electronAPI.captureScreen) {
+                this.speak('Screen analysis is not available in this environment');
+                return;
+            }
+
+            const screenshot = await window.electronAPI.captureScreen();
+
+            if (!screenshot.success) {
+                this.speak('Failed to capture screen');
+                return;
+            }
+
+            // Extract base64 data from data URL
+            const base64Image = screenshot.image.replace(/^data:image\/\w+;base64,/, '');
+
+            // Send to Gemini Vision via LiveService
+            if (this.liveService && this.liveService.isConnected) {
+                // Use sendClientContent with image for vision analysis
+                this.liveService.session.sendClientContent({
+                    turns: [{
+                        role: 'user',
+                        parts: [
+                            {
+                                inlineData: {
+                                    mimeType: 'image/png',
+                                    data: base64Image
+                                }
+                            },
+                            {
+                                text: 'Analyze this screenshot of my screen. Tell me: 1) What application or content is visible? 2) Extract and summarize any visible text. 3) Describe what the user appears to be working on.'
+                            }
+                        ]
+                    }],
+                    turnComplete: true
+                });
             } else {
-                this.speak('Screen reading functionality not available');
+                this.speak('Neural link not connected. Connecting now...');
+                await this.liveService.connect();
+                // Retry after connection
+                setTimeout(() => this.handleReadScreen(), 2000);
             }
         } catch (error) {
-            console.error('Read screen error:', error);
-            this.speak('Failed to read screen');
+            console.error('Screen analysis error:', error);
+            this.speak('Failed to analyze screen');
         }
     }
 

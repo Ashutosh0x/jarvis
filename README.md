@@ -16,27 +16,27 @@ JARVIS is designed to act as a central nervous system for your desktop environme
 ## Comprehensive Feature Set
 
 ### 1. Advanced 3D Visualizer
-- GPU-Accelerated Rendering: Utilizes Three.js for butter-smooth visual performance at 60+ FPS.
-- Floating Orb Aesthetics: A frameless, transparent UI that hovers non-intrusively over any open application.
-- Real-Time Audio Reactivity: The visualizer sphere pulses and transforms dynamically based on your voice or Jarvis's responses.
-- Ambient Color Cycling: Features smooth HSL color transitions during idle states to maintain an active visual presence.
+- **GPU-Accelerated Rendering**: Utilizes Three.js for butter-smooth visual performance at 60+ FPS.
+- **Floating HUD Aesthetics**: A frameless, transparent UI that hovers non-intrusively over any open application.
+- **Real-Time Audio Reactivity**: The visualizer sphere pulses and transforms dynamically based on your voice or Jarvis's responses.
+- **Ambient Color Cycling**: Features smooth HSL color transitions during idle states to maintain an active visual presence.
 
-### 2. Grounded Intelligence and Search
-- Instant Web Grounding: Uses native Google Search retrieval to provide factual, up-to-date information without the latency of traditional web scraping.
-- Grounded Intel HUD: A dedicated side-panel manifests to display source links and citations for all web-retrieved facts.
-- Proactive Verification: The AI is configured to verify real-world data proactively, ensuring maximum accuracy for research and news inquiries.
+### 2. Grounded Intelligence & Real-Time ASR
+- **Google Search Grounding**: Uses native Google Search retrieval to provide factual, up-to-date information instantly.
+- **Streaming Speech-to-Text**: Real-time user transcription displayed in the HUD as you speak, powered by Gemini Live.
+- **Low-Latency Neural Link**: Optimized 16ms audio capture with industry-grade buffering for near-instant conversational turn-around.
+- **Grounded Intel HUD**: A dedicated side-panel manifests to display source links and citations for all web-retrieved facts.
 
-### 3. Neural Synthesis and Vision
-- Image Generation: Create high-fidelity illustrations directly through voice commands via the integrated image generation tool.
-- Visual Cortex: Jarvis can "see" through your camera feed, allowing for features like "Reimagine User" where it transforms the live feed into artistic portraits.
-- Sidebar Preview: All generated media is displayed in a persistent, non-intrusive container on the right side of the screen.
+### 3. Neural Synthesis & Visual Cortex
+- **Image Generation**: Create high-fidelity illustrations directly through voice commands via the integrated image generation tool.
+- **Visual Intelligence**: Jarvis analyzed your live camera feed or current screen contents to provide context-aware insights.
+- **Visual Cortex Preview**: All generated media and camera feeds are displayed in a persistent, non-intrusive container on the right side of the screen.
 
-### 4. System and Productivity Control
-- Application Management: Launch any installed Windows application (Chrome, VS Code, Explorer, etc.) through voice or text.
-- File Operations: Robust handling for folder creation, file deletion, and directory listing across your system.
-- Window Control: Minimize, maximize, or close windows using neural commands.
-- Clipboard Integration: Read from or write to the system clipboard instantly.
-- OS Hardware Control: Voice-activated control over volume, brightness, and system power states (Shutdown/Restart).
+### 4. System & Productivity Control
+- **Security Hardened Execution**: A whitelist-based application launcher and sanitized command handler to ensure safe OS interactions.
+- **OS Hardware Control**: Voice-activated control over volume, brightness, and system power states (Shutdown/Restart).
+- **File & Navigation Support**: Robust handling for folder creation, file deletion, and directory listing across your system.
+- **Clipboard & Logic**: Read from or write to the system clipboard and handle natural language scheduling/reminders.
 
 ### 5. Calendar and Reminders
 - Natural Language Scheduling: Set reminders and add events using natural phrasing (e.g., "Remind me to call John in 10 minutes").

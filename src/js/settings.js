@@ -10,6 +10,7 @@ class SettingsManager {
             voiceName: null, // Will be set automatically to a male voice
             visualizerMode: 'sphere',
             visualizerSensitivity: 1.0,
+            pttMode: false, // Push-to-Talk: false = always listening (default), true = hold space to talk
             apiKeys: {
                 // NOTE: Set your API keys in src/config.js, not here
                 openWeather: ''

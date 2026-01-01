@@ -4,7 +4,7 @@
 class AudioCaptureProcessor extends AudioWorkletProcessor {
     constructor() {
         super();
-        this.bufferSize = 4096;
+        this.bufferSize = 256;
         this.buffer = new Float32Array(this.bufferSize);
         this.bufferIndex = 0;
     }
@@ -22,9 +22,10 @@ class AudioCaptureProcessor extends AudioWorkletProcessor {
                 // When buffer is full, send it to main thread
                 if (this.bufferIndex >= this.bufferSize) {
                     // Send the buffered audio to the main thread
+                    // ✅ FIX: Use new Float32Array(this.buffer) for production-grade GC hygiene
                     this.port.postMessage({
                         type: "audio",
-                        data: this.buffer.slice(),
+                        data: new Float32Array(this.buffer),
                     });
 
                     // Reset buffer

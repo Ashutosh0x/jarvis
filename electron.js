@@ -218,21 +218,34 @@ ipcMain.on('system-command', (event, command) => {
     }
 });
 
-// Screen Capture Handler
+// Screen Capture Handler - Returns actual screenshot as base64
 ipcMain.handle('capture-screen', async () => {
     try {
-        const sources = await desktopCapturer.getSources({ types: ['screen'] });
+        const sources = await desktopCapturer.getSources({
+            types: ['screen'],
+            thumbnailSize: { width: 1920, height: 1080 }
+        });
+
         if (sources.length === 0) {
             throw new Error('No screen sources available');
         }
 
         const primarySource = sources[0];
-        const screenshotPath = path.join(os.tmpdir(), `jarvis-screenshot-${Date.now()}.png`);
 
-        return { sourceId: primarySource.id, path: screenshotPath };
+        // Get the thumbnail as a NativeImage and convert to base64
+        const thumbnail = primarySource.thumbnail;
+        const base64Image = thumbnail.toDataURL();
+
+        return {
+            success: true,
+            sourceId: primarySource.id,
+            image: base64Image,
+            width: thumbnail.getSize().width,
+            height: thumbnail.getSize().height
+        };
     } catch (error) {
         console.error('Screen capture error:', error);
-        throw error;
+        return { success: false, error: error.message };
     }
 });
 
