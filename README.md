@@ -9,6 +9,12 @@
 
 JARVIS is a professional-grade, GPU-accelerated desktop assistant and 3D audio visualizer. It integrates high-speed AI grounding with a translucent user interface to provide a seamless bridge between human interaction and computer control.
 
+
+https://github.com/user-attachments/assets/d450733c-f145-4122-a327-05e669a18c1a
+
+
+
+
 ## Project Vision
 
 JARVIS is designed to act as a central nervous system for your desktop environment, leveraging the Gemini 2.0 Flash Live API for real-time multi-modal communication. It combines specialized system-level tools with web-grounded intelligence to handle everything from file management to complex research queries instantly.
@@ -71,4 +77,4 @@ JARVIS is designed to act as a central nervous system for your desktop environme
 AI Assistant, Audio Visualizer, Electron, Three.js, Gemini AI, Productivity
 
 ---
-Developed with 💖 by **Ashutosh Kumar Singh**
+Developed with 💖 by **Ashutosh Kumar Singh** ([Ashutosh0x](https://github.com/Ashutosh0x))
