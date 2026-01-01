@@ -11,7 +11,8 @@ class SettingsManager {
             visualizerMode: 'sphere',
             visualizerSensitivity: 1.0,
             apiKeys: {
-                openWeather: 'YOUR_OPENWEATHER_API_KEY'
+                // NOTE: Set your API keys in src/config.js, not here
+                openWeather: ''
             },
             theme: 'cyan',
             commandAliases: {}

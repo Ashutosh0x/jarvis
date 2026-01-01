@@ -13,7 +13,8 @@ class Jarvis {
         this.recognition = null;
         this.synthesis = window.speechSynthesis;
         this.selectedVoice = null; // Will be set during initialization
-        this.openWeatherApiKey = 'YOUR_OPENWEATHER_API_KEY'; // Add your key here
+        // API key now loaded exclusively from settings system
+        this.openWeatherApiKey = null;
         this.location = null;
         this.weather = null;
 
@@ -208,6 +209,14 @@ class Jarvis {
         }
     }
 
+    // SECURITY: Sanitize HTML to prevent XSS attacks
+    sanitizeHTML(str) {
+        if (!str) return '';
+        const div = document.createElement('div');
+        div.textContent = str;
+        return div.innerHTML;
+    }
+
     logToHUD(text, role) {
         if (!this.logContainer) return;
 
@@ -220,6 +229,10 @@ class Jarvis {
         entry.className = "text-[11px] group animate-in slide-in-from-left duration-300";
 
         const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+
+        // SECURITY FIX: Sanitize text and role to prevent XSS
+        const safeText = this.sanitizeHTML(text);
+        const safeRole = this.sanitizeHTML(role);
 
         let icon = '';
         let color = 'text-slate-400';
@@ -238,10 +251,10 @@ class Jarvis {
         entry.innerHTML = `
             <div class="flex items-center gap-2 mb-0.5 opacity-60">
                 <span class="font-mono text-[9px]">${time}</span>
-                <span class="text-[9px] uppercase font-bold tracking-tighter">${role}</span>
+                <span class="text-[9px] uppercase font-bold tracking-tighter">${safeRole}</span>
             </div>
             <div class="${color} pl-4 border-l border-slate-800 py-0.5 leading-relaxed truncate hover:whitespace-normal transition-all">
-                ${text}
+                ${safeText}
             </div>
         `;
 
@@ -567,13 +580,14 @@ class Jarvis {
         console.log("Jarvis (UI):", text);
     }
 
-    // Get location from IP
+    // Get location from IP - SECURITY FIX: Use HTTPS endpoint
     async initializeLocation() {
         try {
             const controller = new AbortController();
             const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 second timeout
 
-            const response = await fetch('http://ip-api.com/json', {
+            // SECURITY: Using HTTPS instead of HTTP to protect location data
+            const response = await fetch('https://ipapi.co/json/', {
                 signal: controller.signal,
                 cache: 'no-cache'
             });
@@ -587,9 +601,9 @@ class Jarvis {
             const data = await response.json();
             this.location = {
                 city: data.city || 'Unknown',
-                country: data.country || 'Unknown',
-                lat: data.lat,
-                lon: data.lon
+                country: data.country_name || 'Unknown',
+                lat: data.latitude,
+                lon: data.longitude
             };
         } catch (error) {
             if (error.name === 'AbortError') {
