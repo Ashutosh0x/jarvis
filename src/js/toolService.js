@@ -170,6 +170,72 @@ export async function routeLocalAction(query) {
     }
 }
 
+// Distill DURABLE, STRUCTURED facts from recent interactions for the belief
+// store. Two ideas combined:
+//   - SelfMem: keep only stable, high-signal facts; reject volatile detail
+//     (one-off prices/dates/weather), which stays recoverable from the raw log.
+//   - BeliefMem: emit each fact as an ATTRIBUTE + VALUE with an evidence
+//     strength (prob), so competing values of the same attribute ("browser =
+//     Chrome" vs "browser = Firefox") can be reconciled rather than both stored.
+// JSON-mode keeps the output parseable.
+export async function distillFacts(interactionsText) {
+    const { url, model } = getLocalConfig();
+    try {
+        const res = await fetch(`${url}/api/chat`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                model,
+                stream: false,
+                format: 'json',
+                keep_alive: '60m',
+                options: { temperature: 0 },
+                messages: [
+                    {
+                        role: 'system',
+                        content:
+                            'You consolidate an assistant\'s interaction log into long-term memory. ' +
+                            'Reply ONLY with JSON: {"facts": [{"attribute": string, "value": string, "statement": string, "prob": number}]}. ' +
+                            'Extract only DURABLE, reusable facts about the user or their world: stable preferences, ' +
+                            'identity, tools they use, recurring people/places/projects, and habits. ' +
+                            'For each fact: "attribute" is the short slot it describes (e.g. "preferred browser", "profession", "phone model"); ' +
+                            '"value" is the specific value ("Chrome", "software engineer", "Redmi Note 10 Pro"); ' +
+                            '"statement" is a short third-person sentence about "the user"; ' +
+                            '"prob" is your confidence 0-1 that this is genuinely true and durable. ' +
+                            'REJECT anything volatile or one-off: specific prices, dates, weather, single search queries, ' +
+                            'transient status, or the assistant\'s own replies. If nothing durable is present, return {"facts": []}. ' +
+                            'Return at most 8 facts, deduplicated by attribute.'
+                    },
+                    { role: 'user', content: String(interactionsText).slice(0, 8000) }
+                ]
+            }),
+            signal: AbortSignal.timeout(30000)
+        });
+        if (!res.ok) return { facts: [] };
+        const data = await res.json();
+        const parsed = JSON.parse(data.message?.content || '{}');
+        const raw = Array.isArray(parsed.facts) ? parsed.facts : [];
+        // Normalize + guard. Accept either the structured object or (for
+        // robustness) a bare string, coercing the latter into the schema.
+        const facts = raw.map((f) => {
+            if (typeof f === 'string') {
+                const s = f.trim();
+                return s ? { attribute: s, value: s, statement: s, prob: 0.6 } : null;
+            }
+            const statement = String(f?.statement || f?.value || '').trim();
+            const value = String(f?.value || f?.statement || '').trim();
+            const attribute = String(f?.attribute || statement).trim();
+            const prob = (typeof f?.prob === 'number' && f.prob >= 0 && f.prob <= 1) ? f.prob : 0.6;
+            if (statement.length < 6 || statement.length > 200 || !value) return null;
+            return { attribute, value, statement, prob };
+        }).filter(Boolean).slice(0, 8);
+        return { facts };
+    } catch (e) {
+        console.warn('Fact distillation failed:', e.message);
+        return { facts: [] };
+    }
+}
+
 export async function performSearch(query) {
     try {
         const ai = getClient();

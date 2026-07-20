@@ -28,6 +28,16 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ragLoad: () => ipcRenderer.invoke('rag-load'),
     ragSave: (data) => ipcRenderer.invoke('rag-save', data),
     logTrajectory: (entry) => ipcRenderer.invoke('log-trajectory', entry),
+    // Persistent interaction log (local turns) + its aggregate stats
+    logInteraction: (entry) => ipcRenderer.invoke('log-interaction', entry),
+    getInteractionStats: () => ipcRenderer.invoke('get-interaction-stats'),
+    // Reflection / memory consolidation ("sleep") — read raw experience, persist learnings
+    getInteractions: (opts) => ipcRenderer.invoke('get-interactions', opts),
+    saveReflection: (entry) => ipcRenderer.invoke('save-reflection', entry),
+    getReflections: (opts) => ipcRenderer.invoke('get-reflections', opts),
+    // Confidence ledger for consolidated facts (corroboration gate + decay)
+    loadFactStore: () => ipcRenderer.invoke('load-fact-store'),
+    saveFactStore: (data) => ipcRenderer.invoke('save-fact-store', data),
     // Phone bridge (Wi-Fi notification relay)
     onPhoneNotification: createSafeListener('phone-notification'),
     getPhoneBridgeInfo: () => ipcRenderer.invoke('get-phone-bridge-info'),
@@ -62,6 +72,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
     watchlistGet: () => ipcRenderer.invoke('watchlist-get'),
     watchlistAdd: (entry) => ipcRenderer.invoke('watchlist-add', entry),
     watchlistRemove: (symbol) => ipcRenderer.invoke('watchlist-remove', symbol),
+    // On-demand live quote (name or ticker) and keyless news headlines
+    getQuote: (text) => ipcRenderer.invoke('get-quote', text),
+    getNews: (opts) => ipcRenderer.invoke('get-news', opts),
+    // Historical daily closes for the quant analytics engine
+    getHistory: (opts) => ipcRenderer.invoke('get-history', opts),
     fileOperation: (operation, ...args) => ipcRenderer.invoke('file-operation', operation, ...args),
     openWebsite: (url) => ipcRenderer.send('open-website', url),
     readClipboard: () => ipcRenderer.invoke('read-clipboard'),

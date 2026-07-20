@@ -344,6 +344,24 @@ class RagService {
         return { stored: fresh.length, deduped };
     }
 
+    /**
+     * Remove every chunk matching a predicate, then rebuild the index. Used by
+     * the confidence layer to evict facts that were demoted or archived — a
+     * garbled one-off fact must be able to LEAVE durable memory, not just never
+     * enter it. Returns the number removed.
+     */
+    async forget(predicate) {
+        await this.load();
+        const before = this.chunks.length;
+        this.chunks = this.chunks.filter((c) => !predicate(c));
+        const removed = before - this.chunks.length;
+        if (removed) {
+            this._rebuildIndex(); // postings hold chunk indices — stale after a filter
+            this._scheduleSave();
+        }
+        return removed;
+    }
+
     /* ---------- sparse search: BM25 over the inverted index ---------- */
 
     _idf(df, N) {

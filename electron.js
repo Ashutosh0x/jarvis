@@ -468,12 +468,44 @@ ipcMain.handle('file-operation', async (event, operation, ...args) => {
     }
 });
 
-// Website Opening Handler - SECURITY: Validate URL and use shell.openExternal (safe)
+// Resolve a Chrome executable, or null if none is installed. The hard-coded
+// path in ALLOWED_APPS covers the common install, but Chrome also lands in
+// Program Files (x86) and per-user LocalAppData, so probe all three rather than
+// assume. Cached after the first lookup — the install location does not move.
+let _chromePathCache;
+function resolveChromePath() {
+    if (_chromePathCache !== undefined) return _chromePathCache;
+    const candidates = [
+        ALLOWED_APPS.chrome.path,
+        'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+        path.join(os.homedir(), 'AppData', 'Local', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+    ];
+    _chromePathCache = candidates.find((p) => { try { return fsSync.existsSync(p); } catch { return false; } }) || null;
+    return _chromePathCache;
+}
+
+// Website Opening Handler - SECURITY: validateUrl() enforces http/https only.
+// Opens in Chrome specifically (the user's default browser preference); the URL
+// is passed as an execFile ARGUMENT ARRAY, never a shell string, so a crafted
+// URL cannot inject flags or commands. Falls back to shell.openExternal (the
+// system default browser) when Chrome is not installed, so the feature still
+// works everywhere rather than failing closed.
 ipcMain.on('open-website', (event, url) => {
     try {
         const safeUrl = validateUrl(url);
-        shell.openExternal(safeUrl);
-        event.reply('website-opened', { success: true, url: safeUrl });
+        const chrome = resolveChromePath();
+        if (chrome) {
+            execFile(chrome, [safeUrl], (error) => {
+                if (error) {
+                    console.warn('Chrome launch failed, using default browser:', error.message);
+                    shell.openExternal(safeUrl);
+                }
+            });
+            event.reply('website-opened', { success: true, url: safeUrl, browser: 'chrome' });
+        } else {
+            shell.openExternal(safeUrl);
+            event.reply('website-opened', { success: true, url: safeUrl, browser: 'default' });
+        }
     } catch (error) {
         console.error('Website open error:', error.message);
         event.reply('website-opened', { success: false, error: error.message });
@@ -763,6 +795,168 @@ ipcMain.handle('log-trajectory', async (event, entry) => {
         // Trajectory logging must never break the agent loop
         console.warn('Trajectory log error:', error.message);
         return { success: false };
+    }
+});
+
+/* =========================
+   INTERACTION LOG (self-improvement telemetry)
+   Every LOCAL turn — input, intent, latency, success, response — appended as
+   JSONL to userData/interactions.jsonl. This is distinct from trajectories.jsonl
+   (which only fires on the dormant Gemini cloud tool path and so never writes in
+   local mode): this is the durable record of how Jarvis is ACTUALLY used, the
+   raw material for finding failing commands, common asks and latency outliers.
+   Never leaves the machine; secret-bearing turns are dropped by the renderer
+   before they ever reach here.
+========================= */
+const INTERACTION_FILE = () => path.join(app.getPath('userData'), 'interactions.jsonl');
+const INTERACTION_MAX_BYTES = 5 * 1024 * 1024; // rotate past 5MB, keep one prior gen
+
+ipcMain.handle('log-interaction', async (event, entry) => {
+    try {
+        // Size-cap the log so it never grows without bound. One rotated
+        // generation (.1) is kept so history survives a rollover.
+        try {
+            const st = await fs.stat(INTERACTION_FILE());
+            if (st.size > INTERACTION_MAX_BYTES) {
+                await fs.rename(INTERACTION_FILE(), INTERACTION_FILE() + '.1');
+            }
+        } catch { /* no file yet — first write */ }
+        const record = { ts: Date.now(), ...entry };
+        await fs.appendFile(INTERACTION_FILE(), JSON.stringify(record) + '\n', 'utf-8');
+        return { success: true };
+    } catch (error) {
+        console.warn('Interaction log error:', error.message); // never break the turn
+        return { success: false };
+    }
+});
+
+// Raw interaction rows for the reflection/consolidation pass. Optional sinceTs
+// returns only rows newer than the last reflection, so each consolidation only
+// processes NEW experience (the log itself stays the immutable source of truth,
+// per SelfMem). Reads the rotated generation too so a rollover is not a blind
+// spot.
+ipcMain.handle('get-interactions', async (event, opts) => {
+    try {
+        const sinceTs = Number(opts?.sinceTs) || 0;
+        const limit = Math.min(Math.max(Number(opts?.limit) || 300, 1), 1000);
+        let lines = [];
+        for (const f of [INTERACTION_FILE() + '.1', INTERACTION_FILE()]) {
+            try { lines = lines.concat((await fs.readFile(f, 'utf-8')).trim().split('\n')); }
+            catch { /* generation absent */ }
+        }
+        const rows = lines.filter(Boolean)
+            .map((l) => { try { return JSON.parse(l); } catch { return null; } })
+            .filter((r) => r && (!sinceTs || r.ts > sinceTs));
+        return { success: true, rows: rows.slice(-limit) };
+    } catch (error) {
+        return { success: false, error: error.message, rows: [] };
+    }
+});
+
+// Reflection store: durable, human-readable summaries of what each consolidation
+// pass learned and recommended. Separate from interactions.jsonl because a
+// reflection is derived knowledge, not raw experience, and its max-covered
+// timestamp is what the next pass reads to avoid re-processing old rows.
+const REFLECTION_FILE = () => path.join(app.getPath('userData'), 'reflections.jsonl');
+
+ipcMain.handle('save-reflection', async (event, entry) => {
+    try {
+        const record = { ts: Date.now(), ...entry };
+        await fs.appendFile(REFLECTION_FILE(), JSON.stringify(record) + '\n', 'utf-8');
+        return { success: true };
+    } catch (error) {
+        console.warn('Reflection save error:', error.message);
+        return { success: false };
+    }
+});
+
+// Confidence ledger for consolidated facts. A fact is PROVISIONAL until a later
+// reflection pass corroborates it; only corroborated facts reach durable memory
+// (the RAG). This is the store behind that gate — small, structured, atomic
+// write like the watchlist. Kept OUT of rag-store.json on purpose: provisional
+// and archived facts must never be retrievable, only durable ones live in RAG.
+const FACT_STORE_FILE = () => path.join(app.getPath('userData'), 'fact-store.json');
+
+ipcMain.handle('load-fact-store', async () => {
+    try { return JSON.parse(await fs.readFile(FACT_STORE_FILE(), 'utf-8')); }
+    catch { return { facts: [] }; }
+});
+
+ipcMain.handle('save-fact-store', async (event, data) => {
+    try {
+        const tmp = FACT_STORE_FILE() + '.tmp';
+        await fs.writeFile(tmp, JSON.stringify(data), 'utf-8');
+        await fs.rename(tmp, FACT_STORE_FILE()); // atomic: a crash can't corrupt the ledger
+        return { success: true };
+    } catch (error) {
+        console.warn('Fact store save error:', error.message);
+        return { success: false, error: error.message };
+    }
+});
+
+ipcMain.handle('get-reflections', async (event, opts) => {
+    try {
+        const limit = Math.min(Math.max(Number(opts?.limit) || 10, 1), 100);
+        let lines = [];
+        try { lines = (await fs.readFile(REFLECTION_FILE(), 'utf-8')).trim().split('\n'); }
+        catch { return { success: true, reflections: [], lastCoveredTs: 0 }; }
+        const reflections = lines.filter(Boolean)
+            .map((l) => { try { return JSON.parse(l); } catch { return null; } })
+            .filter(Boolean);
+        // The high-water mark: the newest interaction any prior pass consolidated.
+        const lastCoveredTs = reflections.reduce((m, r) => Math.max(m, Number(r.coveredTs) || 0), 0);
+        return { success: true, reflections: reflections.slice(-limit), lastCoveredTs };
+    } catch (error) {
+        return { success: false, error: error.message, reflections: [], lastCoveredTs: 0 };
+    }
+});
+
+// Aggregate the interaction log into the numbers that actually drive
+// improvement: volume, error rate, average/worst latency, and the intent mix.
+// Reads the rotated generation first so the window spans a rollover.
+ipcMain.handle('get-interaction-stats', async () => {
+    try {
+        let lines = [];
+        for (const f of [INTERACTION_FILE() + '.1', INTERACTION_FILE()]) {
+            try { lines = lines.concat((await fs.readFile(f, 'utf-8')).trim().split('\n')); }
+            catch { /* generation absent */ }
+        }
+        const rows = lines.filter(Boolean)
+            .map((l) => { try { return JSON.parse(l); } catch { return null; } })
+            .filter(Boolean);
+
+        const byIntent = {};
+        const byLatency = {}; // intent -> {sum,n} for per-intent averages
+        let errors = 0, totalMs = 0, msCount = 0;
+        const slowest = [];
+        for (const r of rows) {
+            const intent = r.intent || 'unknown';
+            byIntent[intent] = (byIntent[intent] || 0) + 1;
+            if (r.ok === false) errors++;
+            if (typeof r.latencyMs === 'number') {
+                totalMs += r.latencyMs; msCount++;
+                const b = byLatency[intent] || (byLatency[intent] = { sum: 0, n: 0 });
+                b.sum += r.latencyMs; b.n++;
+                if (r.latencyMs > 3000) slowest.push({ intent, ms: r.latencyMs, input: r.input });
+            }
+        }
+        const avgByIntent = Object.fromEntries(
+            Object.entries(byLatency).map(([k, v]) => [k, Math.round(v.sum / v.n)])
+        );
+        return {
+            success: true,
+            total: rows.length,
+            errors,
+            errorRate: rows.length ? +(errors / rows.length * 100).toFixed(1) : 0,
+            avgLatencyMs: msCount ? Math.round(totalMs / msCount) : null,
+            byIntent: Object.fromEntries(Object.entries(byIntent).sort((a, b) => b[1] - a[1])),
+            avgLatencyByIntent: avgByIntent,
+            slowest: slowest.sort((a, b) => b.ms - a.ms).slice(0, 10),
+            firstTs: rows[0]?.ts || null,
+            lastTs: rows[rows.length - 1]?.ts || null,
+        };
+    } catch (error) {
+        return { success: false, error: error.message };
     }
 });
 
@@ -1196,8 +1390,51 @@ async function fetchQuoteYahoo(symbol) {
     if (!res.ok) throw new Error(`yahoo ${res.status}`);
     const data = await res.json();
     const meta = data?.chart?.result?.[0]?.meta;
-    if (!meta?.regularMarketPrice) throw new Error('no price in response');
-    return { price: meta.regularMarketPrice, currency: meta.currency || 'USD', source: 'yahoo' };
+    const price = meta?.regularMarketPrice;
+    if (price == null) throw new Error('no price in response');
+    // Day change is derived from the previous close. Yahoo names this field
+    // inconsistently across asset classes (chartPreviousClose for equities,
+    // previousClose for some crypto), so fall back through both before giving up
+    // on the change rather than reporting a wrong one.
+    const prevClose = meta.chartPreviousClose ?? meta.previousClose ?? null;
+    const changePct = prevClose ? ((price - prevClose) / prevClose) * 100 : null;
+    return {
+        price,
+        prevClose,
+        changePct,
+        currency: meta.currency || 'USD',
+        name: meta.shortName || meta.longName || symbol,
+        marketState: meta.marketState || null,
+        source: 'yahoo',
+    };
+}
+
+// Resolve a spoken company/asset name to a ticker via Yahoo's keyless search
+// ("tesla" -> TSLA, "bitcoin" -> BTC-USD). Returns null when nothing sensible
+// matches, so the caller can say so plainly rather than quote a wrong symbol.
+// A string that is already ticker-shaped is passed straight through — resolving
+// "AAPL" would waste a request and can mis-rank against a fund of the same name.
+async function resolveSymbol(text) {
+    const raw = String(text || '').trim();
+    if (!raw) return null;
+    // Ticker-shaped already: 1-6 letters, optional -USD / .NS style suffix.
+    if (/^[A-Za-z]{1,6}(-[A-Za-z]{2,4}|\.[A-Za-z]{1,3})?$/.test(raw) && raw === raw.toUpperCase()) {
+        return raw;
+    }
+    const res = await fetch(
+        `https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(raw)}&quotesCount=6&newsCount=0`,
+        { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(10000) }
+    );
+    if (!res.ok) throw new Error(`yahoo search ${res.status}`);
+    const quotes = (await res.json())?.quotes || [];
+    // Yahoo already returns these in relevance order, and that order is better
+    // than any type preference: for "bitcoin" it puts BTC-USD first, ahead of
+    // the GBTC trust and the futures. So KEEP the order and merely skip the
+    // instruments a spoken "what's X worth" never means — a re-sort by type is
+    // what wrongly promoted the ETF over the coin. Take the first tradable.
+    const SKIP = new Set(['FUTURE', 'OPTION', 'INDEX', 'ECNQUOTE']);
+    const best = quotes.find((q) => q.symbol && !SKIP.has(q.quoteType));
+    return best ? best.symbol : (quotes[0]?.symbol || null);
 }
 
 async function fetchQuoteAlpaca(symbol, keyId, secret) {
@@ -1299,6 +1536,144 @@ ipcMain.handle('watchlist-remove', async (event, symbol) => {
     quoteCache.delete(sym);
     return { success: true };
 });
+
+// On-demand single quote for a spoken price question ("what's Tesla trading
+// at"). Resolves a name to a ticker, then reuses the SAME reliable Yahoo path
+// as the watchlist poller — the whole point is that a live price question no
+// longer falls back to scraping search-engine snippets. A fresh cache entry (<
+// 45s old) is reused so rapid re-asks do not re-hit the network.
+ipcMain.handle('get-quote', async (event, text) => {
+    try {
+        const symbol = await resolveSymbol(text);
+        if (!symbol) return { success: false, error: 'no matching symbol' };
+        const cached = quoteCache.get(symbol);
+        if (cached && Date.now() - cached.at < 45000) {
+            return { success: true, symbol, ...cached };
+        }
+        const quote = await fetchQuoteYahoo(symbol);
+        quoteCache.set(symbol, { ...quote, at: Date.now() });
+        return { success: true, symbol, ...quote };
+    } catch (error) {
+        return { success: false, error: error.message };
+    }
+});
+
+// Historical daily closes for quant analytics — the structured series the
+// deterministic quant engine (services/quant.js) computes on. Reuses the SAME
+// keyless Yahoo chart endpoint and resolveSymbol as the quote path; only the
+// range differs. Live market data is fetched, never stored in memory (per the
+// architecture: prices are queried, not remembered). Returns closes + the
+// currency/name so the caller can present real numbers, not model guesses.
+const HISTORY_RANGES = new Set(['5d', '1mo', '3mo', '6mo', '1y', '2y', '5y', 'ytd', 'max']);
+ipcMain.handle('get-history', async (event, opts) => {
+    try {
+        const symbol = await resolveSymbol(opts?.text || opts?.symbol);
+        if (!symbol) return { success: false, error: 'no matching symbol' };
+        const range = HISTORY_RANGES.has(opts?.range) ? opts.range : '1y';
+        const res = await fetch(
+            `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=${range}`,
+            { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(12000) }
+        );
+        if (!res.ok) throw new Error(`yahoo history ${res.status}`);
+        const r = (await res.json())?.chart?.result?.[0];
+        const rawCloses = r?.indicators?.quote?.[0]?.close || [];
+        // Yahoo interpolates nulls on non-trading days; drop them so returns are
+        // computed on real observations only.
+        const closes = rawCloses.filter((x) => x != null && x > 0);
+        if (closes.length < 5) throw new Error('insufficient history');
+        return {
+            success: true,
+            symbol,
+            range,
+            closes,
+            currency: r.meta?.currency || 'USD',
+            name: r.meta?.shortName || r.meta?.longName || symbol,
+        };
+    } catch (error) {
+        return { success: false, error: error.message };
+    }
+});
+
+// Keyless news via RSS. RSS is used deliberately over scraping a news site's
+// HTML: it is a stable, structured contract with real per-item timestamps and
+// source attribution, which snippet scraping cannot give.
+//
+// Two independent providers with FAILOVER (Google News, then Bing News). Google
+// News rate-limits an IP fairly aggressively on repeated hits and then serves an
+// empty feed; a single source would make the feature silently unreliable, so a
+// zero-item result from the first provider falls through to the second.
+function decodeNewsTitle(raw) {
+    return decodeEntities(String(raw).replace(/<!\[CDATA\[|\]\]>/g, '')).trim();
+}
+
+// Parse the <item> list of any RSS 2.0 feed into our normalized shape. Both
+// Google and Bing use the same core tags, so one parser serves both.
+function parseRssItems(xml, limit) {
+    return [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)].slice(0, limit).map((m) => {
+        const block = m[1];
+        const pick = (tag) => (block.match(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`)) || [])[1] || '';
+        let title = decodeNewsTitle(pick('title'));
+        // Google News encodes the outlet as "Headline - Source"; Bing carries a
+        // <source> tag. Try the tag first, then the dash suffix.
+        let source = decodeNewsTitle(pick('source'));
+        if (!source) {
+            const dash = title.lastIndexOf(' - ');
+            if (dash > 0) { source = title.slice(dash + 3); title = title.slice(0, dash); }
+        }
+        const pub = pick('pubDate');
+        return {
+            title,
+            source,
+            url: pick('link').trim(),
+            published: pub ? new Date(pub).toISOString() : null,
+            publishedText: pub ? timeAgo(new Date(pub)) : '',
+        };
+    }).filter((it) => it.title);
+}
+
+async function fetchRss(url) {
+    const res = await fetch(url, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
+        signal: AbortSignal.timeout(12000),
+    });
+    if (!res.ok) throw new Error(`rss ${res.status}`);
+    return res.text();
+}
+
+ipcMain.handle('get-news', async (event, opts) => {
+    const query = String(opts?.query || '').trim().slice(0, 120);
+    const limit = Math.min(Math.max(Number(opts?.limit) || 5, 1), 10);
+
+    const sources = [
+        query
+            ? `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=en-US&gl=US&ceid=US:en`
+            : `https://news.google.com/rss?hl=en-US&gl=US&ceid=US:en`,
+        // Bing needs a query; for top headlines fall back to a broad term.
+        `https://www.bing.com/news/search?q=${encodeURIComponent(query || 'top stories')}&format=RSS`,
+    ];
+
+    let lastError = null;
+    for (const url of sources) {
+        try {
+            const items = parseRssItems(await fetchRss(url), limit);
+            if (items.length) return { success: true, query, items };
+        } catch (error) {
+            lastError = error.message; // try the next provider
+        }
+    }
+    return { success: false, error: lastError || 'no news available', items: [] };
+});
+
+// Compact relative time ("3h ago") for news recency, spoken and displayed.
+function timeAgo(date) {
+    const s = Math.max(0, (Date.now() - date.getTime()) / 1000);
+    if (s < 90) return 'just now';
+    const m = s / 60;
+    if (m < 60) return `${Math.round(m)}m ago`;
+    const h = m / 60;
+    if (h < 24) return `${Math.round(h)}h ago`;
+    return `${Math.round(h / 24)}d ago`;
+}
 
 /* =========================
    PHONE BRIDGE (Wi-Fi notification relay)

@@ -7,6 +7,8 @@ import { LiveService } from './liveService.js';
 import { generateContentLocal, checkOllama, routeLocalAction, describeImageLocal } from './toolService.js';
 import { routePhoneCommand, targetsPhone, executePhoneTool } from './services/phoneTools.js';
 import ragService from './services/ragService.js';
+import reflectionService from './services/reflectionService.js';
+import * as quant from './services/quant.js';
 import { LocalVoiceService } from './services/voiceService.js';
 import { config } from '../config.js';
 
@@ -84,6 +86,23 @@ class Jarvis {
                 this.speak('Systems online. Local intelligence active. How may I assist, Sir?');
             }
         }, 3000);
+
+        // Sleep-like consolidation: once per day, well after boot, distill the
+        // day's experience into long-term memory. Runs at most once daily and
+        // only when there is genuinely new experience, so it is usually a silent
+        // no-op. Delayed 45s so it never competes with startup or the first
+        // command, and gated on not speaking over an active exchange.
+        setTimeout(async () => {
+            try {
+                if (this.isProcessing || this.ttsActive) return;
+                const summary = await reflectionService.maybeAutoReflect();
+                if (summary && !this.isProcessing && !this.ttsActive) {
+                    this.speak(`While you were away, I consolidated my memory. ${summary}`);
+                }
+            } catch (e) {
+                console.warn('Startup auto-reflection skipped:', e.message);
+            }
+        }, 45000);
 
         // Camera State
         this.cameraStream = null;
@@ -983,6 +1002,16 @@ class Jarvis {
         if (cmd.includes('open explorer')) return { intent: 'OPEN_APP', app: 'explorer' };
         if (cmd.includes('open downloads')) return { intent: 'OPEN_APP', app: 'downloads' };
         if (cmd.includes('open vs code') || cmd.includes('open code')) return { intent: 'OPEN_APP', app: 'vscode' };
+
+        // Website / web-app launcher — "open youtube", "go to github",
+        // "open netflix.com", "open youtube dot com". Deliberately placed AFTER
+        // the desktop-app allowlist above so "open chrome/notepad/explorer/code"
+        // still open the native app, not a search for the word. Only fires for a
+        // KNOWN site name or a domain-shaped token, so "open the pod bay doors"
+        // and "go to sleep" fall through to the AI untouched.
+        const siteIntent = this.parseWebsiteIntent(cmd);
+        if (siteIntent) return siteIntent;
+
         if (cmd.includes('shut down') || cmd.includes('shutdown')) return { intent: 'SHUTDOWN' };
         if (cmd.includes('restart')) return { intent: 'RESTART' };
         if (cmd.includes('mute audio')) return { intent: 'MUTE' };
@@ -1116,6 +1145,41 @@ class Jarvis {
             return { intent: 'WATCHLIST_SHOW' };
         }
 
+        // Quant analytics — "sharpe ratio of Apple", "volatility of Tesla",
+        // "how risky is Nvidia", "max drawdown of Bitcoin", "beta of Tesla",
+        // "analyze Apple". Computed by the DETERMINISTIC quant engine over real
+        // historical prices — never estimated by the model. Checked before the
+        // price query so a metric question wins over a bare price.
+        const quantQ = this.parseQuantQuery(cmd);
+        if (quantQ) return { intent: 'QUANT_QUERY', metric: quantQ.metric, entity: quantQ.entity };
+
+        // Live price query — "price of Tesla", "how much is Bitcoin", "AAPL stock
+        // price", "what's Apple trading at". Answered from the reliable Yahoo
+        // quote endpoint, NOT the web-search fallback that used to field these and
+        // returned stale snippet text. Checked before news so "Tesla stock price"
+        // is a quote, not a headline search.
+        const priceEntity = this.parsePriceQuery(cmd);
+        if (priceEntity) return { intent: 'PRICE_QUERY', entity: priceEntity };
+
+        // News / latest updates — "latest news", "news about Tesla", "what's
+        // happening with AI". Empty topic means top headlines. Uses the keyless
+        // Google News RSS feed with real timestamps and sources.
+        const news = this.parseNewsQuery(cmd);
+        if (news) return { intent: 'NEWS_QUERY', topic: news.topic };
+
+        // Usage / self-report — surfaces the interaction log so the improvement
+        // loop is visible from inside Jarvis ("how am I using you", "usage stats").
+        if (/\b(usage stats|interaction stats|how am i using you|how are you performing|self ?report|show (my )?(usage|stats)|your stats)\b/.test(cmd))
+            return { intent: 'USAGE_STATS' };
+
+        // Memory consolidation ("sleep") — distill durable facts from recent
+        // experience into long-term memory and surface self-improvement notes.
+        if (/\b(reflect|consolidate (your )?memory|learn from (today|our (chat|conversation|interactions))|go to sleep and learn|self.?improve|review your memory)\b/.test(cmd))
+            return { intent: 'REFLECT' };
+        // Read back what consolidation has produced.
+        if (/\bwhat (have|did) you learn(ed|t)?\b|\bwhat do you (know|remember) about me\b/.test(cmd))
+            return { intent: 'WHAT_LEARNED' };
+
         // File Operation Commands
         if (cmd.includes('create folder') || cmd.includes('make folder')) {
             const folderName = cmd.match(/folder (?:named )?([^ ]+)/i)?.[1] || 'NewFolder';
@@ -1191,6 +1255,12 @@ class Jarvis {
 
         const intent = this.detectIntent(command);
         console.log('Intent:', intent);
+
+        // Interaction-log bookkeeping: reset this turn's response buffer (filled
+        // by _rememberSpoken) and start the latency clock.
+        const _turnStartedAt = Date.now();
+        this._turnResponse = '';
+        let _turnOk = true;
 
         try {
             switch (intent.intent) {
@@ -1327,6 +1397,24 @@ class Jarvis {
                 case 'WATCHLIST_SHOW':
                     await this.handleWatchlistShow();
                     break;
+                case 'QUANT_QUERY':
+                    await this.handleQuantQuery(intent.metric, intent.entity);
+                    break;
+                case 'PRICE_QUERY':
+                    await this.handlePriceQuery(intent.entity);
+                    break;
+                case 'NEWS_QUERY':
+                    await this.handleNewsQuery(intent.topic);
+                    break;
+                case 'USAGE_STATS':
+                    await this.handleUsageStats();
+                    break;
+                case 'REFLECT':
+                    await this.handleReflect();
+                    break;
+                case 'WHAT_LEARNED':
+                    await this.handleWhatLearned();
+                    break;
                 case 'CREATE_FOLDER':
                     await this.handleCreateFolder(intent.name);
                     break;
@@ -1340,7 +1428,7 @@ class Jarvis {
                     await this.handleSearchFile(intent.name);
                     break;
                 case 'OPEN_WEBSITE':
-                    await this.handleOpenWebsite(intent.url);
+                    await this.handleOpenWebsite(intent.url, intent.label);
                     break;
                 case 'SEARCH_GOOGLE':
                     await this.handleSearchGoogle(intent.query);
@@ -1416,8 +1504,11 @@ class Jarvis {
             }
         } catch (error) {
             console.error('Command processing error:', error);
+            _turnOk = false;
             this.speak('I apologize, but I encountered an error processing that command.');
         } finally {
+            // Persist the turn for later analysis before releasing the loop.
+            this._logInteraction(command, intent, _turnStartedAt, _turnOk);
             this.isProcessing = false;
             this.wakeWordDetected = false;
             if (this.commandInput) {
@@ -1697,14 +1788,350 @@ class Jarvis {
         }
     }
 
+    // Common sites addressable by name. Bare spoken words ("open youtube") map
+    // to a canonical URL here; anything domain-shaped ("open foo.com") is opened
+    // directly and does not need an entry. Keys are lowercased and stripped of
+    // non-alphanumerics, so "you tube" and "youtube" both resolve.
+    static KNOWN_SITES = {
+        youtube: 'youtube.com', yt: 'youtube.com',
+        google: 'google.com', gmail: 'mail.google.com', gemini: 'gemini.google.com',
+        maps: 'maps.google.com', googlemaps: 'maps.google.com', drive: 'drive.google.com',
+        calendar: 'calendar.google.com', photos: 'photos.google.com',
+        facebook: 'facebook.com', fb: 'facebook.com', instagram: 'instagram.com', insta: 'instagram.com',
+        twitter: 'twitter.com', x: 'x.com', reddit: 'reddit.com', linkedin: 'linkedin.com',
+        whatsapp: 'web.whatsapp.com', telegram: 'web.telegram.org', discord: 'discord.com',
+        github: 'github.com', gitlab: 'gitlab.com', stackoverflow: 'stackoverflow.com',
+        netflix: 'netflix.com', primevideo: 'primevideo.com', hotstar: 'hotstar.com',
+        spotify: 'open.spotify.com', twitch: 'twitch.tv', amazon: 'amazon.com',
+        flipkart: 'flipkart.com', wikipedia: 'wikipedia.org', chatgpt: 'chat.openai.com',
+        claude: 'claude.ai', perplexity: 'perplexity.ai',
+    };
+
+    // Parse an "open/go to/visit <target>" command into an OPEN_WEBSITE intent,
+    // or null when the target is neither a known site nor domain-shaped (so the
+    // caller lets it fall through to the AI). Kept pure and side-effect free —
+    // it only classifies.
+    parseWebsiteIntent(cmd) {
+        const m = cmd.match(/^(?:open|launch|go to|goto|navigate to|visit|pull up|bring up)\s+(.+)$/i);
+        if (!m) return null;
+
+        let target = m[1].trim()
+            .replace(/\s+(?:for me|please|now|thanks)\s*$/i, '')
+            .replace(/^(?:the|my|a)\s+/i, '')
+            .replace(/^(?:website|url|site|web ?site|web page|page)\s+/i, '')
+            .replace(/\s+(?:website|site|web ?site|web page|page)\s*$/i, '')
+            .trim();
+        if (!target) return null;
+
+        // Spoken domains: "youtube dot com" -> "youtube.com".
+        const spoken = target.toLowerCase().replace(/\s+dot\s+/g, '.').replace(/\s+/g, '');
+
+        // Known site by name (punctuation/space-insensitive).
+        const key = target.toLowerCase().replace(/[^a-z0-9]/g, '');
+        if (Jarvis.KNOWN_SITES[key]) {
+            return { intent: 'OPEN_WEBSITE', url: `https://${Jarvis.KNOWN_SITES[key]}`, label: key };
+        }
+
+        // Domain-shaped token: at least one dot and a 2+ letter TLD. This is what
+        // lets ANY website work ("open example.org", "open my.company.co.uk")
+        // without being enumerated above.
+        if (/^(https?:\/\/)?([a-z0-9-]+\.)+[a-z]{2,}(\/[^\s]*)?$/i.test(spoken)) {
+            const url = spoken.startsWith('http') ? spoken : `https://${spoken}`;
+            let label = spoken.replace(/^https?:\/\//, '').split('/')[0];
+            return { intent: 'OPEN_WEBSITE', url, label };
+        }
+
+        // A bare, unknown word ("open spotify-ish nonsense"): not confidently a
+        // website. Fall through rather than guess.
+        return null;
+    }
+
+    // Parse a spoken price question into the asset name/ticker, or null. Anchored
+    // on explicit market words (price/stock/share/trading/quote) so everyday
+    // "how much is a coffee" does not trigger a stock lookup. The entity is left
+    // as spoken text — electron's resolveSymbol() maps "tesla" -> TSLA.
+    parsePriceQuery(cmd) {
+        const clean = (s) => s && s.replace(/[?.!,]+$/, '')
+            .replace(/\b(stock|shares?|price|quote|cost|right now|now|today|please|currently)\b/gi, '')
+            .replace(/^\s*(?:of|for|the|a)\s+/i, '').replace(/\s+/g, ' ').trim();
+        let m;
+        if ((m = cmd.match(/\b(?:price|quote)\s+(?:of|for)\s+(.+)/i))) return clean(m[1]) || null;
+        if ((m = cmd.match(/\b(.+?)\s+(?:stock|share)\s+price\b/i))) return clean(m[1]) || null;
+        if ((m = cmd.match(/\bhow much (?:is|are|does)\s+(.+?)(?:\s+cost|\s+worth|\s+trading|\s+stock|\s+shares?)?\s*\??$/i))
+            && /\b(stock|shares?|worth|trading|cost|price)\b/i.test(cmd)) return clean(m[1]) || null;
+        if ((m = cmd.match(/\bwhat(?:'s| is)\s+(.+?)\s+(?:stock\s+)?(?:trading at|worth|at now|priced at)\b/i))) return clean(m[1]) || null;
+        if ((m = cmd.match(/\bhow(?:'s| is)\s+(.+?)\s+(?:stock|shares?)\s+doing\b/i))) return clean(m[1]) || null;
+        return null;
+    }
+
+    // Parse a quant-analytics request into { metric, entity } or null. Metric is
+    // one of: sharpe|sortino|volatility|drawdown|beta|return|summary. The entity
+    // is spoken text (resolveSymbol maps it to a ticker on the main side).
+    parseQuantQuery(cmd) {
+        const clean = (s) => s && s.replace(/[?.!,]+$/, '')
+            .replace(/\b(stock|shares?|the|a|please|now|right now|currently|over the (last|past) (year|month))\b/gi, '')
+            .replace(/^\s*(?:of|for)\s+/i, '').replace(/\s+/g, ' ').trim();
+        const METRIC = {
+            sharpe: /\bsharpe\b/i, sortino: /\bsortino\b/i,
+            volatility: /\b(volatility|volatile|std ?dev|standard deviation)\b/i,
+            drawdown: /\b(max(imum)? )?drawdown\b/i,
+            beta: /\b(beta|alpha)\b/i,
+            return: /\b(annual(ized)? return|cagr|performance)\b/i,
+        };
+        let m;
+        // "<metric> of <entity>" / "<metric> for <entity>"
+        if ((m = cmd.match(/\b(sharpe( ratio)?|sortino( ratio)?|volatility|beta|alpha|max(imum)? drawdown|drawdown|annual(ized)? return|cagr)\s+(?:of|for)\s+(.+)/i))) {
+            const entity = clean(m[m.length - 1]);
+            if (entity) return { metric: this._metricOf(m[1], METRIC), entity };
+        }
+        // "how risky / how volatile is <entity>"
+        if ((m = cmd.match(/\bhow\s+(risky|volatile)\s+is\s+(.+)/i))) {
+            const entity = clean(m[2]);
+            if (entity) return { metric: m[1].toLowerCase() === 'volatile' ? 'volatility' : 'summary', entity };
+        }
+        // "analyze / risk analysis of <entity>"
+        if ((m = cmd.match(/\b(?:analyz|analys)e?\s+(.+)|(?:risk|quant)\s+analysis\s+(?:of|for)\s+(.+)/i))) {
+            const entity = clean(m[1] || m[2]);
+            if (entity && METRIC && !/[?]/.test(entity)) return { metric: 'summary', entity };
+        }
+        // trailing form: "<entity> sharpe / volatility / beta"
+        if ((m = cmd.match(/^(.+?)\s+(sharpe|sortino|volatility|beta|drawdown|risk)\b/i))) {
+            const entity = clean(m[1]);
+            const metric = /risk/i.test(m[2]) ? 'summary' : this._metricOf(m[2], METRIC);
+            if (entity) return { metric, entity };
+        }
+        return null;
+    }
+
+    _metricOf(word, METRIC) {
+        const w = String(word).toLowerCase();
+        for (const [key, re] of Object.entries(METRIC)) if (re.test(w)) return key;
+        return 'summary';
+    }
+
+    // Parse a news request into { topic } (empty topic = top headlines), or null.
+    parseNewsQuery(cmd) {
+        const clean = (s) => s && s.replace(/[?.!,]+$/, '')
+            .replace(/\b(right now|today|please|currently|for me)\b/gi, '')
+            .replace(/^\s*(?:the|a)\s+/i, '').replace(/\s+/g, ' ').trim();
+        let m;
+        // Explicit topic after a connector: "news about X", "latest on X".
+        if ((m = cmd.match(/\b(?:news|headlines?|updates?)\s+(?:about|on|for|regarding|around)\s+(.+)/i)))
+            return { topic: clean(m[1]) || '' };
+        if ((m = cmd.match(/\bwhat(?:'s| is| has| are)\s+(?:the\s+)?(?:latest|happening|new|going on)\s+(?:on|with|about|in|for)\s+(.+)/i)))
+            return { topic: clean(m[1]) || '' };
+
+        // Beyond this point it is only a news request if it actually mentions
+        // news, or is one of a few fixed "catch me up" phrasings. This gate is
+        // what stops "what's the price of Tesla" being read as news.
+        const isNews = /\b(news|headlines?|breaking)\b/i.test(cmd) ||
+            /\b(latest updates?|what'?s happening|what is happening|what'?s new|catch me up)\b/i.test(cmd);
+        if (!isNews) return null;
+
+        // Trailing-topic form: "<topic> news". The head must be a real subject,
+        // not a question/request stem — "what is the news" and "give me the news"
+        // are general headlines, not news about "the". Filler words are peeled
+        // off the FRONT repeatedly until only a subject (or nothing) remains.
+        if ((m = cmd.match(/^(.*?)\s+(?:news|headlines)\b/i))) {
+            const FILLER = /^(?:what's|whats|what|is|are|has|do|does|the|a|an|of|about|on|any|some|latest|recent|top|breaking|world|local|more|good|bad|great|big|tell|me|give|show|get|read|here's|heres|there|please|us|'s)\b/i;
+            let head = clean(m[1]);
+            let prev;
+            do { prev = head; head = head.replace(FILLER, '').trim(); } while (head && head !== prev);
+            if (head) return { topic: head };
+        }
+        // Mentions news but no clean topic -> top headlines.
+        return { topic: '' };
+    }
+
+    _fmtMoney(price, ccy) {
+        const sym = { USD: '$', EUR: '€', GBP: '£', INR: '₹', JPY: '¥' }[ccy] || '';
+        const digits = price >= 1000 ? 0 : price >= 1 ? 2 : 4;
+        const n = Number(price).toLocaleString('en-US', { minimumFractionDigits: digits, maximumFractionDigits: digits });
+        return sym ? `${sym}${n}` : `${n} ${ccy || ''}`.trim();
+    }
+
+    // Finance & News Handlers
+    async handlePriceQuery(entity) {
+        if (!window.electronAPI?.getQuote) {
+            this.speak('Live quotes are not available in this environment.');
+            return;
+        }
+        this.displayText(`Fetching ${entity} quote...`, null);
+        let q;
+        try { q = await window.electronAPI.getQuote(entity); }
+        catch (e) { console.error('Quote error:', e); this.speak(`I could not fetch a price for ${entity}.`); return; }
+        if (!q || !q.success) {
+            this.speak(`I could not find a live price for ${entity}.`);
+            return;
+        }
+        const name = q.name || q.symbol;
+        const priceStr = this._fmtMoney(q.price, q.currency);
+        const arrow = q.changePct == null ? '' : q.changePct >= 0 ? ' ▲ ' : ' ▼ ';
+        const pctStr = q.changePct == null ? '' : `${arrow}${Math.abs(q.changePct).toFixed(2)}%`;
+        this.displayText(`${name} (${q.symbol})\n${priceStr}${pctStr}`, null);
+        const spokenChg = q.changePct == null ? ''
+            : `, ${q.changePct >= 0 ? 'up' : 'down'} ${Math.abs(q.changePct).toFixed(1)} percent today`;
+        this.speak(`${name} is at ${priceStr}${spokenChg}.`);
+    }
+
+    // Quant analytics: fetch REAL historical prices and compute risk/return
+    // metrics with the deterministic engine — the model never estimates these.
+    async handleQuantQuery(metric, entity) {
+        if (!window.electronAPI?.getHistory) {
+            this.speak('Quant analytics are not available in this environment.');
+            return;
+        }
+        this.displayText(`Analyzing ${entity}...`, null);
+        let hist;
+        try { hist = await window.electronAPI.getHistory({ text: entity, range: '1y' }); }
+        catch (e) { console.error('History error:', e); this.speak(`I could not fetch price history for ${entity}.`); return; }
+        if (!hist || !hist.success) {
+            this.speak(`I could not find enough price history for ${entity}.`);
+            return;
+        }
+
+        // Beta/alpha and the full summary need a market benchmark (S&P 500).
+        let benchmarkPrices = null;
+        if (metric === 'beta' || metric === 'summary') {
+            const bench = await window.electronAPI.getHistory({ symbol: '^GSPC', range: '1y' }).catch(() => null);
+            if (bench?.success) benchmarkPrices = bench.closes;
+        }
+
+        // 4% annual risk-free is a reasonable current default for Sharpe/Sortino.
+        const a = quant.analyzeSeries(hist.closes, { benchmarkPrices, riskFree: 0.04 });
+        const name = hist.name || hist.symbol;
+        const pct = (x) => `${(x * 100).toFixed(1)} percent`;
+        const num = (x) => x.toFixed(2);
+
+        // On-screen: the full block. Spoken: focused on what was asked.
+        const lines = [
+            `${name} (${hist.symbol}) — 1-year`,
+            `Return: ${pct(a.annualizedReturn)}   Total: ${pct(a.cumulativeReturn)}`,
+            `Volatility: ${pct(a.annualizedVolatility)}   Max drawdown: ${pct(a.maxDrawdown)}`,
+            `Sharpe: ${num(a.sharpe)}   Sortino: ${num(a.sortino)}`,
+        ];
+        if (a.beta != null) lines.push(`Beta: ${num(a.beta)}   Alpha: ${pct(a.alpha)}   Corr(SPX): ${num(a.correlation)}`);
+        this.displayText(lines.join('\n'), null);
+
+        let spoken;
+        switch (metric) {
+            case 'sharpe':
+                spoken = `${name} has a one-year Sharpe ratio of ${num(a.sharpe)}, on an annualized return of ${pct(a.annualizedReturn)} and volatility of ${pct(a.annualizedVolatility)}.`;
+                break;
+            case 'sortino':
+                spoken = `${name} has a Sortino ratio of ${num(a.sortino)} over the past year.`;
+                break;
+            case 'volatility':
+                spoken = `${name} has an annualized volatility of ${pct(a.annualizedVolatility)} over the past year, with a maximum drawdown of ${pct(a.maxDrawdown)}.`;
+                break;
+            case 'drawdown':
+                spoken = `${name}'s maximum drawdown over the past year was ${pct(a.maxDrawdown)}.`;
+                break;
+            case 'beta':
+                spoken = a.beta != null
+                    ? `${name} has a beta of ${num(a.beta)} to the S&P 500, with an annualized alpha of ${pct(a.alpha)}.`
+                    : `I could not compute beta for ${name} — the benchmark data was unavailable.`;
+                break;
+            case 'return':
+                spoken = `${name} returned ${pct(a.annualizedReturn)} annualized over the past year, ${pct(a.cumulativeReturn)} in total.`;
+                break;
+            default:
+                spoken = `Over the past year, ${name} returned ${pct(a.annualizedReturn)} annualized with ${pct(a.annualizedVolatility)} volatility, a Sharpe of ${num(a.sharpe)}, and a maximum drawdown of ${pct(a.maxDrawdown)}.`;
+                if (a.beta != null) spoken += ` Its beta to the market is ${num(a.beta)}.`;
+        }
+        this.speak(spoken);
+    }
+
+    async handleNewsQuery(topic) {
+        if (!window.electronAPI?.getNews) {
+            this.speak('News is not available in this environment.');
+            return;
+        }
+        this.displayText(topic ? `Getting news about ${topic}...` : 'Getting the latest headlines...', null);
+        let res;
+        try { res = await window.electronAPI.getNews({ query: topic, limit: 5 }); }
+        catch (e) { console.error('News error:', e); this.speak('I could not fetch the news right now.'); return; }
+        if (!res || !res.success || !res.items.length) {
+            this.speak(topic ? `I could not find recent news about ${topic}.` : 'I could not fetch the news right now.');
+            return;
+        }
+        const items = res.items;
+        const display = items.map((it, i) =>
+            `${i + 1}. ${it.title}${it.source ? `  — ${it.source}` : ''}${it.publishedText ? `  (${it.publishedText})` : ''}`
+        ).join('\n');
+        this.displayText(`${topic ? `News: ${topic}` : 'Top headlines'}\n${display}`, null);
+        const spoken = items.slice(0, 3).map((it, i) =>
+            `${i + 1}. ${it.title}${it.source ? `, from ${it.source}` : ''}`
+        ).join('. ');
+        this.speak(`${topic ? `Here's the latest on ${topic}. ` : 'Here are the top headlines. '}${spoken}.`);
+    }
+
+    // Surface the interaction log — the self-improvement telemetry — as a
+    // spoken + on-screen summary.
+    async handleUsageStats() {
+        if (!window.electronAPI?.getInteractionStats) {
+            this.speak('Usage statistics are not available in this environment.');
+            return;
+        }
+        const s = await window.electronAPI.getInteractionStats();
+        if (!s || !s.success || !s.total) {
+            this.speak('I have no interaction history logged yet.');
+            return;
+        }
+        const top = Object.entries(s.byIntent).slice(0, 6)
+            .map(([k, v]) => `${k}: ${v}`).join('\n');
+        const since = s.firstTs ? new Date(s.firstTs).toLocaleDateString() : 'recently';
+        this.displayText(
+            `Usage since ${since}\n` +
+            `Total turns: ${s.total}\n` +
+            `Error rate: ${s.errorRate}%\n` +
+            `Avg latency: ${s.avgLatencyMs != null ? s.avgLatencyMs + 'ms' : 'n/a'}\n` +
+            `Top intents:\n${top}`,
+            null
+        );
+        const busiest = Object.keys(s.byIntent)[0] || 'none';
+        this.speak(
+            `I have handled ${s.total} commands since ${since}, ` +
+            `with a ${s.errorRate} percent error rate and about ${s.avgLatencyMs || 0} milliseconds average response. ` +
+            `Your most common request type is ${busiest.replace(/_/g, ' ').toLowerCase()}.`
+        );
+    }
+
+    // Memory consolidation — the "sleep" pass. Distills durable facts from
+    // recent experience into long-term memory and reports self-improvement notes.
+    async handleReflect() {
+        this.speak('Consolidating my memory. One moment.');
+        this.displayText('Reflecting on recent interactions...', null);
+        try {
+            const summary = await reflectionService.reflect();
+            this.speak(summary);
+        } catch (e) {
+            console.error('Reflection error:', e);
+            this.speak('I ran into a problem while consolidating my memory.');
+        }
+    }
+
+    async handleWhatLearned() {
+        try {
+            const summary = await reflectionService.lastReflectionSummary();
+            this.speak(summary);
+        } catch (e) {
+            console.error('Reflection recall error:', e);
+            this.speak('I could not recall what I have learned.');
+        }
+    }
+
     // Web Automation Handlers
-    async handleOpenWebsite(url) {
+    async handleOpenWebsite(url, label) {
         try {
             if (window.electronAPI && window.electronAPI.openWebsite) {
-                // Add http:// if no protocol specified
+                // Add https:// if no protocol specified
                 const fullUrl = url.startsWith('http') ? url : `https://${url}`;
                 window.electronAPI.openWebsite(fullUrl);
-                this.speak(`Opening ${url}`);
+                // Speak the friendly name when we have one ("Opening YouTube"),
+                // otherwise the host ("Opening example.com").
+                const spokenName = label || fullUrl.replace(/^https?:\/\//, '').split('/')[0];
+                this.speak(`Opening ${spokenName} in Chrome`);
             } else {
                 this.speak('Web browser control not available');
             }
@@ -2044,6 +2471,29 @@ class Jarvis {
         this._spokenRecently.push({ words: this._echoWords(text), at: Date.now() });
         const cutoff = Date.now() - 20000;
         this._spokenRecently = this._spokenRecently.filter(e => e.at > cutoff);
+        // Accumulate this turn's spoken output for the interaction log. Both
+        // speak() and _speakQueued() (the streaming path) funnel through here, so
+        // this is the one place that sees every word Jarvis says.
+        this._turnResponse = ((this._turnResponse || '') + ' ' + text).trim();
+    }
+
+    // Append one local turn to the persistent interaction log. Best-effort and
+    // fully guarded — telemetry must never break or slow a turn. Secret-bearing
+    // commands are dropped here so a key never reaches disk via this path.
+    _logInteraction(input, intent, startedAt, ok) {
+        try {
+            if (!window.electronAPI?.logInteraction) return;
+            const name = (intent && intent.intent) || 'AI';
+            if (name === 'SET_KEY' || name === 'LIST_KEYS' || /^\s*(store|set)\s+key\s+/i.test(input)) return;
+            window.electronAPI.logInteraction({
+                source: this._lastInputWasVoice ? 'voice' : 'text',
+                input: String(input || '').slice(0, 500),
+                intent: name,
+                latencyMs: Date.now() - startedAt,
+                ok: ok !== false,
+                response: String(this._turnResponse || '').slice(0, 500),
+            });
+        } catch { /* logging must never affect the turn */ }
     }
 
     _echoWords(text) {
@@ -2463,17 +2913,24 @@ class Jarvis {
             return;
         }
         const lines = list.map(item => {
-            const price = item.quote ? `${item.quote.price}` : 'fetching';
+            const q = item.quote;
+            const price = q ? this._fmtMoney(q.price, q.currency) : 'fetching';
+            const chg = q && q.changePct != null
+                ? `  ${q.changePct >= 0 ? '▲' : '▼'} ${Math.abs(q.changePct).toFixed(2)}%` : '';
             const extras = [
                 item.target ? `target ${item.target}` : null,
                 item.stop ? `stop ${item.stop}` : null
             ].filter(Boolean).join(', ');
-            return `${item.symbol}: ${price}${extras ? ` (${extras})` : ''}`;
+            return `${item.symbol}: ${price}${chg}${extras ? ` (${extras})` : ''}`;
         });
         this.displayText(`Watchlist\n${lines.join('\n')}`, null);
-        const spoken = list.slice(0, 5).map(item =>
-            `${item.symbol} at ${item.quote ? item.quote.price : 'unknown'}`
-        ).join('. ');
+        const spoken = list.slice(0, 5).map(item => {
+            const q = item.quote;
+            if (!q) return `${item.symbol}, price unknown`;
+            const chg = q.changePct != null
+                ? `, ${q.changePct >= 0 ? 'up' : 'down'} ${Math.abs(q.changePct).toFixed(1)} percent` : '';
+            return `${item.symbol} at ${this._fmtMoney(q.price, q.currency)}${chg}`;
+        }).join('. ');
         this.speak(spoken + '.');
     }
 
