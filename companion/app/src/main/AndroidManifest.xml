@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Networking: the companion dials OUT to the desktop, so no inbound
+         listener and no server socket permission is needed. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- NsdManager needs this to see services on the local network (Android 12+). -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+
+    <!-- Mic drives the visualizer's FFT, exactly as it does on desktop. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+    <!-- Foreground services. Android 14 (API 34) requires BOTH the generic
+         permission and a per-type permission matching each declared
+         foregroundServiceType below. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+
+    <!-- Post-13 runtime notification permission for the ongoing link notice. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- NOTE: android.permission.PROJECT_MEDIA is deliberately NOT declared.
+         It is a signature/system permission that a normal app cannot hold.
+
+         Screenshots go through AccessibilityService.takeScreenshot() (API 30+)
+         instead of MediaProjection: it returns the bitmap directly, needs no
+         foreground service, no mediaProjection type, and no per-session consent
+         dialog, and the accessibility grant is already required for Tier 2. -->
+
+    <application
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:theme="@style/Theme.JarvisCompanion">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|uiMode"
+            android:launchMode="singleTask"
+            android:theme="@style/Theme.JarvisCompanion">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Tier 1: holds the WebSocket link to the desktop while backgrounded. -->
+        <service
+            android:name=".services.LinkService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <!-- Tier 2: UI automation over Wi-Fi, no ADB. User must enable this
+             manually under Settings -> Accessibility. -->
+        <service
+            android:name=".services.JarvisAccessibilityService"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
+
+    </application>
+</manifest>

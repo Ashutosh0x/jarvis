@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The desktop bridge is plain http:// and ws:// on the LAN. Android 9+ blocks
+  cleartext by default, so it must be permitted explicitly or every connection
+  fails with CLEARTEXT_NOT_PERMITTED.
+
+  This cannot be narrowed to RFC1918 ranges: domain-config matches hostnames
+  and literal IPs only, not CIDR blocks, and the desktop's address is assigned
+  by DHCP. The connection is instead authenticated by the shared bridge token
+  carried in the QR payload.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

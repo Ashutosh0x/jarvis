@@ -1,0 +1,23 @@
+# Build outputs
+build/
+app/build/
+*.apk
+*.aab
+*.aar
+
+# Gradle
+.gradle/
+local.properties
+gradle-app.setting
+.gradletasknamecache
+
+# Kotlin
+.kotlin/
+
+# IDE
+.idea/
+*.iml
+.cxx/captures/
+
+# OS
+.DS_Store

@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">JARVIS</string>
+    <string name="accessibility_service_label">JARVIS Device Control</string>
+    <string name="accessibility_service_description">Lets JARVIS Desktop read the current screen and perform taps, swipes, and navigation on your behalf over your local Wi-Fi network. Only enable this if you trust the paired computer — it grants access to the content of every app you open.</string>
+    <string name="link_channel_name">Desktop Link</string>
+    <string name="link_channel_desc">Ongoing connection to JARVIS Desktop</string>
+</resources>

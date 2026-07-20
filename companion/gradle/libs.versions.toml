@@ -1,0 +1,28 @@
+[versions]
+# AGP 8.7.3 + Kotlin 2.0.21 is a known-good pair against Gradle 8.10.x.
+# compileSdk 35 is the highest this AGP line fully supports; SDK 36 needs
+# AGP 8.9+, which is a separate upgrade (see README).
+agp = "8.7.3"
+kotlin = "2.0.21"
+coreKtx = "1.15.0"
+appcompat = "1.7.0"
+okhttp = "4.12.0"
+lifecycle = "2.8.7"
+webkit = "1.12.1"
+
+[libraries]
+androidx-core-ktx = { module = "androidx.core:core-ktx", version.ref = "coreKtx" }
+androidx-appcompat = { module = "androidx.appcompat:appcompat", version.ref = "appcompat" }
+androidx-lifecycle-service = { module = "androidx.lifecycle:lifecycle-service", version.ref = "lifecycle" }
+# WebViewAssetLoader: serves assets over a real https origin so the visualizer's
+# ES modules + import map load. WebView blocks module scripts from file://
+# (opaque origin -> CORS failure), which renders as a silent black screen.
+androidx-webkit = { module = "androidx.webkit:webkit", version.ref = "webkit" }
+# OkHttp carries the WebSocket client. Chosen over Ktor: one dependency,
+# no engine/coroutine plumbing, and a synchronous listener API that maps
+# cleanly onto the command dispatch loop.
+okhttp = { module = "com.squareup.okhttp3:okhttp", version.ref = "okhttp" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }

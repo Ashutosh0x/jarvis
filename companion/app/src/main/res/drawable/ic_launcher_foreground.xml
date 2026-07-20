@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Cyan wireframe orb, echoing the desktop visualizer's palette (0.1, 0.8, 1.0). -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Outer ring -->
+    <path
+        android:strokeColor="#1ACCFF"
+        android:strokeWidth="2.5"
+        android:fillColor="#00000000"
+        android:pathData="M54,30 a24,24 0 1,0 0.1,0 Z" />
+    <!-- Latitude bands -->
+    <path
+        android:strokeColor="#1ACCFF"
+        android:strokeWidth="1.5"
+        android:fillColor="#00000000"
+        android:pathData="M30,54 a24,10 0 1,0 48,0 a24,10 0 1,0 -48,0 Z" />
+    <path
+        android:strokeColor="#1ACCFF"
+        android:strokeWidth="1.5"
+        android:fillColor="#00000000"
+        android:pathData="M38,54 a16,24 0 1,0 32,0 a16,24 0 1,0 -32,0 Z" />
+    <!-- Core -->
+    <path
+        android:fillColor="#1ACCFF"
+        android:pathData="M54,50 a4,4 0 1,0 0.1,0 Z" />
+</vector>
