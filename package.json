@@ -16,7 +16,9 @@
   "dependencies": {
     "@google/genai": "^1.34.0",
     "axios": "^1.6.0",
+    "chokidar": "^5.0.0",
     "dat.gui": "^0.7.9",
+    "pdf-to-img": "^6.2.0",
     "three": "^0.158.0"
   },
   "devDependencies": {

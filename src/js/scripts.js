@@ -88,7 +88,25 @@ function animate() {
     camera.lookAt(scene.position);
 
     uniforms.u_time.value = clock.getElapsedTime();
+
+    // ✅ FFT-driven deformation: when the mic analyser is live, blend real
+    // frequency bands (bass drives the body, treble adds shimmer) with the
+    // RMS volume. Falls back to plain RMS when no analyser exists.
     let frequency = window.visualizerVolume || 0;
+    if (window.jarvisAnalyser && window.jarvisFrequencyData) {
+        window.jarvisAnalyser.getByteFrequencyData(window.jarvisFrequencyData);
+        const bins = window.jarvisFrequencyData;
+        const third = Math.floor(bins.length / 3);
+        let bass = 0, mid = 0, treble = 0;
+        for (let i = 0; i < third; i++) bass += bins[i];
+        for (let i = third; i < third * 2; i++) mid += bins[i];
+        for (let i = third * 2; i < bins.length; i++) treble += bins[i];
+        bass /= third; mid /= third; treble /= (bins.length - third * 2);
+        // Weighted mix scaled to the shader's expected 0-100-ish range
+        const fftEnergy = (bass * 0.5 + mid * 0.35 + treble * 0.15) / 255 * 100;
+        frequency = Math.max(frequency, fftEnergy);
+        window.visualizerBands = { bass, mid, treble };
+    }
     uniforms.u_frequency.value = frequency;
 
     if (visualizerModes) {
@@ -109,3 +127,34 @@ window.addEventListener('resize', () => {
     camera.updateProjectionMatrix();
     renderer.setSize(window.innerWidth, window.innerHeight);
 });
+
+// Minimal mode toggle: F2 switches between orb-only and full HUD
+window.addEventListener('keydown', (e) => {
+    if (e.key === 'F2') {
+        document.body.classList.toggle('minimal');
+    }
+});
+
+// ✅ System Diagnostics HUD — live telemetry pushed from the Electron main process
+(function initDiagnosticsHud() {
+    if (!window.electronAPI?.onSystemTelemetry) return; // browser dev mode: leave placeholders
+
+    const cpuEl = document.getElementById('diag-cpu');
+    const cpuBar = document.getElementById('diag-cpu-bar');
+    const memEl = document.getElementById('diag-mem');
+    const memBar = document.getElementById('diag-mem-bar');
+    const footer = document.getElementById('diag-footer');
+
+    const barClass = (pct) => pct >= 90 ? 'diag-bar-fill critical' : pct >= 70 ? 'diag-bar-fill warning' : 'diag-bar-fill';
+
+    window.electronAPI.onSystemTelemetry((event, t) => {
+        if (!t) return;
+        cpuEl.textContent = `${t.cpu}%`;
+        cpuBar.style.width = `${t.cpu}%`;
+        cpuBar.className = barClass(t.cpu);
+        memEl.textContent = `${t.memUsedGb}/${t.memTotalGb}G`;
+        memBar.style.width = `${t.memPercent}%`;
+        memBar.className = barClass(t.memPercent);
+        footer.textContent = `CORES ${t.cores} · UP ${t.uptimeHours}H`;
+    });
+})();

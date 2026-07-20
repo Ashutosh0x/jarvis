@@ -4,6 +4,7 @@ import {
     arrayBufferToBase64,
 } from "./audioUtils.js";
 import { performSearch, generateImage, reimagineImage } from "./toolService.js";
+import ragService from "./services/ragService.js";
 import { config } from "../config.js";
 import captureProcessorUrl from './capture-processor.js?url';
 import playbackProcessorUrl from './playback-processor.js?url';
@@ -33,6 +34,94 @@ const reimagineTool = {
     },
 };
 
+const parseDocumentOcrTool = {
+    name: "parse_document_ocr",
+    description: "Parse a local image or PDF file into structured Markdown using the local Unlimited-OCR model (Baidu, long-horizon document parsing). Use when the user asks to read, scan, parse, or extract text/tables from a document, invoice, paper, or screenshot file.",
+    parameters: {
+        type: "OBJECT",
+        properties: {
+            filePath: { type: "STRING", description: "Absolute path to the document (e.g. C:\\Users\\Name\\Downloads\\invoice.pdf). Images and multi-page PDFs are supported." }
+        },
+        required: ["filePath"],
+    },
+};
+
+const ocrScreenTool = {
+    name: "ocr_screen",
+    description: "Capture the user's current screen and parse everything visible into structured Markdown using the local Unlimited-OCR model. Use when the user says 'read my screen', 'what does my screen say', 'OCR the screen', or asks about text/tables/code currently visible on their display.",
+    parameters: {
+        type: "OBJECT",
+        properties: {},
+    },
+};
+
+const systemStatusTool = {
+    name: "get_system_status",
+    description: "Read live system diagnostics: CPU load, RAM usage, core count, and uptime. Use when the user asks about their computer's performance, load, memory, or system health.",
+    parameters: {
+        type: "OBJECT",
+        properties: {},
+    },
+};
+
+const rememberFactTool = {
+    name: "remember_fact",
+    description: "Store a fact, note, decision, or piece of information into Jarvis's persistent long-term memory. Use when the user says 'remember that...', 'note this down', 'save this', or shares durable personal/project information worth keeping. Also extract any entities and relationships mentioned.",
+    parameters: {
+        type: "OBJECT",
+        properties: {
+            content: { type: "STRING", description: "The fact or information to store, written as a complete standalone statement." },
+            entities: {
+                type: "ARRAY",
+                description: "Named entities mentioned (people, companies, projects, files).",
+                items: {
+                    type: "OBJECT",
+                    properties: {
+                        name: { type: "STRING" },
+                        type: { type: "STRING", description: "person | company | project | file | thing" }
+                    },
+                    required: ["name"]
+                }
+            },
+            relations: {
+                type: "ARRAY",
+                description: "Relationships between entities, e.g. {subject: 'Ashutosh', relation: 'works_on', object: 'FurlPay'}.",
+                items: {
+                    type: "OBJECT",
+                    properties: {
+                        subject: { type: "STRING" },
+                        relation: { type: "STRING" },
+                        object: { type: "STRING" }
+                    },
+                    required: ["subject", "relation", "object"]
+                }
+            }
+        },
+        required: ["content"],
+    },
+};
+
+const marketWatchlistTool = {
+    name: "get_market_watchlist",
+    description: "Read the user's stock/crypto watchlist with live prices, targets, and stop levels. Use when the user asks about their watchlist, portfolio watch, stock prices they track, or how their symbols are doing. READ-ONLY: you cannot place trades or modify the watchlist — the user manages it by voice commands themselves.",
+    parameters: {
+        type: "OBJECT",
+        properties: {},
+    },
+};
+
+const recallMemoryTool = {
+    name: "recall_memory",
+    description: "Search Jarvis's persistent long-term memory (facts, parsed documents, past notes, entity relationships). Use when the user asks about something previously discussed, stored, or scanned — 'what did I say about...', 'find my notes on...', 'do you remember...'. IMPORTANT: if the user's question is plural or open-ended, report ALL relevant results, not just the first.",
+    parameters: {
+        type: "OBJECT",
+        properties: {
+            query: { type: "STRING", description: "What to search for." }
+        },
+        required: ["query"],
+    },
+};
+
 /**
  * Audio Streamer - Captures and streams microphone audio (Official Pattern)
  */
@@ -49,16 +138,28 @@ class AudioStreamer {
         console.log("🎙️ [INIT] AudioStreamer created, isMuted:", this.isMuted);
     }
 
+    // Read audio-conditioning prefs saved by SettingsManager (localStorage)
+    _getAudioSettings() {
+        try {
+            const stored = JSON.parse(localStorage.getItem('jarvis_settings') || '{}');
+            return {
+                echoCancellation: stored.echoCancellation !== false, // default ON: stops speaker output feeding back into the mic
+                noiseSuppression: stored.noiseSuppression !== false, // default ON: filters fans/keystrokes
+                autoGainControl: stored.autoGainControl === true,    // default OFF: preserves dynamics
+            };
+        } catch {
+            return { echoCancellation: true, noiseSuppression: true, autoGainControl: false };
+        }
+    }
+
     async start() {
         try {
             console.log("🎙️ [START] Requesting microphone access...");
+            const audioPrefs = this._getAudioSettings();
             this.mediaStream = await navigator.mediaDevices.getUserMedia({
                 audio: {
                     sampleRate: this.sampleRate,
-                    // ✅ OPTIMIZATION: Disable all browser-level processing for near-zero latency
-                    echoCancellation: false,
-                    noiseSuppression: false,
-                    autoGainControl: false,
+                    ...audioPrefs,
                 },
             });
             console.log("🎙️ [START] Microphone access GRANTED");
@@ -126,7 +227,37 @@ class AudioStreamer {
             };
 
             const source = this.audioContext.createMediaStreamSource(this.mediaStream);
-            source.connect(this.audioWorklet);
+
+            // ✅ Low-cut filter: roll off sub-80Hz rumble (desk vibration, HVAC)
+            // before the audio ever reaches the encoder.
+            this.lowCutFilter = this.audioContext.createBiquadFilter();
+            this.lowCutFilter.type = 'highpass';
+            this.lowCutFilter.frequency.value = 80;
+            this.lowCutFilter.Q.value = 0.707;
+
+            // ✅ Gentle compressor: evens out loud/quiet speech before encoding
+            // (broadcast-style levelling — no pumping at these settings)
+            this.compressor = this.audioContext.createDynamicsCompressor();
+            this.compressor.threshold.value = -24;
+            this.compressor.knee.value = 30;
+            this.compressor.ratio.value = 4;
+            this.compressor.attack.value = 0.003;
+            this.compressor.release.value = 0.25;
+
+            // ✅ FFT Analyser: real frequency-band data for the visualizer
+            // (replaces the flat RMS number — the sphere can now react to
+            // sibilants vs bass differently). Exposed globally for scripts.js.
+            this.analyser = this.audioContext.createAnalyser();
+            this.analyser.fftSize = 256;
+            this.analyser.smoothingTimeConstant = 0.75;
+            this.frequencyData = new Uint8Array(this.analyser.frequencyBinCount);
+            window.jarvisAnalyser = this.analyser;
+            window.jarvisFrequencyData = this.frequencyData;
+
+            source.connect(this.lowCutFilter);
+            this.lowCutFilter.connect(this.compressor);
+            this.compressor.connect(this.audioWorklet);
+            this.lowCutFilter.connect(this.analyser); // parallel tap — analysis only (pre-compression)
 
             // ✅ FIX: Routing mic-to-speaker causes echo and latency. Use a silent gain node.
             const silentGain = this.audioContext.createGain();
@@ -158,6 +289,19 @@ class AudioStreamer {
     stop() {
         this.isStreaming = false;
         this.isMuted = false;
+        if (this.analyser) {
+            this.analyser.disconnect();
+            this.analyser = null;
+            window.jarvisAnalyser = null;
+        }
+        if (this.compressor) {
+            this.compressor.disconnect();
+            this.compressor = null;
+        }
+        if (this.lowCutFilter) {
+            this.lowCutFilter.disconnect();
+            this.lowCutFilter = null;
+        }
         if (this.audioWorklet) {
             this.audioWorklet.disconnect();
             this.audioWorklet = null;
@@ -288,6 +432,7 @@ export class LiveService {
 
     async disconnect() {
         console.log("LiveService: Manually disconnecting...");
+        this.manualDisconnect = true; // suppress always-on auto-reconnect
         if (this.session) {
             this.session.close();
             this.session = null;
@@ -300,11 +445,20 @@ export class LiveService {
 
     async connect() {
         this.retryCount = 0; // Reset on manual connect
+        this.manualDisconnect = false;
         await this._connectInternal();
     }
 
     async _connectInternal() {
         if (this.isConnected) return;
+
+        // No Gemini key -> cloud voice is disabled; stay offline quietly
+        // instead of spinning the reconnect loop against a dead endpoint.
+        if (!config.geminiApiKey || config.geminiApiKey.startsWith('YOUR_')) {
+            console.warn('LiveService: no Gemini API key - cloud voice disabled, local mode only');
+            this.onStateChange('DISCONNECTED');
+            return;
+        }
         this.onStateChange('CONNECTING');
 
         try {
@@ -347,11 +501,16 @@ export class LiveService {
                     onmessage: (msg) => this.handleMessage(msg),
                     onclose: (reason) => {
                         console.log("LiveService: Session closed", reason);
-                        const wasExceeded = reason?.reason?.includes("quota") || reason?.code === 1011;
 
                         this.isConnected = false;
                         this.onStateChange('DISCONNECTED');
                         this.stopAll();
+
+                        // ALWAYS-ON: unexpected closes self-heal with capped backoff.
+                        // Only a manual disconnect stays disconnected.
+                        if (!this.manualDisconnect) {
+                            this.handleRetry();
+                        }
                     },
                     onerror: (err) => {
                         console.error("LiveService: Session error", err);
@@ -370,11 +529,11 @@ export class LiveService {
                         }
                     },
                     systemInstruction: {
-                        parts: [{ text: "You are Jarvis, a highly advanced AI assistant. You are helpful, precise, and have a futuristic personality. \n\nCRITICAL RULES:\n1. If the user asks to 'create', 'generate', or 'draw' an image from scratch, you MUST use the `create_illustration` tool.\n2. If the user asks to 'take a photo', 'capture me', 'selfie', 'picture of me', or 'reimagine' them, you MUST use the `reimagine_user` tool. Do NOT just describe the video feed textually. You must generate an actual image using the tool.\n3. For real-time information, current events, or world facts, proactively use the Google Search grounding capability to provide accurate, up-to-date answers instantly.\n4. Always confirm verbally when you are about to perform an action (e.g., 'Capturing that for you now...')." }]
+                        parts: [{ text: "You are Jarvis, a highly advanced AI assistant. You are helpful, precise, and have a futuristic personality. \n\nCRITICAL RULES:\n1. If the user asks to 'create', 'generate', or 'draw' an image from scratch, you MUST use the `create_illustration` tool.\n2. If the user asks to 'take a photo', 'capture me', 'selfie', 'picture of me', or 'reimagine' them, you MUST use the `reimagine_user` tool. Do NOT just describe the video feed textually. You must generate an actual image using the tool.\n3. For real-time information, current events, or world facts, proactively use the Google Search grounding capability to provide accurate, up-to-date answers instantly.\n4. If the user asks to read, scan, parse, or extract text from a document FILE (PDF, image, invoice, paper), use the `parse_document_ocr` tool with the file's absolute path.\n5. If the user asks to read or OCR their SCREEN ('what's on my screen', 'read this error'), use the `ocr_screen` tool.\n6. If the user asks about their computer's performance, CPU, RAM, or system health, use the `get_system_status` tool and report the numbers.\n7. If the user shares information worth keeping ('remember that...', durable facts about their projects/preferences), use `remember_fact` — include entities and relations. If they ask about past information ('what did I say about...', 'find my notes on...'), use `recall_memory`. When a recall question is plural or open-ended, enumerate ALL relevant results, not just the top one.\n8. Always confirm verbally when you are about to perform an action (e.g., 'Scanning that document now...'). Document parsing can take up to a minute — tell the user you're working on it." }]
                     },
                     tools: [
                         { googleSearchRetrieval: {} },
-                        { functionDeclarations: [createTool, reimagineTool] }
+                        { functionDeclarations: [createTool, reimagineTool, parseDocumentOcrTool, ocrScreenTool, systemStatusTool, rememberFactTool, recallMemoryTool, marketWatchlistTool] }
                     ]
                 }
             });
@@ -382,7 +541,7 @@ export class LiveService {
         } catch (error) {
             console.error("LiveService: Connection failed", error);
             this.onStateChange('ERROR');
-            if (this.retryCount < this.maxRetries) {
+            if (!this.manualDisconnect) {
                 this.handleRetry();
             }
         }
@@ -390,12 +549,14 @@ export class LiveService {
 
     handleRetry() {
         this.retryCount++;
-        const delay = this.retryDelay * Math.pow(2, this.retryCount - 1);
-        console.warn(`LiveService: Quota exceeded or connection lost. Retrying in ${delay}ms (Attempt ${this.retryCount}/${this.maxRetries})`);
+        // Capped exponential backoff (max 30s) — the session keeps trying
+        // forever so Jarvis stays "always listening" through network blips.
+        const delay = Math.min(this.retryDelay * Math.pow(2, this.retryCount - 1), 30000);
+        console.warn(`LiveService: Connection lost. Reconnecting in ${delay}ms (attempt ${this.retryCount})`);
         this.onStateChange('RETRYING');
 
         setTimeout(() => {
-            this._connectInternal();
+            if (!this.manualDisconnect) this._connectInternal();
         }, delay);
     }
 
@@ -486,6 +647,7 @@ export class LiveService {
         if (message.toolCall) {
             for (const fc of message.toolCall.functionCalls) {
                 let result = { result: "ok" };
+                const startedAt = Date.now();
 
                 try {
                     if (fc.name === "create_illustration") {
@@ -520,19 +682,131 @@ export class LiveService {
                             });
                             result = { result: "Photo captured and processing." };
                         }
+
+                    } else if (fc.name === "parse_document_ocr") {
+                        const filePath = fc.args.filePath;
+                        this.onMessage({ role: 'model', text: `Parsing document: ${filePath}...` });
+                        if (!window.electronAPI?.performOCR) {
+                            result = { error: "OCR bridge not available in this environment." };
+                        } else {
+                            // Long-horizon parsing can take a while — defer the tool response
+                            result = null;
+                            window.electronAPI.performOCR({ filePath }).then(ocr => {
+                                if (ocr.success) {
+                                    this.onMessage({
+                                        role: 'system',
+                                        text: `Document parsed (${ocr.pages} page${ocr.pages > 1 ? 's' : ''}, ${ocr.mode} mode)`,
+                                        metadata: { type: 'ocr_markdown', content: ocr.markdown, source: filePath }
+                                    });
+                                    // Auto-ingest into long-term memory: parsed docs become recallable
+                                    ragService.ingest(ocr.markdown, { source: filePath })
+                                        .catch(e => console.warn('RAG ingest of OCR failed:', e));
+                                    this._sendToolResult(fc, { parsed_content: ocr.markdown });
+                                } else {
+                                    this.onMessage({ role: 'system', text: `OCR failed: ${ocr.error}` });
+                                    this._sendToolResult(fc, { error: ocr.error });
+                                }
+                            }).catch(e => this._sendToolResult(fc, { error: e.message }));
+                        }
+
+                    } else if (fc.name === "ocr_screen") {
+                        this.onMessage({ role: 'model', text: `Scanning your screen...` });
+                        if (!window.electronAPI?.captureScreen) {
+                            result = { error: "Screen capture bridge not available." };
+                        } else {
+                            result = null;
+                            window.electronAPI.captureScreen().then(cap => {
+                                if (!cap?.success) throw new Error(cap?.error || 'Screen capture failed');
+                                return window.electronAPI.performOCR({ imageBase64: cap.image, mode: 'gundam' });
+                            }).then(ocr => {
+                                if (ocr.success) {
+                                    this.onMessage({
+                                        role: 'system',
+                                        text: 'Screen parsed',
+                                        metadata: { type: 'ocr_markdown', content: ocr.markdown, source: 'screen' }
+                                    });
+                                    ragService.ingest(ocr.markdown, { source: `screen-${new Date().toISOString().slice(0, 10)}` })
+                                        .catch(e => console.warn('RAG ingest of screen OCR failed:', e));
+                                    this._sendToolResult(fc, { screen_content: ocr.markdown });
+                                } else {
+                                    this.onMessage({ role: 'system', text: `Screen OCR failed: ${ocr.error}` });
+                                    this._sendToolResult(fc, { error: ocr.error });
+                                }
+                            }).catch(e => this._sendToolResult(fc, { error: e.message }));
+                        }
+
+                    } else if (fc.name === "get_system_status") {
+                        if (!window.electronAPI?.getSystemTelemetry) {
+                            result = { error: "Telemetry bridge not available." };
+                        } else {
+                            const t = await window.electronAPI.getSystemTelemetry();
+                            result = {
+                                cpu_load_percent: t.cpu,
+                                ram_used_gb: t.memUsedGb,
+                                ram_total_gb: t.memTotalGb,
+                                ram_percent: t.memPercent,
+                                cpu_cores: t.cores,
+                                uptime_hours: t.uptimeHours,
+                                active_window: t.activeWindow?.app
+                                    ? `${t.activeWindow.app}: ${t.activeWindow.title}`
+                                    : 'unknown'
+                            };
+                        }
+
+                    } else if (fc.name === "remember_fact") {
+                        const { stored, deduped } = await ragService.ingest(fc.args.content, {
+                            source: 'voice-note',
+                            entities: fc.args.entities,
+                            relations: fc.args.relations,
+                        });
+                        this.onMessage({ role: 'system', text: `Memory stored: ${fc.args.content.slice(0, 80)}${fc.args.content.length > 80 ? '…' : ''}` });
+                        result = { status: stored ? "stored" : (deduped ? "already known" : "stored"), memory_stats: ragService.stats() };
+
+                    } else if (fc.name === "get_market_watchlist") {
+                        if (!window.electronAPI?.watchlistGet) {
+                            result = { error: "Watchlist bridge not available." };
+                        } else {
+                            const list = await window.electronAPI.watchlistGet();
+                            result = {
+                                watchlist: list.map(item => ({
+                                    symbol: item.symbol,
+                                    price: item.quote?.price ?? null,
+                                    currency: item.quote?.currency ?? 'USD',
+                                    target: item.target,
+                                    stop: item.stop
+                                })),
+                                note: "Read-only data. Trading is not possible through this system."
+                            };
+                        }
+
+                    } else if (fc.name === "recall_memory") {
+                        const { context, results } = await ragService.recall(fc.args.query);
+                        if (results.length || context) {
+                            result = { recalled: context, result_count: results.length };
+                        } else {
+                            result = { recalled: "", result_count: 0, note: "Nothing in memory matches this query." };
+                        }
                     }
 
-                    if (this.isSessionLive()) {
-                        this.session.sendToolResponse({
-                            functionResponses: [{
-                                id: fc.id,
-                                name: fc.name,
-                                response: result
-                            }]
-                        });
+                    // result === null means the tool defers its response until its async work finishes
+                    if (result !== null) {
+                        this._logTrajectory(fc, result, startedAt);
+                        if (this.isSessionLive()) {
+                            this.session.sendToolResponse({
+                                functionResponses: [{
+                                    id: fc.id,
+                                    name: fc.name,
+                                    response: result
+                                }]
+                            });
+                        }
+                    } else {
+                        // Deferred tools log their outcome in _sendToolResult
+                        fc._startedAt = startedAt;
                     }
                 } catch (e) {
                     console.error("Tool execution error:", e);
+                    this._logTrajectory(fc, { error: e.message }, startedAt);
                 }
             }
         }
@@ -567,6 +841,37 @@ export class LiveService {
                 });
             }
         }
+    }
+
+    // Send a deferred tool response (used by long-running tools like OCR)
+    _sendToolResult(fc, response) {
+        this._logTrajectory(fc, response, fc._startedAt || Date.now());
+        if (this.isSessionLive()) {
+            this.session.sendToolResponse({
+                functionResponses: [{
+                    id: fc.id,
+                    name: fc.name,
+                    response
+                }]
+            });
+        }
+    }
+
+    // ATDP-lite trajectory event (arXiv:2607.01120): observation → action →
+    // outcome → latency, persisted as JSONL for future learning/replay.
+    _logTrajectory(fc, response, startedAt) {
+        if (!window.electronAPI?.logTrajectory) return;
+        const truncate = (obj) => {
+            const s = JSON.stringify(obj) || '';
+            return s.length > 500 ? s.slice(0, 500) + '…' : s;
+        };
+        window.electronAPI.logTrajectory({
+            action: fc.name,
+            args: truncate(fc.args || {}),
+            outcome: truncate(response),
+            success: !response?.error,
+            latencyMs: Date.now() - startedAt,
+        }).catch(() => { /* never break the agent loop */ });
     }
 
     setMediaLoading(isLoading) {

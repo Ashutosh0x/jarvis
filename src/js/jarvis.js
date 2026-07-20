@@ -4,6 +4,10 @@ import ScreenCapture from './screenCapture.js';
 import CalendarSystem from './calendar.js';
 import SettingsManager from './settings.js';
 import { LiveService } from './liveService.js';
+import { generateContentLocal, checkOllama, routeLocalAction } from './toolService.js';
+import ragService from './services/ragService.js';
+import { LocalVoiceService } from './services/voiceService.js';
+import { config } from '../config.js';
 
 class Jarvis {
     constructor() {
@@ -32,9 +36,53 @@ class Jarvis {
         this.settings = new SettingsManager();
         this.applySettings();
 
+        // No Gemini key -> force local Gemma regardless of stored settings
+        // (prevents stale localStorage from routing to a dead cloud endpoint)
+        this.localVoice = null;
+        this.followUpUntil = 0;
+        if (!config.geminiApiKey || config.geminiApiKey.startsWith('YOUR_')) {
+            this.settings.set('llmProvider', 'gemma-local');
+            console.log('Jarvis: running in LOCAL mode (Gemma via Ollama)');
+
+            // Always-on local voice loop: mic -> VAD -> faster-whisper -> commands
+            // NOTE: the TTS gate uses this.ttsActive (explicit flag), NOT
+            // synthesis.speaking — Chromium's speaking flag can stick true
+            // forever after an utterance, which would permanently deafen the mic.
+            this.ttsActive = false;
+            this.localVoice = new LocalVoiceService({
+                onTranscript: (text) => this._handleVoiceTranscript(text),
+                onVolume: (v) => { window.visualizerVolume = v; },
+                onStatus: (s) => this._onVoiceStatus(s),
+                isTtsSpeaking: () => this.ttsActive,
+            });
+            setTimeout(() => {
+                this.localVoice.start().catch(e => {
+                    console.warn('LocalVoice: mic start failed (voice input disabled)', e);
+                    this._showTranscript(`Microphone unavailable: ${e.name || e.message}`, 'error', 'MIC ERROR', 0);
+                });
+            }, 1500);
+        }
+
         // Live Service (Gemini Multimodal Live)
         this.liveService = new LiveService();
         this.setupLiveService();
+
+        // Phone Bridge (Wi-Fi notification relay from Android)
+        this.recentNotifications = new Map(); // dedupe hash -> ts
+        this.setupPhoneBridge();
+
+        // Event-Driven Core (JARVIS v4): OS events -> router -> act/announce
+        this.activeWindow = null;
+        this.setupEventBus();
+
+        // Local-mode startup greeting (the cloud greeting only fires when the
+        // Live session connects; without a Gemini key that never happens).
+        // Delayed so the TTS voice list has time to load.
+        setTimeout(() => {
+            if (!this.liveService || !this.liveService.isConnected) {
+                this.speak('Systems online. Local intelligence active. How may I assist, Sir?');
+            }
+        }, 3000);
 
         // Camera State
         this.cameraStream = null;
@@ -87,7 +135,7 @@ class Jarvis {
         } else {
             // Always-on mode: hide PTT indicator, mic is always active
             if (this.pttIndicator) {
-                this.pttIndicator.textContent = '🎙️ ALWAYS LISTENING';
+                this.pttIndicator.textContent = 'ALWAYS LISTENING';
                 this.pttIndicator.classList.add('active');
             }
         }
@@ -126,10 +174,10 @@ class Jarvis {
         if (this.pttIndicator) {
             if (active) {
                 this.pttIndicator.classList.add('active');
-                this.pttIndicator.textContent = '🎙️ SPEAKING';
+                this.pttIndicator.textContent = 'SPEAKING';
             } else {
                 this.pttIndicator.classList.remove('active');
-                this.pttIndicator.textContent = '⏸️ HOLD SPACE TO TALK';
+                this.pttIndicator.textContent = 'HOLD SPACE TO TALK';
             }
         }
 
@@ -387,13 +435,10 @@ class Jarvis {
         let color = 'text-slate-400';
 
         if (role === 'model') {
-            icon = '🛰️';
             color = 'text-cyan-400';
         } else if (role === 'user') {
-            icon = '👤';
             color = 'text-slate-100';
         } else {
-            icon = '⚙️';
             color = 'text-slate-500';
         }
 
@@ -723,10 +768,63 @@ class Jarvis {
             this.startAlwaysOnListening();
         });
 
-        // Note: Clean speech is now handled directly by Gemini Audio output 
-        // through the LiveService. Local speak method is now UI only to prevent
-        // system voice (e.g., David/Mark) from interrupting the neural link.
-        console.log("Jarvis (UI):", text);
+        // When the Gemini Live session is active, ITS audio stream is the
+        // voice — stay silent locally to avoid two voices talking over each
+        // other. In local mode (no cloud), Windows TTS is the voice.
+        if (this.liveService && this.liveService.isConnected) {
+            console.log("Jarvis (via Live audio):", text);
+            return;
+        }
+
+        try {
+            // Strip markdown noise so TTS reads clean sentences
+            const clean = String(text)
+                .replace(/```[\s\S]*?```/g, ' code block omitted ')
+                .replace(/[*_#`>|]/g, '')
+                .replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}]/gu, '') // no emojis, ever
+                .replace(/\s+/g, ' ')
+                .trim();
+            if (!clean) return;
+
+            // Flush the queue: the newest information wins
+            this.synthesis.cancel();
+
+            const utterance = new SpeechSynthesisUtterance(clean);
+            if (this.selectedVoice) utterance.voice = this.selectedVoice;
+            utterance.rate = this.settings.get('speechRate') || 1.0;
+            utterance.pitch = this.settings.get('speechPitch') || 1.0;
+            utterance.volume = this.settings.get('speechVolume') || 1.0;
+
+            // Explicit TTS-active flag for the mic gate. Never trust
+            // synthesis.speaking — Chromium can leave it stuck true forever,
+            // which would permanently deafen the voice loop.
+            this.ttsActive = true;
+            // Safety net: force-clear even if onend never fires (~400ms/word)
+            const maxMs = Math.min(clean.split(/\s+/).length * 450 + 3000, 30000);
+            clearTimeout(this._ttsSafetyTimer);
+            this._ttsSafetyTimer = setTimeout(() => { this.ttsActive = false; }, maxMs);
+
+            // Chromium bug workaround: synthesis silently pauses on long
+            // utterances (~15s). Nudge it with resume() while speaking.
+            const resumeTimer = setInterval(() => {
+                if (this.synthesis.speaking) this.synthesis.resume();
+                else clearInterval(resumeTimer);
+            }, 10000);
+            utterance.onstart = () => { this.ttsActive = true; };
+            utterance.onend = () => {
+                clearInterval(resumeTimer);
+                this.ttsActive = false;
+            };
+            utterance.onerror = (e) => {
+                clearInterval(resumeTimer);
+                this.ttsActive = false;
+                console.warn('TTS error:', e.error);
+            };
+
+            this.synthesis.speak(utterance);
+        } catch (e) {
+            console.warn('TTS unavailable:', e);
+        }
     }
 
     // Get location from IP - SECURITY FIX: Use HTTPS endpoint
@@ -899,6 +997,64 @@ class Jarvis {
         // Screen Capture Commands
         if (cmd.includes('take screenshot') || cmd.includes('screenshot')) return { intent: 'SCREENSHOT' };
         if (cmd.includes('read screen') || cmd.includes('what\'s on my screen') || cmd.includes('read my screen')) return { intent: 'READ_SCREEN' };
+        if (cmd.includes('phone setup') || cmd.includes('phone bridge') || cmd.includes('connect my phone') || cmd.includes('pair my phone')) return { intent: 'PHONE_SETUP' };
+        if (cmd.includes('scan') && (cmd.includes('wifi') || cmd.includes('wi-fi') || cmd.includes('network'))) return { intent: 'WIFI_SCAN' };
+        if (cmd.includes('available networks') || cmd === 'list wifi') return { intent: 'WIFI_SCAN' };
+        // "connect to <specific network name>" -> Wi-Fi connect (checked BEFORE
+        // the generic settings matcher so named networks take priority)
+        const wifiConnectMatch = cmd.match(/connect\s+(?:me\s+)?(?:to|with)\s+(?:my\s+|the\s+)?(.+)/);
+        if (wifiConnectMatch) {
+            let name = wifiConnectMatch[1]
+                .replace(/\b(device|hotspot|wifi|wi-fi|network|phone)\b/g, '')
+                .replace(/\s+/g, ' ').trim();
+            // Bare "connect to wifi/bluetooth" (no name) falls through to settings
+            if (name && !/^(wifi|wi-fi|bluetooth|internet)$/.test(name)) {
+                return { intent: 'WIFI_CONNECT', name };
+            }
+        }
+        const settingsMatch = cmd.match(/\b(?:turn (?:on|off)|open|enable|disable|connect(?: to)?)\s+(?:my\s+)?(wifi|wi-fi|bluetooth|sound|display|battery|notifications?)\b/);
+        if (settingsMatch) {
+            let page = settingsMatch[1].replace('wi-fi', 'wifi');
+            if (page === 'notification') page = 'notifications';
+            return { intent: 'OPEN_SETTINGS', page };
+        }
+        if (cmd.includes('use laptop mic') || cmd.includes('use internal mic') || cmd.includes('use built-in mic') || cmd.includes('use laptop microphone') || cmd.includes('use internal microphone')) return { intent: 'MIC_INTERNAL' };
+        if (cmd.includes('use earbuds mic') || cmd.includes('use headset mic') || cmd.includes('use earbuds microphone') || cmd.includes('use headset microphone')) return { intent: 'MIC_HEADSET' };
+        if (cmd.includes('which mic') || cmd.includes('which microphone') || cmd.includes('what microphone')) return { intent: 'MIC_WHICH' };
+        if (cmd.includes('earbuds') || cmd.includes('earbud') || cmd.includes('headphone battery') || cmd.includes('bluetooth battery') || cmd.includes('bluetooth status')) return { intent: 'EARBUDS_STATUS' };
+        if (cmd.includes('meeting mode') || cmd.includes('joining a meeting') || cmd.includes('join a meeting')) return { intent: 'MEETING_MODE' };
+        if (cmd.includes('volume down') || cmd.includes('lower the volume') || cmd.includes('decrease volume')) return { intent: 'VOLUME_DOWN' };
+        const rememberMatch = cmd.match(/^(?:please\s+)?(?:remember|note)(?:\s+that)?\s+(.{3,})/);
+        if (rememberMatch) return { intent: 'REMEMBER', text: rememberMatch[1] };
+        const recallMatch = cmd.match(/(?:what do you (?:remember|know) about|do you remember|recall)\s+(.{2,})/);
+        if (recallMatch) return { intent: 'RECALL', query: recallMatch[1] };
+        if (cmd.includes('pause music') || cmd.includes('play music') || cmd.includes('pause the music') || cmd.includes('resume music')) return { intent: 'MEDIA_PLAYPAUSE' };
+        if (cmd.includes('next track') || cmd.includes('next song') || cmd.includes('skip song') || cmd.includes('skip track')) return { intent: 'MEDIA_NEXT' };
+        if (cmd.includes('previous track') || cmd.includes('previous song') || cmd.includes('last song')) return { intent: 'MEDIA_PREV' };
+
+        // Secure key storage: handled locally, NEVER forwarded to any LLM
+        if (cmd.startsWith('store key ') || cmd.startsWith('set key ')) return { intent: 'SET_KEY', raw: command };
+        if (cmd === 'list keys' || cmd === 'list my keys') return { intent: 'LIST_KEYS' };
+
+        // Finance watchlist
+        if (cmd.includes('watchlist') || cmd.startsWith('watch ')) {
+            if (cmd.includes('remove') || cmd.includes('delete')) {
+                const rm = cmd.match(/(?:remove|delete)\s+([a-z0-9.\-]{1,15})/);
+                if (rm) return { intent: 'WATCHLIST_REMOVE', symbol: rm[1] };
+            }
+            const add = cmd.match(/(?:add|watch)\s+([a-z0-9.\-]{1,15})/);
+            if (add && add[1] !== 'my' && !cmd.match(/^(?:show|open|read)/)) {
+                const target = cmd.match(/(?:at|target(?:\s+of)?|above)\s+\$?([\d,]+(?:\.\d+)?)/);
+                const stop = cmd.match(/(?:stop(?:\s+loss)?|below)\s+\$?([\d,]+(?:\.\d+)?)/);
+                return {
+                    intent: 'WATCHLIST_ADD',
+                    symbol: add[1],
+                    target: target ? parseFloat(target[1].replace(/,/g, '')) : null,
+                    stop: stop ? parseFloat(stop[1].replace(/,/g, '')) : null
+                };
+            }
+            return { intent: 'WATCHLIST_SHOW' };
+        }
 
         // File Operation Commands
         if (cmd.includes('create folder') || cmd.includes('make folder')) {
@@ -1016,6 +1172,84 @@ class Jarvis {
                     break;
                 case 'READ_SCREEN':
                     await this.handleReadScreen();
+                    break;
+                case 'PHONE_SETUP':
+                    await this.handlePhoneBridgeSetup();
+                    break;
+                case 'EARBUDS_STATUS':
+                    await this.handleEarbudsStatus();
+                    break;
+                case 'MIC_INTERNAL':
+                    if (this.localVoice) { this.localVoice.setMicPreference('internal'); this.speak('Switching to the internal microphone.'); }
+                    break;
+                case 'MIC_HEADSET':
+                    if (this.localVoice) { this.localVoice.setMicPreference('headset'); this.speak('Switching to the earbuds microphone.'); }
+                    break;
+                case 'MIC_WHICH':
+                    this.speak(this.localVoice?.currentMicLabel
+                        ? `I am listening through: ${this.localVoice.currentMicLabel}.`
+                        : 'Voice input is not active.');
+                    break;
+                case 'OPEN_SETTINGS':
+                    if (window.electronAPI?.openSettings) {
+                        await window.electronAPI.openSettings(intent.page);
+                        this.speak(`I cannot toggle ${intent.page} directly without administrator rights, Sir - opening the ${intent.page} settings for you instead.`);
+                    }
+                    break;
+                case 'VOLUME_DOWN':
+                    window.electronAPI?.systemCommand('volume-down');
+                    this.speak('Volume decreased.');
+                    break;
+                case 'WIFI_SCAN':
+                    await this.handleWifiScan();
+                    break;
+                case 'WIFI_CONNECT':
+                    await this.handleWifiConnect(intent.name);
+                    break;
+                case 'REMEMBER': {
+                    const r = await ragService.ingest(intent.text, { source: 'voice-note' });
+                    this.speak(r.stored ? 'Noted and stored, Sir.' : 'I already have that in memory, Sir.');
+                    break;
+                }
+                case 'RECALL': {
+                    const { context, results } = await ragService.recall(intent.query);
+                    if (!results.length && !context) {
+                        this.speak(`I have nothing in memory about ${intent.query}, Sir.`);
+                    } else {
+                        this.displayText(context.slice(0, 800), null);
+                        this.speak(results[0] ? results[0].text.slice(0, 250) : context.slice(0, 250));
+                    }
+                    break;
+                }
+                case 'MEETING_MODE':
+                    await this.handleMeetingMode();
+                    break;
+                case 'MEDIA_PLAYPAUSE':
+                    window.electronAPI?.systemCommand('play-pause');
+                    this.speak('Done.');
+                    break;
+                case 'MEDIA_NEXT':
+                    window.electronAPI?.systemCommand('next-track');
+                    this.speak('Next track.');
+                    break;
+                case 'MEDIA_PREV':
+                    window.electronAPI?.systemCommand('prev-track');
+                    this.speak('Previous track.');
+                    break;
+                case 'SET_KEY':
+                    await this.handleStoreKey(intent.raw);
+                    break;
+                case 'LIST_KEYS':
+                    await this.handleListKeys();
+                    break;
+                case 'WATCHLIST_ADD':
+                    await this.handleWatchlistAdd(intent.symbol, intent.target, intent.stop);
+                    break;
+                case 'WATCHLIST_REMOVE':
+                    await this.handleWatchlistRemove(intent.symbol);
+                    break;
+                case 'WATCHLIST_SHOW':
+                    await this.handleWatchlistShow();
                     break;
                 case 'CREATE_FOLDER':
                     await this.handleCreateFolder(intent.name);
@@ -1225,13 +1459,40 @@ class Jarvis {
         }
     }
 
-    // Screen Analysis Handler - Uses Gemini Vision for OCR + Analysis
+    // Screen Analysis Handler
+    // Prefers local Unlimited-OCR (private, structured Markdown) when the
+    // SGLang server is up; falls back to Gemini Vision otherwise.
     async handleReadScreen() {
         try {
             this.displayText('Analyzing your screen...', null);
 
             if (!window.electronAPI || !window.electronAPI.captureScreen) {
                 this.speak('Screen analysis is not available in this environment');
+                return;
+            }
+
+            // Try local Unlimited-OCR first (ocrProvider: 'auto' or 'local')
+            const ocrProvider = this.settings.get('ocrProvider') || 'auto';
+            if (ocrProvider !== 'cloud' && await this.screenCapture.isOcrAvailable()) {
+                try {
+                    this.speak('Parsing your screen with local vision.');
+                    const markdown = await this.screenCapture.captureAndRead();
+                    this.memory.addMessage('assistant', `Screen OCR result:\n${markdown}`);
+                    this.displayText(markdown.slice(0, 600) + (markdown.length > 600 ? '…' : ''), null);
+                    // Hand the parsed text to the live session for reasoning, if connected
+                    if (this.liveService && this.liveService.isConnected) {
+                        this.liveService.sendText(`I just OCR'd my screen. Here is the structured Markdown content — summarize what I'm working on and answer any follow-ups from it:\n\n${markdown.slice(0, 8000)}`);
+                    }
+                    return;
+                } catch (e) {
+                    console.warn('Local OCR failed, falling back to Gemini Vision:', e.message);
+                }
+            }
+
+            // No local OCR server and no cloud key: say so honestly instead
+            // of silently attempting a dead Gemini Vision path.
+            if (!config.geminiApiKey || config.geminiApiKey.startsWith('YOUR_')) {
+                this.speak('Screen reading needs the local OCR server, Sir. Start the Unlimited-OCR server from docs slash OCR setup, and I will read anything on your display.');
                 return;
             }
 
@@ -1619,13 +1880,382 @@ class Jarvis {
         }
     }
 
-    // AI Command Handler (Gemini)
+    // Phone Bridge: real-time notification announcements from the paired phone.
+    // The phone (via MacroDroid) POSTs each notification to the LAN listener in
+    // electron.js; here we announce it, display it, and store it in memory.
+    setupPhoneBridge() {
+        if (!window.electronAPI?.onPhoneNotification) return;
+
+        window.electronAPI.onPhoneNotification((event, notif) => {
+            if (!notif) return;
+
+            // Dedupe: identical notification within 15s is announced once
+            // (Android often re-posts the same notification on updates)
+            const hash = `${notif.app}|${notif.title}|${notif.text}`.slice(0, 300);
+            const now = Date.now();
+            const last = this.recentNotifications.get(hash);
+            if (last && now - last < 15000) return;
+            this.recentNotifications.set(hash, now);
+            // Prune old entries
+            if (this.recentNotifications.size > 50) {
+                for (const [k, ts] of this.recentNotifications) {
+                    if (now - ts > 60000) this.recentNotifications.delete(k);
+                }
+            }
+
+            const sender = notif.title || notif.app;
+            const appName = notif.app.replace(/^com\.[a-z0-9.]*\./i, '');
+            const announcement = notif.title
+                ? `Sir, you have a new message from ${sender} on ${appName}.`
+                : `Sir, new notification from ${appName}.`;
+
+            this.speak(announcement);
+            const preview = notif.text ? `${sender}: ${notif.text.slice(0, 200)}` : sender;
+            this.displayText(`Phone - ${appName}\n${preview}`, null);
+
+            // Store in long-term memory so "what messages did I get today?" works
+            ragService.ingest(
+                `Phone notification (${appName}) from ${sender}: ${notif.text || notif.title}`,
+                { source: `phone-${appName}` }
+            ).catch(() => { /* memory is best-effort here */ });
+
+            // If the live session is up, give Gemini the context silently so
+            // follow-up questions ("what did they say?") work naturally
+            if (this.liveService && this.liveService.isConnected) {
+                this.liveService.sendText(
+                    `[System event, do not respond unless asked] Phone notification on ${appName} from ${sender}: ${notif.text || '(no text)'}`
+                );
+            }
+        });
+    }
+
+    // Live transcript overlay on the visualizer: every mic state change and
+    // every transcript is shown in real time, so you can always SEE that the
+    // mic heard you — even for speech Jarvis chooses not to act on.
+    _showTranscript(text, mode = 'ambient', status = '', hideAfterMs = 4500) {
+        const box = document.getElementById('voice-transcript');
+        const statusEl = document.getElementById('vt-status');
+        const textEl = document.getElementById('vt-text');
+        if (!box || !textEl) return;
+
+        box.className = `visible ${mode}`;
+        statusEl.textContent = status;
+        textEl.textContent = text;
+
+        clearTimeout(this._vtTimer);
+        if (hideAfterMs > 0) {
+            this._vtTimer = setTimeout(() => box.classList.remove('visible'), hideAfterMs);
+        }
+    }
+
+    _onVoiceStatus(s) {
+        console.log('LocalVoice status:', s);
+        if (s === 'listening') {
+            this._showTranscript('...', 'listening', 'LISTENING', 0);
+        } else if (s === 'processing') {
+            this._showTranscript('...', 'listening', 'TRANSCRIBING', 8000);
+        } else if (s.startsWith('mic-active')) {
+            const label = s.split(':')[1] || 'default device';
+            this._showTranscript(`Microphone active: ${label}. Just speak - I am listening.`, 'acted', 'MIC ONLINE', 6000);
+        } else if (s === 'stt-connected') {
+            this._showTranscript('Speech recognition online.', 'acted', 'STT READY', 4000);
+        } else if (s === 'mic-switching') {
+            this._showTranscript('Audio device changed - switching microphone...', 'acted', 'MIC SWITCH', 5000);
+        } else if (s === 'stt-disconnected') {
+            this._showTranscript('Speech server offline - retrying. Voice input paused.', 'error', 'STT OFFLINE', 8000);
+        } else if (s.startsWith('mic-error')) {
+            this._showTranscript(`Microphone error: ${s.split(':')[1] || 'unknown'}`, 'error', 'MIC ERROR', 0);
+        }
+    }
+
+    // Local voice transcripts: EVERYTHING heard is displayed on the
+    // visualizer in real time. Only wake-word speech (or the 10 s follow-up
+    // window) is acted on; ambient speech is shown, then dropped — never
+    // stored anywhere.
+    _handleVoiceTranscript(text) {
+        const t = String(text).trim();
+        if (!t) {
+            this._showTranscript('(silence - nothing recognized)', 'ambient', 'HEARD', 2500);
+            return;
+        }
+        const lower = t.toLowerCase();
+
+        // OPEN CONVERSATION MODE: everything you say goes to the LLM and
+        // Jarvis answers by voice. No wake word required. If you do lead
+        // with "Jarvis" (or a Whisper mishear of it), it's stripped so the
+        // model sees a clean sentence.
+        const wakeRe = /^\s*(hey\s+)?(j[ae]rv[aeiu]s|gervais|jarvis)[,.!?\s]*/i;
+        const cmd = lower.replace(wakeRe, '').trim();
+
+        // Drop pure filler blips that would spam the model
+        if (!cmd || cmd.length < 2 || /^(uh|um|hmm|mm)[.!?]?$/.test(cmd)) {
+            this._showTranscript(t, 'ambient', 'HEARD');
+            return;
+        }
+
+        this._showTranscript(t, 'acted', 'YOU SAID');
+        this.processCommand(cmd);
+    }
+
+    // Event-Driven Core router: main-process watchers publish typed events;
+    // this decides whether to announce, ingest, or stay silent.
+    setupEventBus() {
+        if (!window.electronAPI?.onJarvisEvent) return;
+
+        window.electronAPI.onJarvisEvent(async (event, evt) => {
+            if (!evt) return;
+            try {
+                switch (evt.type) {
+                    case 'download-added': {
+                        const { filePath, name } = evt.payload;
+                        this.speak(`Sir, a new document arrived in Downloads: ${name}.`);
+                        // Auto-read it if the local OCR server is up, then memorize
+                        if (await this.screenCapture.isOcrAvailable()) {
+                            const result = await window.electronAPI.performOCR({ filePath });
+                            if (result.success) {
+                                await ragService.ingest(result.markdown, { source: name });
+                                this.speak(`I have read and memorized ${name}. Ask me about it anytime.`);
+                                this.displayText(`Ingested: ${name} (${result.pages} page${result.pages > 1 ? 's' : ''})`, null);
+                            }
+                        }
+                        break;
+                    }
+
+                    case 'clipboard-secret': {
+                        // Privacy: only the masked hint ever reaches this process.
+                        // Deliberately NOT stored in RAG or trajectory logs.
+                        const { kind, masked } = evt.payload;
+                        this.speak(`Sir, careful. I detected what looks like a ${kind} on your clipboard. Mind where you paste it.`);
+                        this.displayText(`Clipboard warning: ${kind} detected (${masked})`, null);
+                        break;
+                    }
+
+                    case 'active-window': {
+                        // Silent context tracking — no announcements, just awareness.
+                        this.activeWindow = evt.payload;
+                        break;
+                    }
+
+                    case 'price-alert': {
+                        // Watchlist target/stop crossing — always announce
+                        const { message, type } = evt.payload;
+                        const prefix = type === 'stop' ? 'Sir, heads up.' : 'Sir, good news.';
+                        this.speak(`${prefix} ${message}`);
+                        this.displayText(`Market alert: ${message}`, null);
+                        break;
+                    }
+                }
+            } catch (e) {
+                console.warn('Event router error:', evt.type, e);
+            }
+        });
+    }
+
+    // Wi-Fi voice control: scan and connect to saved networks (no admin)
+    async handleWifiScan() {
+        if (!window.electronAPI?.wifiScan) {
+            this.speak('Wi-Fi control is not available in this environment.');
+            return;
+        }
+        this.displayText('Scanning Wi-Fi networks...', null);
+        const result = await window.electronAPI.wifiScan();
+        if (!result.success || !result.networks.length) {
+            this.speak('I could not find any Wi-Fi networks in range, Sir.');
+            return;
+        }
+        const sorted = result.networks.sort((a, b) => b.signal - a.signal);
+        this.displayText('Networks in range\n' + sorted.map(n => `${n.ssid} - ${n.signal}%`).join('\n'), null);
+        const top = sorted.slice(0, 4).map(n => `${n.ssid} at ${n.signal} percent`).join('. ');
+        this.speak(`I found ${result.networks.length} network${result.networks.length > 1 ? 's' : ''}, Sir. ${top}.`);
+    }
+
+    async handleWifiConnect(name) {
+        if (!window.electronAPI?.wifiConnect) {
+            this.speak('Wi-Fi control is not available in this environment.');
+            return;
+        }
+        this.speak(`Connecting to ${name}, Sir. One moment.`);
+        this.displayText(`Connecting to ${name}...`, null);
+        const result = await window.electronAPI.wifiConnect(name);
+        if (result.success) {
+            this.speak(`Connected to ${result.ssid}, Sir.`);
+            this.displayText(`Connected: ${result.ssid}`, null);
+        } else {
+            this.speak(result.error);
+            this.displayText(result.error, null);
+        }
+    }
+
+    // Bluetooth audio status (voice: "earbuds status" / "headphone battery")
+    async handleEarbudsStatus() {
+        if (!window.electronAPI?.getBluetoothAudio) {
+            this.speak('Bluetooth status is not available in this environment.');
+            return;
+        }
+        this.displayText('Checking Bluetooth devices...', null);
+        const result = await window.electronAPI.getBluetoothAudio();
+        if (!result.success || !result.devices.length) {
+            this.speak('I could not find any Bluetooth audio devices.');
+            return;
+        }
+        const connected = result.devices.filter(d => d.connected);
+        if (!connected.length) {
+            this.speak('No Bluetooth devices are currently connected.');
+            return;
+        }
+        const parts = connected.map(d =>
+            d.battery != null ? `${d.name} at ${d.battery} percent` : `${d.name}, battery unknown`
+        );
+        this.speak(`Connected: ${parts.join('. ')}.`);
+        this.displayText(connected.map(d => `${d.name} - ${d.battery != null ? d.battery + '%' : 'battery n/a'}`).join('\n'), null);
+    }
+
+    // Meeting mode: route audio to connected earbuds and confirm readiness
+    async handleMeetingMode() {
+        this.displayText('Configuring meeting mode...', null);
+        const bt = window.electronAPI?.getBluetoothAudio
+            ? await window.electronAPI.getBluetoothAudio()
+            : { success: false, devices: [] };
+        const buds = (bt.devices || []).find(d => d.connected &&
+            /buds|pods|headphone|headset|earphone/i.test(d.name)) || (bt.devices || []).find(d => d.connected);
+
+        if (!buds) {
+            this.speak('Meeting mode: I could not find connected earbuds. Connect them and try again.');
+            return;
+        }
+
+        const sw = await window.electronAPI.switchAudioOutput(buds.name);
+        if (sw.success) {
+            const battery = buds.battery != null ? ` Earbuds at ${buds.battery} percent.` : '';
+            this.speak(`Audio routed to ${buds.name}.${battery} You are ready, Sir.`);
+        } else {
+            // Most likely: SoundVolumeView.exe not yet placed in bin/
+            this.speak(`Earbuds are connected, but I could not switch the audio output. ${sw.error}`);
+            this.displayText(sw.error, null);
+        }
+    }
+
+    // Common name -> ticker mapping for voice commands
+    static SYMBOL_MAP = {
+        bitcoin: 'BTC-USD', ethereum: 'ETH-USD', solana: 'SOL-USD',
+        apple: 'AAPL', tesla: 'TSLA', nvidia: 'NVDA', microsoft: 'MSFT',
+        google: 'GOOGL', amazon: 'AMZN', meta: 'META', netflix: 'NFLX'
+    };
+
+    _resolveSymbol(raw) {
+        const key = String(raw).toLowerCase();
+        return (Jarvis.SYMBOL_MAP[key] || raw).toUpperCase();
+    }
+
+    // Typed command: "store key <name> <value>" — value goes straight to the
+    // OS-encrypted vault. Never spoken back, never sent to any LLM, never
+    // stored in conversation memory (this path bypasses handleAICommand).
+    async handleStoreKey(raw) {
+        const parts = String(raw).trim().split(/\s+/);
+        // ["store"|"set", "key", name, value...]
+        if (parts.length < 4) {
+            this.speak('Usage: store key, then the key name, then the value. For example: store key alpaca_key_id, then your ID.');
+            return;
+        }
+        const name = parts[2];
+        const value = parts.slice(3).join(' ');
+        const result = await window.electronAPI.secureCredSet(name, value);
+        if (result.success) {
+            this.speak(`Key ${result.name} stored securely.`);
+            this.displayText(`Stored: ${result.name} (${value.slice(0, 4)}${'*'.repeat(8)})`, null);
+        } else {
+            this.speak(`I could not store that key. ${result.error}`);
+        }
+    }
+
+    async handleListKeys() {
+        const names = await window.electronAPI.secureCredList();
+        if (!names.length) {
+            this.speak('The credential vault is empty. For market data via Alpaca, store alpaca_key_id and alpaca_secret.');
+            return;
+        }
+        this.speak(`Stored keys: ${names.join(', ')}.`);
+        this.displayText(`Vault: ${names.join(', ')}`, null);
+    }
+
+    // Finance watchlist handlers (read/manage only — no trading exists)
+    async handleWatchlistAdd(rawSymbol, target, stop) {
+        const symbol = this._resolveSymbol(rawSymbol);
+        const result = await window.electronAPI.watchlistAdd({ symbol, target, stop });
+        if (!result.success) {
+            this.speak(`I could not add that. ${result.error}`);
+            return;
+        }
+        const parts = [`${symbol} added to your watchlist`];
+        if (target) parts.push(`target ${target}`);
+        if (stop) parts.push(`stop ${stop}`);
+        this.speak(`${parts.join(', ')}. I will alert you on a crossing.`);
+    }
+
+    async handleWatchlistRemove(rawSymbol) {
+        const symbol = this._resolveSymbol(rawSymbol);
+        await window.electronAPI.watchlistRemove(symbol);
+        this.speak(`${symbol} removed from your watchlist.`);
+    }
+
+    async handleWatchlistShow() {
+        const list = await window.electronAPI.watchlistGet();
+        if (!list.length) {
+            this.speak('Your watchlist is empty. Say: watch Apple at 190, or: add BTC-USD to watchlist.');
+            return;
+        }
+        const lines = list.map(item => {
+            const price = item.quote ? `${item.quote.price}` : 'fetching';
+            const extras = [
+                item.target ? `target ${item.target}` : null,
+                item.stop ? `stop ${item.stop}` : null
+            ].filter(Boolean).join(', ');
+            return `${item.symbol}: ${price}${extras ? ` (${extras})` : ''}`;
+        });
+        this.displayText(`Watchlist\n${lines.join('\n')}`, null);
+        const spoken = list.slice(0, 5).map(item =>
+            `${item.symbol} at ${item.quote ? item.quote.price : 'unknown'}`
+        ).join('. ');
+        this.speak(spoken + '.');
+    }
+
+    // Speak the phone pairing instructions (voice command: "phone setup")
+    async handlePhoneBridgeSetup() {
+        if (!window.electronAPI?.getPhoneBridgeInfo) {
+            this.speak('Phone bridge is not available in this environment.');
+            return;
+        }
+        const info = await window.electronAPI.getPhoneBridgeInfo();
+        if (!info.running || !info.exampleUrl) {
+            this.speak('The phone bridge server is not running.');
+            return;
+        }
+        this.displayText(
+            `Phone Bridge Setup\n` +
+            `1. Install MacroDroid on your phone (free)\n` +
+            `2. New macro: Trigger = Notification Received (any app)\n` +
+            `3. Action = HTTP Request, POST, JSON body:\n` +
+            `   {"app":"[not_app_name]","title":"[not_title]","text":"[not_text]"}\n` +
+            `4. URL: ${info.exampleUrl}\n` +
+            `Phone and PC must be on the same Wi-Fi. Allow Jarvis through the Windows firewall when prompted.`,
+            null
+        );
+        this.speak('Phone bridge details are on screen. Set up MacroDroid with the displayed URL, and I will announce your phone notifications in real time.');
+    }
+
+    // AI Command Handler — routes to cloud Gemini Live or local Gemma (Ollama)
     async handleAICommand(query) {
         try {
             this.displayText('Processing your request...', null);
 
             // Add user message to local memory for UI/logging
             this.memory.addMessage('user', query);
+
+            // Local Mode: 100% private inference via Ollama (settings.llmProvider)
+            if (this.settings.get('llmProvider') === 'gemma-local') {
+                await this.handleLocalAICommand(query);
+                return;
+            }
 
             if (this.liveService && this.liveService.isConnected) {
                 this.liveService.sendText(query);
@@ -1637,6 +2267,155 @@ class Jarvis {
         } catch (error) {
             console.error('AI command error:', error);
             this.speak('I apologize, but I encountered an error processing your request.');
+        }
+    }
+
+    // Local AI Command Handler (Gemma via Ollama, streamed to the display)
+    async handleLocalAICommand(query) {
+        const status = await checkOllama();
+        if (!status.available) {
+            this.speak('Local mode is enabled but the Ollama server is not responding. Start Ollama or switch back to cloud mode.');
+            return;
+        }
+
+        // OBEDIENCE LAYER: imperative-sounding requests that no regex intent
+        // caught get classified by Gemma into an executable action before we
+        // fall back to conversation. "Play some music on YouTube" -> opens
+        // youtube.com instead of an apologetic paragraph.
+        if (/^(open|play|launch|start|go to|visit|show me|put on|bring up)\b/i.test(query)) {
+            const route = await routeLocalAction(query);
+            switch (route.action) {
+                case 'open_app':
+                    await this.handleOpenApp(route.arg);
+                    return;
+                case 'open_website': {
+                    const site = route.arg.replace(/^https?:\/\//, '');
+                    window.electronAPI?.openWebsite(`https://${site}`);
+                    this.speak(`Opening ${site}, Sir.`);
+                    return;
+                }
+                case 'web_search':
+                    query = `search ${route.arg}`; // falls through to grounded chat below
+                    break;
+                case 'remember': {
+                    const r = await ragService.ingest(route.arg, { source: 'voice-note' });
+                    this.speak(r.stored ? 'Noted and stored, Sir.' : 'Already in memory, Sir.');
+                    return;
+                }
+                case 'recall':
+                    query = `what do I have in memory about ${route.arg}`;
+                    break;
+                // 'none' -> conversational answer below
+            }
+        }
+
+        // Hybrid RAG recall: prepend long-term memory relevant to the query.
+        // Kept small and best-first per the retrieval-generation gap findings
+        // (arXiv:2606.25656 — more context does not mean better answers).
+        let memoryContext = '';
+        try {
+            const { context } = await ragService.recall(query);
+            if (context) memoryContext = `\n\nRelevant long-term memory (most relevant first):\n${context}`;
+        } catch (e) {
+            console.warn('RAG recall failed (continuing without):', e);
+        }
+
+        // Live system grounding: questions about "my system/pc/cpu" get real
+        // telemetry injected (observed user need: "know something about my system")
+        let sysContext = '';
+        if (/\b(my (system|computer|pc|laptop)|cpu|ram\b|memory usage|system status|uptime|what am i (working|running))\b/i.test(query)
+            && window.electronAPI?.getSystemTelemetry) {
+            try {
+                const t = await window.electronAPI.getSystemTelemetry();
+                sysContext = `\n\nLive system telemetry right now: CPU ${t.cpu}% across ${t.cores} cores, RAM ${t.memUsedGb}/${t.memTotalGb} GB (${t.memPercent}%), uptime ${t.uptimeHours}h, active window: ${t.activeWindow?.app ? t.activeWindow.app + ' - ' + t.activeWindow.title : 'unknown'}.`;
+            } catch { /* answer without */ }
+        }
+
+        // Live web grounding: for search-shaped questions, fetch keyless
+        // DuckDuckGo results and let Gemma answer from them with sources.
+        let webContext = '';
+        const needsWeb = /\b(search|look up|google|news|latest|current|today|yesterday|price of|who is|what is|happening|weather in)\b/i.test(query);
+        if (needsWeb && window.electronAPI?.webSearch) {
+            try {
+                this.displayText('Searching the web...', null);
+                const web = await window.electronAPI.webSearch(query);
+                if (web.success && web.results.length) {
+                    const lines = web.results.map((r, i) => `[${i + 1}] ${r.title} - ${r.snippet}`);
+                    webContext = `\n\nLive web search results for "${query}" (cite [n] when you use one):\n${lines.join('\n')}`;
+                }
+            } catch (e) {
+                console.warn('Web search failed (continuing without):', e);
+            }
+        }
+
+        // Build context from conversation memory (map to Ollama roles)
+        const messages = [
+            {
+                role: 'system',
+                content: 'You are Jarvis, a highly advanced AI assistant running fully locally and privately on the machine of Ashutosh, a software engineer and security researcher. Address him as Sir. Be helpful, precise, and concise — your answers are spoken aloud, so keep them to 1-3 short sentences unless asked for detail. Never use emojis or emoticons. If asked to do something you have no tool for, say so plainly in one sentence.' + sysContext + memoryContext + webContext
+            },
+            ...this.memory.getContextMessages().slice(-10),
+            { role: 'user', content: query }
+        ];
+
+        // STREAMING SPEECH: speak each sentence the moment it completes in
+        // the token stream, instead of waiting for the whole answer. Cuts
+        // time-to-first-word from ~5-10s to ~1-2s.
+        let displayed = '';
+        let spokenUpTo = 0;
+        try {
+            const fullText = await generateContentLocal(messages, (chunk) => {
+                displayed += chunk;
+                this.displayText(displayed, null);
+
+                // Find complete sentences beyond what we've already spoken
+                const pending = displayed.slice(spokenUpTo);
+                const m = pending.match(/^[\s\S]*?[.!?](?=\s|$)/);
+                if (m && m[0].trim().length > 1) {
+                    spokenUpTo += m[0].length;
+                    this._speakQueued(m[0]);
+                }
+            });
+            // Speak whatever remains after the stream ends
+            const tail = displayed.slice(spokenUpTo).trim();
+            if (tail) this._speakQueued(tail);
+            this.memory.addMessage('assistant', fullText);
+        } catch (error) {
+            console.error('Local AI error:', error);
+            this.speak('Local inference failed. ' + error.message);
+        }
+    }
+
+    // Queued speech for streaming answers: does NOT cancel prior utterances
+    // (unlike speak(), which flushes). Keeps the mic gate (ttsActive) held
+    // until the last queued utterance finishes.
+    _speakQueued(text) {
+        try {
+            const clean = String(text)
+                .replace(/```[\s\S]*?```/g, ' code block omitted ')
+                .replace(/[*_#`>|]/g, '')
+                .replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}]/gu, '')
+                .replace(/\s+/g, ' ')
+                .trim();
+            if (!clean) return;
+
+            this._utterCount = (this._utterCount || 0) + 1;
+            this.ttsActive = true;
+
+            const u = new SpeechSynthesisUtterance(clean);
+            if (this.selectedVoice) u.voice = this.selectedVoice;
+            u.rate = this.settings.get('speechRate') || 1.0;
+            u.pitch = this.settings.get('speechPitch') || 1.0;
+            u.volume = this.settings.get('speechVolume') || 1.0;
+            const done = () => {
+                this._utterCount = Math.max(0, (this._utterCount || 1) - 1);
+                if (this._utterCount === 0) this.ttsActive = false;
+            };
+            u.onend = done;
+            u.onerror = done;
+            this.synthesis.speak(u);
+        } catch (e) {
+            console.warn('Queued TTS failed:', e);
         }
     }
 }

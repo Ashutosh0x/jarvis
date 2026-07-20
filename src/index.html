@@ -394,10 +394,161 @@
         transform: translateX(0);
       }
     }
+
+    /* System Diagnostics HUD (Iron-Man style telemetry) */
+    #diagnostics-hud {
+      position: fixed;
+      top: 90px;
+      left: 30px;
+      width: 190px;
+      z-index: 1004;
+      pointer-events: none;
+      background: rgba(15, 23, 42, 0.35);
+      backdrop-filter: blur(12px);
+      border: 1px solid rgba(6, 182, 212, 0.15);
+      border-radius: 12px;
+      padding: 12px 14px;
+      box-shadow: 0 0 20px rgba(0, 0, 0, 0.3), inset 0 0 15px rgba(6, 182, 212, 0.05);
+    }
+
+    .diag-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 6px;
+      font-family: 'Orbitron', sans-serif;
+      font-size: 9px;
+      color: rgba(6, 182, 212, 0.7);
+      text-transform: uppercase;
+      letter-spacing: 1.5px;
+    }
+
+    .diag-value {
+      color: #e2e8f0;
+      text-shadow: 0 0 8px rgba(6, 182, 212, 0.4);
+    }
+
+    .diag-bar {
+      width: 100%;
+      height: 3px;
+      background: rgba(255, 255, 255, 0.08);
+      border-radius: 2px;
+      overflow: hidden;
+      margin-bottom: 10px;
+    }
+
+    .diag-bar-fill {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, #06b6d4, #22d3ee);
+      border-radius: 2px;
+      transition: width 0.8s ease;
+      box-shadow: 0 0 8px rgba(6, 182, 212, 0.6);
+    }
+
+    .diag-bar-fill.warning {
+      background: linear-gradient(90deg, #f59e0b, #fbbf24);
+      box-shadow: 0 0 8px rgba(245, 158, 11, 0.6);
+    }
+
+    .diag-bar-fill.critical {
+      background: linear-gradient(90deg, #ef4444, #f87171);
+      box-shadow: 0 0 8px rgba(239, 68, 68, 0.6);
+    }
+
+    .diag-footer {
+      font-family: 'Orbitron', sans-serif;
+      font-size: 8px;
+      color: rgba(100, 116, 139, 0.8);
+      letter-spacing: 1px;
+      text-align: right;
+    }
+
+    /* ============================================
+       MINIMAL MODE (default): only the orb.
+       All HUD chrome is hidden; the speech bubble
+       still appears transiently when Jarvis talks,
+       and the command input fades in on hover/focus.
+       Press F2 to toggle the full HUD back on.
+    ============================================ */
+    body.minimal #status-hud,
+    body.minimal #diagnostics-hud,
+    body.minimal #ptt-indicator,
+    body.minimal #sources-container,
+    body.minimal #camera-container {
+      display: none !important;
+    }
+
+    body.minimal #command-input-container {
+      opacity: 0;
+      transition: opacity 0.4s ease;
+    }
+
+    /* Live voice transcript - always visible, even in minimal (orb-only) mode.
+       Shows mic state and everything the mic hears, in real time. */
+    #voice-transcript {
+      position: fixed;
+      bottom: 210px;
+      left: 50%;
+      transform: translateX(-50%);
+      max-width: 70%;
+      padding: 10px 24px;
+      background: rgba(2, 12, 20, 0.55);
+      backdrop-filter: blur(12px);
+      border: 1px solid rgba(6, 182, 212, 0.25);
+      border-radius: 22px;
+      font-family: 'Rajdhani', sans-serif;
+      font-size: 17px;
+      letter-spacing: 0.5px;
+      color: #e2e8f0;
+      text-align: center;
+      z-index: 1007;
+      opacity: 0;
+      transition: opacity 0.25s ease;
+      pointer-events: none;
+    }
+
+    #voice-transcript.visible {
+      opacity: 1;
+    }
+
+    #voice-transcript .vt-status {
+      font-family: 'Orbitron', sans-serif;
+      font-size: 9px;
+      text-transform: uppercase;
+      letter-spacing: 3px;
+      color: rgba(6, 182, 212, 0.9);
+      display: block;
+      margin-bottom: 2px;
+    }
+
+    #voice-transcript.listening {
+      border-color: rgba(34, 197, 94, 0.6);
+      box-shadow: 0 0 18px rgba(34, 197, 94, 0.25);
+    }
+
+    #voice-transcript.acted {
+      border-color: rgba(6, 182, 212, 0.7);
+      box-shadow: 0 0 18px rgba(6, 182, 212, 0.3);
+    }
+
+    #voice-transcript.ambient {
+      color: #94a3b8;
+    }
+
+    #voice-transcript.error {
+      border-color: rgba(239, 68, 68, 0.6);
+      color: #fca5a5;
+    }
+
+    body.minimal #command-input-container:hover,
+    body.minimal #command-input-container:focus-within {
+      opacity: 1;
+    }
   </style>
 </head>
 
-<body>
+<body class="minimal">
   <!-- Shaders -->
   <script id="vertexshader" type="x-shader/x-vertex">
     uniform float u_time;
@@ -503,12 +654,27 @@
     </div>
   </div>
 
+  <!-- System Diagnostics HUD -->
+  <div id="diagnostics-hud">
+    <div class="diag-row"><span>CPU</span><span class="diag-value" id="diag-cpu">--%</span></div>
+    <div class="diag-bar"><div class="diag-bar-fill" id="diag-cpu-bar"></div></div>
+    <div class="diag-row"><span>Memory</span><span class="diag-value" id="diag-mem">--</span></div>
+    <div class="diag-bar"><div class="diag-bar-fill" id="diag-mem-bar"></div></div>
+    <div class="diag-footer" id="diag-footer">CORES -- · UP --H</div>
+  </div>
+
   <!-- Push-to-Talk Indicator -->
-  <div id="ptt-indicator">⏸️ HOLD SPACE TO TALK</div>
+  <div id="ptt-indicator">HOLD SPACE TO TALK</div>
 
   <!-- Jarvis Text Display -->
   <div id="jarvis-display">
     <p id="jarvis-text"></p>
+  </div>
+
+  <!-- Live Voice Transcript (mic state + everything heard, realtime) -->
+  <div id="voice-transcript">
+    <span class="vt-status" id="vt-status"></span>
+    <span id="vt-text"></span>
   </div>
 
   <!-- Command Input -->

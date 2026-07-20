@@ -1,4 +1,6 @@
 // Screen Capture and OCR Module
+// OCR is powered by Baidu Unlimited-OCR running on a local SGLang server
+// (long-horizon document parsing — see docs/OCR-SETUP.md).
 class ScreenCapture {
     constructor() {
         this.screenshotsPath = null;
@@ -12,29 +14,41 @@ class ScreenCapture {
         throw new Error('Screen capture not available');
     }
 
-    // Request OCR on screenshot
-    async performOCR(imagePath) {
+    // Check whether the local Unlimited-OCR server is reachable
+    async isOcrAvailable() {
+        if (window.electronAPI && window.electronAPI.checkOcrServer) {
+            const status = await window.electronAPI.checkOcrServer();
+            return status.available;
+        }
+        return false;
+    }
+
+    // OCR a local file (image or multi-page PDF) → structured Markdown
+    async performOCR(filePath, mode = 'gundam') {
         if (window.electronAPI && window.electronAPI.performOCR) {
-            return await window.electronAPI.performOCR(imagePath);
+            return await window.electronAPI.performOCR({ filePath, mode });
         }
         throw new Error('OCR not available');
     }
 
-    // Capture and read screen
+    // Capture the screen and OCR it in "gundam" mode (dense single-page layouts)
     async captureAndRead() {
         try {
-            const screenshotPath = await this.captureScreen();
-            if (screenshotPath) {
-                const ocrText = await this.performOCR(screenshotPath);
-                return ocrText;
+            const capture = await this.captureScreen();
+            if (!capture || !capture.success) {
+                throw new Error(capture?.error || 'Screen capture failed');
             }
-            return null;
+            const result = await window.electronAPI.performOCR({
+                imageBase64: capture.image,
+                mode: 'gundam'
+            });
+            if (!result.success) throw new Error(result.error);
+            return result.markdown;
         } catch (error) {
-            console.error('Screen capture error:', error);
+            console.error('Screen OCR error:', error);
             throw error;
         }
     }
 }
 
 export default ScreenCapture;
-

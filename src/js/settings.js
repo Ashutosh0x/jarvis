@@ -16,7 +16,20 @@ class SettingsManager {
                 openWeather: ''
             },
             theme: 'cyan',
-            commandAliases: {}
+            commandAliases: {},
+
+            // --- LLM provider (Cloud vs Local) ---
+            llmProvider: 'gemma-local',                   // 'gemma-local' (private, via Ollama, default) | 'gemini' (cloud, Live voice)
+            localOllamaUrl: 'http://localhost:11434',     // Ollama OpenAI-compatible server
+            localModel: 'gemma3:4b',                      // e.g. 'gemma3:4b', 'gemma4:12b' if you have 16GB+ RAM
+
+            // --- Audio conditioning (applied on next mic start) ---
+            echoCancellation: true,   // stops Jarvis's own voice feeding back into the mic
+            noiseSuppression: true,   // filters fans, keystrokes, room hum
+            autoGainControl: false,   // off preserves natural dynamics
+
+            // --- OCR ---
+            ocrProvider: 'auto'       // 'auto' = local Unlimited-OCR if server is up, else cloud vision
         };
         this.settings = this.loadSettings();
     }
