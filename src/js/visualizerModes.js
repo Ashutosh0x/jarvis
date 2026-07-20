@@ -1,4 +1,6 @@
 // Visualizer Modes Manager
+import * as THREE from 'three';
+
 class VisualizerModes {
     constructor(scene, camera, renderer) {
         this.scene = scene;
@@ -45,8 +47,22 @@ class VisualizerModes {
 
         particles.setAttribute('position', new THREE.BufferAttribute(positions, 3));
 
+        // Keep a pristine copy of the rest positions so per-frame audio scaling
+        // is applied from the base each frame instead of compounding (which
+        // would otherwise send the particles flying off to infinity).
+        this.particleBasePositions = Float32Array.from(positions);
+
+        // Derive the particle color from the shader's live RGB uniforms rather
+        // than a bogus float; fall back to the idle cyan if they're absent.
+        const u = material && material.uniforms;
+        const particleColor = new THREE.Color(
+            u?.u_red?.value ?? 0.1,
+            u?.u_green?.value ?? 0.8,
+            u?.u_blue?.value ?? 1.0
+        );
+
         const particleMaterial = new THREE.PointsMaterial({
-            color: material.uniforms.u_red.value * 0xffffff,
+            color: particleColor,
             size: 0.1,
             transparent: true,
             opacity: 0.8
@@ -119,11 +135,13 @@ class VisualizerModes {
     update(frequency, time, uniforms) {
         if (this.currentMode === 'particles' && this.particleSystem) {
             const positions = this.particleSystem.geometry.attributes.position.array;
-            for (let i = 0; i < positions.length; i += 3) {
-                const scale = 1 + (frequency / 30) * 0.5;
-                positions[i] *= scale;
-                positions[i + 1] *= scale;
-                positions[i + 2] *= scale;
+            const base = this.particleBasePositions;
+            const scale = 1 + (frequency / 30) * 0.5;
+            if (base && base.length === positions.length) {
+                // Scale from the pristine base positions — no runaway growth.
+                for (let i = 0; i < positions.length; i++) {
+                    positions[i] = base[i] * scale;
+                }
             }
             this.particleSystem.geometry.attributes.position.needsUpdate = true;
         } else {

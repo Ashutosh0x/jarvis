@@ -4,7 +4,8 @@ import ScreenCapture from './screenCapture.js';
 import CalendarSystem from './calendar.js';
 import SettingsManager from './settings.js';
 import { LiveService } from './liveService.js';
-import { generateContentLocal, checkOllama, routeLocalAction } from './toolService.js';
+import { generateContentLocal, checkOllama, routeLocalAction, describeImageLocal } from './toolService.js';
+import { routePhoneCommand, targetsPhone, executePhoneTool } from './services/phoneTools.js';
 import ragService from './services/ragService.js';
 import { LocalVoiceService } from './services/voiceService.js';
 import { config } from '../config.js';
@@ -107,7 +108,11 @@ class Jarvis {
         this.initializeUI();
         await this.initializeLocation();
         await this.initializeWeather();
-        // this.initializeVoice(); // Voice is now handled by Gemini Audio
+        // Select a good system voice for local (Windows SAPI) TTS. In cloud
+        // mode speak() returns before SAPI, so this is a harmless no-op there;
+        // in local mode (default, no Gemini key) it's what gives Jarvis a
+        // proper voice instead of the browser default.
+        this.initializeVoice();
         // this.initializeSpeechRecognition(); // Replaced by LiveService
         this.initializeCommandInput();
         this.initializePushToTalk();
@@ -548,6 +553,7 @@ class Jarvis {
                     if (command) {
                         this.commandInput.value = '';
                         this.commandInput.disabled = true;
+                        this._lastInputWasVoice = false;
                         this.processCommand(command);
                     }
                 }
@@ -780,11 +786,20 @@ class Jarvis {
             // Strip markdown noise so TTS reads clean sentences
             const clean = String(text)
                 .replace(/```[\s\S]*?```/g, ' code block omitted ')
+                // Citation markers are for the screen, not the ear. Left in,
+                // "[n] 1 & 2" was spoken as "and one and two" — and then the
+                // mic transcribed it back as a new user turn.
+                .replace(/\[\s*n\s*\]/gi, '')
+                .replace(/\[\s*\d+(\s*(,|&|and)\s*\d+)*\s*\]/g, '')
                 .replace(/[*_#`>|]/g, '')
                 .replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}]/gu, '') // no emojis, ever
                 .replace(/\s+/g, ' ')
                 .trim();
             if (!clean) return;
+
+            // Record before speaking so the echo guard is armed even if the
+            // mic picks up the very first words.
+            this._rememberSpoken(clean);
 
             // Flush the queue: the newest information wins
             this.synthesis.cancel();
@@ -939,6 +954,29 @@ class Jarvis {
     detectIntent(command) {
         const cmd = command.toLowerCase().trim();
 
+        // Phone-targeted commands: "open whatsapp on my phone", "flashlight on
+        // my phone". Checked before every desktop matcher, otherwise "open
+        // chrome on my phone" opens Chrome on the PC.
+        if (targetsPhone(cmd)) {
+            const phoneIntent = routePhoneCommand(cmd);
+            if (phoneIntent) return { intent: 'PHONE_TOOL', phoneIntent };
+        }
+
+        // Companion status. Added because the user repeatedly asked Jarvis
+        // "why are you offline in my mobile" and got invented answers ("I will
+        // relay this to the command layer") — it had no way to actually look.
+        if (/\b(phone|mobile|companion)\b/.test(cmd) &&
+            /\b(status|connected|online|offline|linked|why)\b/.test(cmd)) {
+            return { intent: 'COMPANION_STATUS' };
+        }
+
+        // Android companion pairing
+        if (cmd.includes('connect to my mobile') || cmd.includes('connect to my phone') ||
+            cmd.includes('install jarvis on my phone') || cmd.includes('pair my phone') ||
+            cmd.includes('send yourself to my phone')) {
+            return { intent: 'COMPANION_PAIR' };
+        }
+
         // System Control Commands
         if (cmd.includes('open chrome')) return { intent: 'OPEN_APP', app: 'chrome' };
         if (cmd.includes('open notepad')) return { intent: 'OPEN_APP', app: 'notepad' };
@@ -996,10 +1034,32 @@ class Jarvis {
 
         // Screen Capture Commands
         if (cmd.includes('take screenshot') || cmd.includes('screenshot')) return { intent: 'SCREENSHOT' };
-        if (cmd.includes('read screen') || cmd.includes('what\'s on my screen') || cmd.includes('read my screen')) return { intent: 'READ_SCREEN' };
+        // Screen reading — captures the ACTUAL question so Gemma vision answers
+        // specifically ("what error is showing" vs "read the code" vs "what's this").
+        if (/\b(can you see|look at|read|what('?s| is)? ?(on|showing on)|what am i (looking at|seeing)|describe|analyz|check)\b[^.]*\b(screen|display|monitor)\b/.test(cmd) ||
+            cmd.includes('read my screen') || cmd.includes('see my screen') || cmd.includes('read the screen') ||
+            cmd.includes('what is on the screen') || cmd.includes("what's on the screen") ||
+            /\b(what does|what's|read)\b.*\b(this|that|it)\b.*\b(say|says|mean)\b/.test(cmd)) {
+            return { intent: 'READ_SCREEN', question: command };
+        }
         if (cmd.includes('phone setup') || cmd.includes('phone bridge') || cmd.includes('connect my phone') || cmd.includes('pair my phone')) return { intent: 'PHONE_SETUP' };
         if (cmd.includes('scan') && (cmd.includes('wifi') || cmd.includes('wi-fi') || cmd.includes('network'))) return { intent: 'WIFI_SCAN' };
         if (cmd.includes('available networks') || cmd === 'list wifi') return { intent: 'WIFI_SCAN' };
+        // Disconnect — checked before the connect matcher so "disconnect" wins
+        if (/\b(disconnect|drop)\b.*\b(wifi|wi-fi|network|internet|connection)\b/.test(cmd) ||
+            cmd === 'disconnect' || cmd === 'disconnect wifi' || cmd === 'disconnect the wifi') {
+            return { intent: 'WIFI_DISCONNECT' };
+        }
+        // Network / device intelligence — real measured data about the current
+        // connection (the "device" you connect to over Wi-Fi is the hotspot/router)
+        if (/\b(which (wi-?fi|network)|what (wi-?fi|network))\b.*\b(am i|connected)\b/.test(cmd) ||
+            /\b(network|wi-?fi|connection|internet)\s+(info|information|details|status|quality|speed|health)\b/.test(cmd) ||
+            /\b(why is|is (my|the))\s+(wi-?fi|internet|connection|network)\s+(slow|unstable|bad|down)\b/.test(cmd) ||
+            /\b(how('s| is) my (wi-?fi|internet|connection|network))\b/.test(cmd) ||
+            /\b(test|check)\s+(my\s+)?(connection|internet|network|wi-?fi)\b/.test(cmd) ||
+            (/(tell me|information|info|details|about)/.test(cmd) && /(device|network|connection|hotspot|router)/.test(cmd) && /(connect|wi-?fi|current)/.test(cmd))) {
+            return { intent: 'WIFI_INFO' };
+        }
         // "connect to <specific network name>" -> Wi-Fi connect (checked BEFORE
         // the generic settings matcher so named networks take priority)
         const wifiConnectMatch = cmd.match(/connect\s+(?:me\s+)?(?:to|with)\s+(?:my\s+|the\s+)?(.+)/);
@@ -1134,6 +1194,16 @@ class Jarvis {
 
         try {
             switch (intent.intent) {
+                case 'PHONE_TOOL':
+                    await this.handlePhoneTool(intent.phoneIntent);
+                    break;
+                case 'COMPANION_STATUS':
+                    await this.handleCompanionStatus();
+                    break;
+                case 'COMPANION_PAIR':
+                    this.speak('Opening the pairing window sir. Scan the code with your phone.');
+                    window.jarvisCompanion?.open();
+                    break;
                 case 'OPEN_APP':
                     await this.handleOpenApp(intent.app);
                     break;
@@ -1171,7 +1241,7 @@ class Jarvis {
                     await this.handleScreenshot();
                     break;
                 case 'READ_SCREEN':
-                    await this.handleReadScreen();
+                    await this.handleReadScreen(intent.question);
                     break;
                 case 'PHONE_SETUP':
                     await this.handlePhoneBridgeSetup();
@@ -1205,6 +1275,12 @@ class Jarvis {
                     break;
                 case 'WIFI_CONNECT':
                     await this.handleWifiConnect(intent.name);
+                    break;
+                case 'WIFI_DISCONNECT':
+                    await this.handleWifiDisconnect();
+                    break;
+                case 'WIFI_INFO':
+                    await this.handleWifiInfo();
                     break;
                 case 'REMEMBER': {
                     const r = await ragService.ingest(intent.text, { source: 'voice-note' });
@@ -1462,79 +1538,64 @@ class Jarvis {
     // Screen Analysis Handler
     // Prefers local Unlimited-OCR (private, structured Markdown) when the
     // SGLang server is up; falls back to Gemini Vision otherwise.
-    async handleReadScreen() {
+    // Read the screen: screenshot -> base64 -> local Gemma vision -> spoken
+    // answer. Fully offline (gemma3 is multimodal). Answers the user's ACTUAL
+    // question ("what error is showing?") rather than a fixed prompt.
+    async handleReadScreen(question) {
         try {
-            this.displayText('Analyzing your screen...', null);
-
             if (!window.electronAPI || !window.electronAPI.captureScreen) {
-                this.speak('Screen analysis is not available in this environment');
+                this.speak('Screen capture is not available in this environment.');
                 return;
             }
 
-            // Try local Unlimited-OCR first (ocrProvider: 'auto' or 'local')
-            const ocrProvider = this.settings.get('ocrProvider') || 'auto';
-            if (ocrProvider !== 'cloud' && await this.screenCapture.isOcrAvailable()) {
-                try {
-                    this.speak('Parsing your screen with local vision.');
-                    const markdown = await this.screenCapture.captureAndRead();
-                    this.memory.addMessage('assistant', `Screen OCR result:\n${markdown}`);
-                    this.displayText(markdown.slice(0, 600) + (markdown.length > 600 ? '…' : ''), null);
-                    // Hand the parsed text to the live session for reasoning, if connected
-                    if (this.liveService && this.liveService.isConnected) {
-                        this.liveService.sendText(`I just OCR'd my screen. Here is the structured Markdown content — summarize what I'm working on and answer any follow-ups from it:\n\n${markdown.slice(0, 8000)}`);
-                    }
+            this.speak('Let me take a look, Sir.');
+            this.displayText('Capturing and reading your screen...', null);
+
+            const shot = await window.electronAPI.captureScreen();
+            if (!shot?.success || !shot.image) {
+                this.speak('I could not capture your screen.');
+                return;
+            }
+
+            // Build a focused prompt from what the user actually asked. Strip the
+            // "read my screen" scaffolding so the real intent reaches the model.
+            const cleaned = String(question || '')
+                .replace(/\b(hey )?jarvis\b/gi, '')
+                .replace(/\b(can you |could you |please )?/gi, '')
+                .replace(/\b(read|look at|see|check|analyze|describe)\b/gi, '')
+                .replace(/\b(my |the |on )?(screen|display|monitor)\b/gi, '')
+                .replace(/[?.!]+$/, '').trim();
+            const prompt = cleaned.length > 3
+                ? `Looking at this screenshot of my screen: ${cleaned}. Answer concisely and specifically from what is visible. This is spoken aloud, so keep it under 3 sentences.`
+                : 'Concisely describe what is on this screen: the application or content, and the key visible text or state. This is spoken aloud, so keep it under 3 sentences.';
+
+            let answer;
+            try {
+                answer = await describeImageLocal(shot.image, prompt);
+            } catch (e) {
+                console.warn('Gemma vision failed:', e.message);
+                // Optional fallback: dense-text OCR server, if the user runs one.
+                if (await this.screenCapture.isOcrAvailable()) {
+                    const md = await this.screenCapture.captureAndRead();
+                    this.displayText(md.slice(0, 600), null);
+                    this.speak('I read the text on your screen. It is displayed for you.');
                     return;
-                } catch (e) {
-                    console.warn('Local OCR failed, falling back to Gemini Vision:', e.message);
                 }
-            }
-
-            // No local OCR server and no cloud key: say so honestly instead
-            // of silently attempting a dead Gemini Vision path.
-            if (!config.geminiApiKey || config.geminiApiKey.startsWith('YOUR_')) {
-                this.speak('Screen reading needs the local OCR server, Sir. Start the Unlimited-OCR server from docs slash OCR setup, and I will read anything on your display.');
+                this.speak('I could not read the screen. Is the local model running?');
                 return;
             }
 
-            const screenshot = await window.electronAPI.captureScreen();
-
-            if (!screenshot.success) {
-                this.speak('Failed to capture screen');
+            if (!answer) {
+                this.speak('I looked, but could not make out the screen clearly.');
                 return;
             }
 
-            // Extract base64 data from data URL
-            const base64Image = screenshot.image.replace(/^data:image\/\w+;base64,/, '');
-
-            // Send to Gemini Vision via LiveService
-            if (this.liveService && this.liveService.isConnected) {
-                // Use sendClientContent with image for vision analysis
-                this.liveService.session.sendClientContent({
-                    turns: [{
-                        role: 'user',
-                        parts: [
-                            {
-                                inlineData: {
-                                    mimeType: 'image/png',
-                                    data: base64Image
-                                }
-                            },
-                            {
-                                text: 'Analyze this screenshot of my screen. Tell me: 1) What application or content is visible? 2) Extract and summarize any visible text. 3) Describe what the user appears to be working on.'
-                            }
-                        ]
-                    }],
-                    turnComplete: true
-                });
-            } else {
-                this.speak('Neural link not connected. Connecting now...');
-                await this.liveService.connect();
-                // Retry after connection
-                setTimeout(() => this.handleReadScreen(), 2000);
-            }
+            this.memory.addMessage('assistant', `Screen read: ${answer}`);
+            this.displayText(answer, null);
+            this.speak(answer);
         } catch (error) {
-            console.error('Screen analysis error:', error);
-            this.speak('Failed to analyze screen');
+            console.error('Screen read error:', error);
+            this.speak('I ran into an error reading your screen.');
         }
     }
 
@@ -1972,6 +2033,50 @@ class Jarvis {
     // visualizer in real time. Only wake-word speech (or the 10 s follow-up
     // window) is acted on; ambient speech is shown, then dropped — never
     // stored anywhere.
+    /**
+     * Records what Jarvis just said, so the mic can recognise its own voice
+     * coming back. Kept as a short time-boxed window — anything older than a
+     * few seconds cannot still be echoing.
+     */
+    _rememberSpoken(text) {
+        if (!text) return;
+        this._spokenRecently = this._spokenRecently || [];
+        this._spokenRecently.push({ words: this._echoWords(text), at: Date.now() });
+        const cutoff = Date.now() - 20000;
+        this._spokenRecently = this._spokenRecently.filter(e => e.at > cutoff);
+    }
+
+    _echoWords(text) {
+        return new Set(
+            String(text)
+                .toLowerCase()
+                .replace(/[^a-z0-9\s]/g, ' ')
+                .split(/\s+/)
+                .filter(w => w.length > 2)
+        );
+    }
+
+    /**
+     * True when a transcript overlaps heavily with something recently spoken.
+     * Word-overlap rather than exact match, because the STT re-transcription of
+     * synthesised speech is close but never identical.
+     */
+    _isEchoOfSelf(cmd) {
+        const recent = this._spokenRecently || [];
+        if (!recent.length) return false;
+
+        const said = this._echoWords(cmd);
+        if (said.size < 3) return false; // too short to judge; let it through
+
+        for (const entry of recent) {
+            if (!entry.words.size) continue;
+            let hits = 0;
+            for (const w of said) if (entry.words.has(w)) hits++;
+            if (hits / said.size >= 0.6) return true;
+        }
+        return false;
+    }
+
     _handleVoiceTranscript(text) {
         const t = String(text).trim();
         if (!t) {
@@ -1993,8 +2098,101 @@ class Jarvis {
             return;
         }
 
+        // ECHO GUARD: the ttsActive gate is necessary but not sufficient —
+        // SAPI audio bypasses Chromium's AEC, and the tail of an utterance can
+        // land after the flag clears. Real logs show Jarvis's own words coming
+        // back as a user turn ("sir, my current assessment suggests a focus
+        // query related to that term, and one and two"), which it then answered,
+        // talking to itself. Compare against what was recently spoken.
+        if (this._isEchoOfSelf(cmd)) {
+            this._showTranscript(t, 'ambient', 'ECHO IGNORED', 2500);
+            return;
+        }
+
         this._showTranscript(t, 'acted', 'YOU SAID');
+        this._lastInputWasVoice = true;
         this.processCommand(cmd);
+    }
+
+    /**
+     * Executes a structured phone tool and speaks the ACTUAL outcome.
+     *
+     * The LLM is deliberately not in this path. Earlier logs show it inventing
+     * results ("Tab opened, rows closed") because it had no execution feedback;
+     * here every spoken confirmation comes from what the phone reported back.
+     */
+    async handlePhoneTool(phoneIntent) {
+        if (!window.electronAPI?.companionCommand) {
+            this.speak('The companion bridge is not available in this build, Sir.');
+            return;
+        }
+
+        const devices = await window.electronAPI.companionDevices();
+        if (!devices.length) {
+            this.speak('Your phone is not linked right now, Sir. Say connect to my mobile to pair it.');
+            return;
+        }
+
+        this.displayText(`Phone: ${phoneIntent.tool} ${JSON.stringify(phoneIntent.parameters)}`, null);
+
+        try {
+            const out = await executePhoneTool(phoneIntent, devices[0].capabilities);
+            this.speak(out.spoken);
+
+            // Screen reads are worth keeping: they are how Jarvis answers
+            // follow-up questions about what is on the phone.
+            if (out.ok && phoneIntent.tool === 'phone.read_screen' && out.result?.nodes) {
+                const visible = out.result.nodes
+                    .map((n) => n.text || n.desc)
+                    .filter(Boolean)
+                    .slice(0, 40)
+                    .join(', ');
+                this.displayText(`Phone screen (${out.result.package}): ${visible}`, null);
+                this._lastPhoneScreen = { at: Date.now(), text: visible, pkg: out.result.package };
+            }
+        } catch (e) {
+            console.error('Phone tool failed:', e);
+            this.speak(`I could not reach your phone, Sir. ${e.message}`);
+        }
+    }
+
+    /**
+     * Reports the real companion link state by asking the bridge, and — when
+     * it is down — says which stage failed and what to do about it.
+     *
+     * Deliberately evidence-only: no LLM in this path. The model has no view of
+     * the socket, so letting it answer produced confident fiction.
+     */
+    async handleCompanionStatus() {
+        if (!window.electronAPI?.companionDevices) {
+            this.speak('The companion bridge is not available in this build, Sir.');
+            return;
+        }
+
+        const devices = await window.electronAPI.companionDevices();
+
+        if (devices.length) {
+            const d = devices[0];
+            const name = d.model || d.remote || 'a device';
+            const extra = d.accessibility === false
+                ? ' Device control is limited: the accessibility service is not enabled on the phone.'
+                : '';
+            this.speak(`Your phone is connected, Sir. ${name} is linked over Wi-Fi.${extra}`);
+            this.displayText(`Companion linked: ${name}${d.android ? ` (Android ${d.android})` : ''} at ${d.remote || 'unknown address'}`, null);
+            return;
+        }
+
+        // Not linked — distinguish "never paired" from "paired but unreachable",
+        // because the fix is different for each.
+        const info = await window.electronAPI.getPhoneBridgeInfo?.();
+        const addr = info?.addresses?.[0];
+        this.speak('Your phone is not linked right now, Sir. Say connect to my mobile to open the pairing window, then open Jarvis on the phone.');
+        this.displayText(
+            `Companion: OFFLINE\n` +
+            `Desktop bridge: ${addr ? `${addr}:${info.port}` : 'no LAN address'}\n` +
+            `The phone must be on the same Wi-Fi and pairs within 5 minutes of opening the window.`,
+            null
+        );
     }
 
     // Event-Driven Core router: main-process watchers publish typed events;
@@ -2084,6 +2282,66 @@ class Jarvis {
             this.speak(result.error);
             this.displayText(result.error, null);
         }
+    }
+
+    async handleWifiDisconnect() {
+        if (!window.electronAPI?.wifiDisconnect) {
+            this.speak('Wi-Fi control is not available in this environment.');
+            return;
+        }
+        const result = await window.electronAPI.wifiDisconnect();
+        if (result.alreadyOff) {
+            this.speak('Wi-Fi is already disconnected, Sir.');
+        } else if (result.success) {
+            this.speak(`Disconnected from ${result.wasSsid || 'the network'}, Sir. No active wireless connection.`);
+            this.displayText('Wi-Fi disconnected', null);
+        } else {
+            this.speak('I issued the disconnect, but Windows still reports a connection. It may auto-reconnect.');
+        }
+    }
+
+    // Real, measured network + device intelligence — never fabricated numbers.
+    async handleWifiInfo() {
+        if (!window.electronAPI?.wifiInfo) {
+            this.speak('Network intelligence is not available in this environment.');
+            return;
+        }
+        this.displayText('Measuring your connection...', null);
+        const n = await window.electronAPI.wifiInfo();
+        if (!n.success || !n.connected) {
+            this.speak('You are not connected to any Wi-Fi network right now, Sir.');
+            return;
+        }
+
+        // Full details on the orb
+        const lines = [
+            `Network: ${n.ssid}`,
+            n.bssid ? `Access point: ${n.bssid}` : null,
+            n.band || n.radio ? `Radio: ${[n.radio, n.band].filter(Boolean).join(', ')}${n.channel ? `, ch ${n.channel}` : ''}` : null,
+            n.signal ? `Signal: ${n.signal}` : null,
+            n.linkRateMbps ? `Link rate: ${n.linkRateMbps} Mbps` : null,
+            n.security ? `Security: ${n.security}` : null,
+            n.ipv4 ? `IP: ${n.ipv4}` : null,
+            n.gateway ? `Gateway: ${n.gateway}${n.gatewayLatencyMs != null ? ` (${n.gatewayLatencyMs} ms)` : ''}` : null,
+            n.dns?.length ? `DNS: ${n.dns.join(', ')}` : null,
+            n.internetLatencyMs != null ? `Internet: ${n.internetLatencyMs} ms, ${n.packetLossPct}% loss` : `Internet: unreachable`,
+            `Quality: ${n.quality}`,
+        ].filter(Boolean);
+        this.displayText(lines.join('\n'), null);
+
+        // Concise spoken summary — evidence first, like a real diagnostic
+        const parts = [`You are on ${n.ssid}`];
+        if (n.signal) parts.push(`signal ${n.signal}`);
+        if (n.band) parts.push(n.band);
+        if (n.linkRateMbps) parts.push(`${n.linkRateMbps} megabits`);
+        if (n.internetReachable && n.internetLatencyMs != null) {
+            parts.push(`internet latency ${n.internetLatencyMs} milliseconds`);
+            parts.push(n.packetLossPct === 0 ? 'no packet loss' : `${n.packetLossPct} percent packet loss`);
+            parts.push(`connection quality is ${n.quality}`);
+        } else {
+            parts.push('but the internet is not reachable');
+        }
+        this.speak(parts.join('. ') + ', Sir.');
     }
 
     // Bluetooth audio status (voice: "earbuds status" / "headphone battery")
@@ -2314,7 +2572,11 @@ class Jarvis {
         // (arXiv:2606.25656 — more context does not mean better answers).
         let memoryContext = '';
         try {
-            const { context } = await ragService.recall(query);
+            // Typed input can afford the reranker's ~5s; spoken input cannot,
+            // so voice keeps the fast lexical ordering.
+            const { context } = await ragService.recall(query, {
+                rerank: !this._lastInputWasVoice
+            });
             if (context) memoryContext = `\n\nRelevant long-term memory (most relevant first):\n${context}`;
         } catch (e) {
             console.warn('RAG recall failed (continuing without):', e);
@@ -2341,20 +2603,48 @@ class Jarvis {
                 const web = await window.electronAPI.webSearch(query);
                 if (web.success && web.results.length) {
                     const lines = web.results.map((r, i) => `[${i + 1}] ${r.title} - ${r.snippet}`);
-                    webContext = `\n\nLive web search results for "${query}" (cite [n] when you use one):\n${lines.join('\n')}`;
+                    // The literal token "[n]" used to appear in this instruction
+                    // and Gemma copied it straight into its answers — nearly
+                    // every logged reply ended in "[n] 1 & 2", which then got
+                    // spoken aloud as "and one and two".
+                    webContext = `\n\nLive web search results for "${query}". Use them only if they are relevant, and refer to a source inline as [1] or [2]. Never write the placeholder "[n]".\n${lines.join('\n')}`;
                 }
             } catch (e) {
                 console.warn('Web search failed (continuing without):', e);
             }
         }
 
-        // Build context from conversation memory (map to Ollama roles)
+        // Build context from conversation memory (map to Ollama roles).
+        //
+        // processAICommand() already pushed this turn's user message into
+        // memory, so the tail of the history IS the current query. Appending
+        // `query` again sent it to Gemma twice, back to back — which the model
+        // faithfully described ("the repeated query", "duplicate search query",
+        // "I have executed the repeated command to close Chrome twice") and
+        // which derailed most of the conversation log. Drop the duplicate here
+        // rather than skipping the append, because `query` may have been
+        // rewritten above (web_search / recall routing) and the rewrite is what
+        // should reach the model.
+        const history = this.memory.getContextMessages().slice(-11);
+        if (history.length && history[history.length - 1].role === 'user') history.pop();
+
         const messages = [
             {
                 role: 'system',
-                content: 'You are Jarvis, a highly advanced AI assistant running fully locally and privately on the machine of Ashutosh, a software engineer and security researcher. Address him as Sir. Be helpful, precise, and concise — your answers are spoken aloud, so keep them to 1-3 short sentences unless asked for detail. Never use emojis or emoticons. If asked to do something you have no tool for, say so plainly in one sentence.' + sysContext + memoryContext + webContext
+                content: 'You are Jarvis, a highly advanced AI assistant running fully locally and privately on the machine of Ashutosh, a software engineer and security researcher. Address him as Sir. Be helpful, precise, and concise — your answers are spoken aloud, so keep them to 1-3 short sentences unless asked for detail. Never use emojis or emoticons. If asked to do something you have no tool for, say so plainly in one sentence.'
+                    // Without this, the model narrated actions it never took
+                    // ("Tab opened, rows closed", "I have initiated playback of
+                    // the requested video stream") because it receives no
+                    // execution feedback and pattern-matches an obedient reply.
+                    + ' You cannot open, close, play, or control anything yourself; a separate command layer does that and it reports back to the user directly. Never claim you performed an action. If a request needs an action, say what you would do, in one sentence.'
+                    // The input is speech-to-text, so it arrives garbled, with
+                    // fragments and mis-hearings. Earlier logs show the model
+                    // treating that noise as meaningful and inventing theories
+                    // about "system probing" and "diagnostic loops".
+                    + ' Your input comes from speech recognition and may be garbled or incomplete. If a message is unclear, briefly ask what he meant. Never speculate about system probing, diagnostics, repeated input, or your own internal state.'
+                    + sysContext + memoryContext + webContext
             },
-            ...this.memory.getContextMessages().slice(-10),
+            ...history,
             { role: 'user', content: query }
         ];
 
@@ -2391,13 +2681,20 @@ class Jarvis {
     // until the last queued utterance finishes.
     _speakQueued(text) {
         try {
+            // Same cleanup as speak(). This is the path Gemma's streamed
+            // answers take, so it is the one that was actually reading "[n] 1
+            // & 2" aloud — it had drifted out of sync with speak()'s filter.
             const clean = String(text)
                 .replace(/```[\s\S]*?```/g, ' code block omitted ')
+                .replace(/\[\s*n\s*\]/gi, '')
+                .replace(/\[\s*\d+(\s*(,|&|and)\s*\d+)*\s*\]/g, '')
                 .replace(/[*_#`>|]/g, '')
                 .replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}]/gu, '')
                 .replace(/\s+/g, ' ')
                 .trim();
             if (!clean) return;
+
+            this._rememberSpoken(clean);
 
             this._utterCount = (this._utterCount || 0) + 1;
             this.ttsActive = true;

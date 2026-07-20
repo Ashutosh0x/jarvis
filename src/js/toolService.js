@@ -51,6 +51,36 @@ export async function checkOllama() {
  * @param {(chunk: string) => void} onChunk - called per streamed token/segment
  * @returns {Promise<string>} the full response text
  */
+/**
+ * Local VISION: describe/read a screenshot with Gemma 3 (a multimodal model)
+ * through Ollama. Fully offline — no OCR server, no cloud. `imageInput` may be
+ * a data URL or raw base64; the data-URL prefix is stripped for Ollama.
+ * @returns {Promise<string>} the model's description/answer
+ */
+export async function describeImageLocal(imageInput, question) {
+    const { url, model } = getLocalConfig();
+    const base64 = String(imageInput).replace(/^data:image\/\w+;base64,/, '');
+    const res = await fetch(`${url}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            model,
+            stream: false,
+            keep_alive: '60m',
+            messages: [{
+                role: 'user',
+                content: question || 'Describe what is on this screen concisely and accurately.',
+                images: [base64],
+            }],
+        }),
+    });
+    if (!res.ok) {
+        throw new Error(`Ollama vision error ${res.status}: is '${model}' a vision model? gemma3 supports images.`);
+    }
+    const data = await res.json();
+    return (data.message?.content || '').trim();
+}
+
 export async function generateContentLocal(messages, onChunk) {
     const { url, model } = getLocalConfig();
     const response = await fetch(`${url}/api/chat`, {

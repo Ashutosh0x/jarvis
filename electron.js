@@ -3,7 +3,11 @@ const path = require('path');
 const { exec, execFile, spawn } = require('child_process');
 const os = require('os');
 const fs = require('fs').promises;
+const fsSync = require('fs');
 const axios = require('axios');
+const QRCode = require('qrcode');
+const { CompanionBridge, WS_PORT: COMPANION_WS_PORT } = require('./companionBridge');
+const adbService = require('./adbService');
 
 /* =========================
    UNLIMITED-OCR CONFIG
@@ -13,6 +17,15 @@ const axios = require('axios');
 const OCR_SERVER_URL = process.env.JARVIS_OCR_URL || 'http://127.0.0.1:10000';
 const OCR_MAX_PDF_PAGES = 20; // safety limit; model supports dozens of pages in one pass
 const OCR_TIMEOUT_MS = 300000; // long-horizon parsing can take minutes on consumer GPUs
+
+/* =========================
+   LOCAL LLM CONFIG (Ollama)
+   Defaults mirror settings.js (llmProvider 'gemma-local'). The renderer
+   keeps its settings in localStorage, which main can't read at boot, so
+   these are env-overridable the same way OCR_SERVER_URL is.
+========================= */
+const OLLAMA_URL = process.env.JARVIS_OLLAMA_URL || 'http://localhost:11434';
+const OLLAMA_MODEL = process.env.JARVIS_LOCAL_MODEL || 'gemma3:4b';
 
 // GPU acceleration enabled for smooth visualizer performance
 // Note: If transparency breaks, uncomment the line below
@@ -142,12 +155,15 @@ app.whenReady().then(async () => {
     startTelemetry();
     phoneBridgeToken = await loadPhoneBridgeToken();
     startPhoneBridge();
+    startCompanionBridge();
     // Event-driven core watchers
     startDownloadsWatcher();
     startClipboardMonitor();
     startActiveWindowTracker();
     startFinanceService();
     startSttServer();
+    // Not awaited — readiness polling + model warm must not block the window.
+    startOllamaServer();
 
     app.on('activate', () => {
         if (BrowserWindow.getAllWindows().length === 0) {
@@ -536,6 +552,104 @@ ipcMain.handle('wifi-connect', async (event, requestedName) => {
     };
 });
 
+ipcMain.handle('wifi-disconnect', async () => {
+    const before = parseNetshInterface(await runNetsh(['wlan', 'show', 'interfaces']));
+    if (before.state !== 'connected') {
+        return { success: true, alreadyOff: true, ssid: before.ssid };
+    }
+    await runNetsh(['wlan', 'disconnect']);
+    await new Promise(r => setTimeout(r, 2000));
+    const after = parseNetshInterface(await runNetsh(['wlan', 'show', 'interfaces']));
+    return { success: after.state !== 'connected', wasSsid: before.ssid, nowState: after.state };
+});
+
+// Parse `netsh wlan show interfaces` into a key->value map. Splitting on the
+// FIRST " : " is essential — values like MAC addresses contain their own
+// colons, so a greedy split would corrupt the BSSID.
+function parseNetshInterface(out) {
+    const kv = {};
+    for (const line of String(out).split(/\r?\n/)) {
+        const m = line.match(/^\s{4,}([^:]+?)\s*:\s*(.+)$/);
+        if (m) kv[m[1].trim().toLowerCase()] = m[2].trim();
+    }
+    return {
+        ssid: kv['ssid'] || null,
+        bssid: kv['ap bssid'] || kv['bssid'] || null,
+        state: (kv['state'] || '').toLowerCase(),
+        radio: kv['radio type'] || null,
+        band: kv['band'] || null,
+        channel: kv['channel'] || null,
+        signal: kv['signal'] || null,
+        rxRate: kv['receive rate (mbps)'] || null,
+        txRate: kv['transmit rate (mbps)'] || null,
+        auth: kv['authentication'] || null,
+    };
+}
+
+// Real, measured network + device intelligence — no fabricated numbers.
+// Everything here comes from netsh / Get-NetIPConfiguration / live pings.
+ipcMain.handle('wifi-info', async () => {
+    const iface = parseNetshInterface(await runNetsh(['wlan', 'show', 'interfaces']));
+    if (iface.state !== 'connected') {
+        return { success: true, connected: false };
+    }
+
+    // IP config + gateway/DNS via PowerShell (structured, reliable)
+    const ipScript = `
+$c = Get-NetIPConfiguration -InterfaceAlias 'Wi-Fi' -ErrorAction SilentlyContinue
+[PSCustomObject]@{
+  ipv4 = $c.IPv4Address.IPAddress
+  gateway = $c.IPv4DefaultGateway.NextHop
+  dns = ($c.DNSServer | Where-Object { $_.AddressFamily -eq 2 } | Select-Object -ExpandProperty ServerAddresses) -join ','
+} | ConvertTo-Json -Compress`;
+    let ip = {};
+    try { ip = JSON.parse((await runPowerShell(ipScript, 8000)) || '{}'); } catch { /* keep {} */ }
+
+    // Live latency + packet loss to the gateway and to the internet (8.8.8.8)
+    const measure = async (target) => {
+        const s = `$p = Test-Connection '${target}' -Count 3 -ErrorAction SilentlyContinue
+if ($p) { "$([math]::Round(($p | Measure-Object ResponseTime -Average).Average)):$(3 - $p.Count)" } else { "x:3" }`;
+        const r = await runPowerShell(s, 12000);
+        if (!r || r.startsWith('x')) return { latencyMs: null, lossOf3: 3 };
+        const [lat, loss] = r.split(':');
+        return { latencyMs: Number(lat), lossOf3: Number(loss) };
+    };
+    const [gw, net] = ip.gateway
+        ? await Promise.all([measure(ip.gateway), measure('8.8.8.8')])
+        : [{ latencyMs: null, lossOf3: 3 }, await measure('8.8.8.8')];
+
+    // Derive a plain-language quality verdict from measured internet latency/loss
+    let quality = 'unknown';
+    if (net.latencyMs != null && net.lossOf3 === 0) {
+        quality = net.latencyMs < 40 ? 'excellent' : net.latencyMs < 100 ? 'good' : net.latencyMs < 250 ? 'fair' : 'poor';
+    } else if (net.lossOf3 >= 3) {
+        quality = 'no internet';
+    } else if (net.lossOf3 > 0) {
+        quality = 'unstable';
+    }
+
+    return {
+        success: true,
+        connected: true,
+        ssid: iface.ssid,
+        bssid: iface.bssid,
+        radio: iface.radio,
+        band: iface.band,
+        channel: iface.channel,
+        signal: iface.signal,
+        linkRateMbps: iface.rxRate,
+        security: iface.auth,
+        ipv4: ip.ipv4 || null,
+        gateway: ip.gateway || null,
+        dns: ip.dns ? ip.dns.split(',') : [],
+        gatewayLatencyMs: gw.latencyMs,
+        internetLatencyMs: net.latencyMs,
+        packetLossPct: Math.round((net.lossOf3 / 3) * 100),
+        internetReachable: net.lossOf3 < 3,
+        quality,
+    };
+});
+
 // Windows Settings deep links - allowlisted ms-settings: pages only.
 // (Radio toggles like Wi-Fi on/off need admin rights; opening the exact
 // settings panel is the safe, always-works alternative.)
@@ -846,6 +960,80 @@ ipcMain.handle('switch-audio-output', async (event, deviceName) => {
 });
 
 /* =========================
+   LOCAL LLM SERVER (Gemma via Ollama)
+   Auto-spawned so local mode needs zero manual steps. If Ollama is
+   already up (tray app, another Jarvis, manual `ollama serve`) we reuse
+   that instance and never kill it on quit — we only own what we spawn.
+========================= */
+let ollamaProcess = null; // non-null ONLY when this process spawned the server
+
+async function ollamaAlive(timeoutMs = 1500) {
+    try {
+        await axios.get(`${OLLAMA_URL}/api/tags`, { timeout: timeoutMs });
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+// Load the model into RAM ahead of the first prompt, so the first spoken
+// question doesn't eat a multi-second cold load. keep_alive matches the
+// 60m used by toolService.js chat calls.
+async function preloadLocalModel() {
+    try {
+        await axios.post(
+            `${OLLAMA_URL}/api/generate`,
+            { model: OLLAMA_MODEL, keep_alive: '60m' },
+            { timeout: 180000 }
+        );
+        console.log(`Local model resident: ${OLLAMA_MODEL} (keep_alive 60m)`);
+    } catch (e) {
+        console.warn(`Local model preload failed (${OLLAMA_MODEL}) — is it pulled? ollama pull ${OLLAMA_MODEL}:`, e.message);
+    }
+}
+
+async function startOllamaServer() {
+    if (await ollamaAlive()) {
+        console.log('Ollama already running — reusing existing instance');
+        preloadLocalModel();
+        return;
+    }
+
+    try {
+        ollamaProcess = spawn('ollama', ['serve'], { windowsHide: true, stdio: 'ignore' });
+
+        ollamaProcess.on('error', (e) => {
+            console.warn('Ollama spawn failed (local mode disabled):', e.message);
+            ollamaProcess = null;
+        });
+        ollamaProcess.on('exit', (code) => {
+            console.log('Ollama exited with code', code);
+            ollamaProcess = null;
+            // AUTO-RESPAWN, same contract as the STT server. A port-conflict
+            // exit lands here too; the retry is harmless because the
+            // alive-check above short-circuits while another instance owns it.
+            if (!app.isQuittingJarvis) {
+                setTimeout(() => { if (!ollamaProcess) startOllamaServer(); }, 15000);
+            }
+        });
+        console.log(`Ollama spawning (${OLLAMA_URL}, model ${OLLAMA_MODEL})`);
+    } catch (e) {
+        console.warn('Ollama unavailable:', e.message);
+        return;
+    }
+
+    // Wait for the server to bind before warming the model.
+    for (let i = 0; i < 30; i++) {
+        await new Promise((r) => setTimeout(r, 1000));
+        if (await ollamaAlive()) {
+            preloadLocalModel();
+            return;
+        }
+    }
+    console.warn('Ollama did not become ready within 30s — local mode may be unavailable');
+}
+
+/* =========================
    LOCAL STT SERVER (faster-whisper via uv)
    Auto-spawned so voice input needs zero manual steps. If another
    instance already owns port 8770, this one exits harmlessly.
@@ -881,8 +1069,13 @@ function startSttServer() {
 }
 
 app.on('before-quit', () => {
-    app.isQuittingJarvis = true; // stop the STT respawn loop
+    app.isQuittingJarvis = true; // stop the STT/Ollama respawn loops
     if (sttProcess) try { sttProcess.kill(); } catch { /* noop */ }
+    // Only ours to kill — an Ollama we merely reused stays up for the user.
+    if (ollamaProcess) try { ollamaProcess.kill(); } catch { /* noop */ }
+    // Unpublish mDNS and drop companion sockets cleanly, otherwise the phone
+    // keeps retrying against a stale advertisement.
+    if (companionBridge) try { companionBridge.stop(); } catch { /* noop */ }
 });
 
 /* =========================
@@ -1124,15 +1317,75 @@ const PHONE_BRIDGE_PORT = 8765;
 let phoneBridgeServer = null;
 let phoneBridgeToken = null;
 
+/* ---- Android companion ---- */
+const COMPANION_APK_PATH = path.join(
+    __dirname, 'companion', 'app', 'build', 'outputs', 'apk', 'debug', 'app-debug.apk'
+);
+let companionBridge = null;
+
+// Served at /install. Deliberately dependency-free and inline-styled: this is
+// rendered by a phone browser that has never seen this host before.
+const COMPANION_INSTALL_PAGE = `<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Install JARVIS</title>
+<style>
+  body{margin:0;min-height:100vh;display:flex;flex-direction:column;align-items:center;
+       justify-content:center;background:#050a0f;color:#1accff;
+       font-family:system-ui,-apple-system,sans-serif;text-align:center;padding:24px}
+  h1{font-size:22px;letter-spacing:3px;font-weight:400;margin:0 0 8px}
+  p{color:#7aa6b8;font-size:14px;line-height:1.6;max-width:320px;margin:0 0 28px}
+  a{display:inline-block;padding:16px 40px;border:1px solid #1accff;border-radius:8px;
+    color:#1accff;text-decoration:none;font-size:16px;letter-spacing:1px}
+  a:active{background:rgba(26,204,255,.15)}
+  small{display:block;margin-top:28px;color:#4a6b7a;font-size:12px;max-width:320px}
+</style></head>
+<body>
+  <h1>JARVIS</h1>
+  <p>Install the companion app to mirror the visualizer and link this phone to your desktop.</p>
+  <a href="/apk">Download APK</a>
+  <small>Android will ask permission to install from this browser. The app pairs
+  automatically once opened, while the desktop pairing window is still open.</small>
+</body></html>`;
+
+/**
+ * LAN IPv4 addresses, best-first.
+ *
+ * Order matters: addresses[0] is what the pairing QR and the install URL are
+ * built from. Unranked, this machine returns the VirtualBox host-only adapter
+ * (192.168.56.1) before the real Wi-Fi address (192.168.0.107) — a phone on the
+ * Wi-Fi subnet cannot route to it, so pairing timed out and the QR pointed at a
+ * dead host. Virtual and link-local adapters are pushed to the back.
+ */
 function getLanAddresses() {
     const nets = os.networkInterfaces();
-    const addrs = [];
+    const candidates = [];
+
     for (const name of Object.keys(nets)) {
         for (const net of nets[name] || []) {
-            if (net.family === 'IPv4' && !net.internal) addrs.push(net.address);
+            if (net.family !== 'IPv4' || net.internal) continue;
+
+            const ip = net.address;
+            // APIPA/link-local: never routable to a phone.
+            if (ip.startsWith('169.254.')) continue;
+
+            let rank = 0;
+            // VirtualBox/VMware host-only and Docker/WSL bridges: real
+            // interfaces, but never the one the phone is on.
+            if (ip.startsWith('192.168.56.') || ip.startsWith('192.168.99.')) rank += 100;
+            if (/^172\.(1[6-9]|2\d|3[01])\./.test(ip)) rank += 100;
+            if (/virtual|vmware|hyper-v|vethernet|docker|wsl|loopback|tailscale|zerotier/i.test(name)) rank += 100;
+            // Prefer the adapter that is actually the Wi-Fi/Ethernet uplink.
+            if (/wi-?fi|wlan|wireless/i.test(name)) rank -= 10;
+            else if (/^ethernet$/i.test(name)) rank -= 5;
+
+            candidates.push({ ip, rank, name });
         }
     }
-    return addrs;
+
+    candidates.sort((a, b) => a.rank - b.rank);
+    return candidates.map((c) => c.ip);
 }
 
 async function loadPhoneBridgeToken() {
@@ -1150,12 +1403,120 @@ function startPhoneBridge() {
     if (phoneBridgeServer) return;
 
     phoneBridgeServer = http.createServer((req, res) => {
-        // Token check: header or query param (MacroDroid supports both)
         const url = new URL(req.url, `http://localhost:${PHONE_BRIDGE_PORT}`);
+
+        /* ---- unauthenticated onboarding routes ----
+           These MUST bypass the token check: a phone that has not paired yet
+           has no token by definition. They are gated instead by the pairing
+           window, which only the desktop user can open. */
+
+        // Serves the companion APK for the QR-code install flow.
+        if (req.method === 'GET' && url.pathname === '/apk') {
+            if (!companionBridge || !companionBridge.isPairingOpen) {
+                res.writeHead(403, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'pairing window is closed' }));
+                return;
+            }
+            if (!fsSync.existsSync(COMPANION_APK_PATH)) {
+                res.writeHead(404, { 'Content-Type': 'text/plain' });
+                res.end('Companion APK not built yet. Run: companion/gradlew assembleDebug');
+                return;
+            }
+            const stat = fsSync.statSync(COMPANION_APK_PATH);
+            res.writeHead(200, {
+                'Content-Type': 'application/vnd.android.package-archive',
+                'Content-Length': stat.size,
+                'Content-Disposition': 'attachment; filename="jarvis-companion.apk"'
+            });
+            fsSync.createReadStream(COMPANION_APK_PATH).pipe(res);
+            return;
+        }
+
+        // Hands the bridge token to a phone, but only while the user has
+        // explicitly opened the pairing window.
+        if (req.method === 'POST' && url.pathname === '/pair') {
+            if (!companionBridge || !companionBridge.isPairingOpen) {
+                res.writeHead(403, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'pairing window is closed' }));
+                return;
+            }
+            let body = '';
+            req.on('data', (chunk) => {
+                body += chunk;
+                if (body.length > 4096) req.destroy();
+            });
+            req.on('end', () => {
+                let device = {};
+                try { device = JSON.parse(body || '{}'); } catch { /* tolerate */ }
+                console.log(`Companion paired: ${device.model || 'unknown device'} (Android ${device.android || '?'})`);
+                if (mainWindow && !mainWindow.isDestroyed()) {
+                    mainWindow.webContents.send('companion-paired', device);
+                }
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ token: phoneBridgeToken, wsPort: COMPANION_WS_PORT }));
+            });
+            return;
+        }
+
+        // Landing page the QR code points at — gives the phone a tap target
+        // rather than an immediate binary download.
+        if (req.method === 'GET' && url.pathname === '/install') {
+            res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+            res.end(COMPANION_INSTALL_PAGE);
+            return;
+        }
+
+        /* ---- everything below requires the token ---- */
         const token = req.headers['x-jarvis-token'] || url.searchParams.get('token');
         if (token !== phoneBridgeToken) {
             res.writeHead(401, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ error: 'invalid token' }));
+            return;
+        }
+
+        // Opens the companion pairing window without touching the HUD. Token
+        // is required, so this grants nothing to a caller who does not already
+        // hold the bridge secret. Useful for CLI/automation and for verifying
+        // the pairing flow headlessly.
+        if (req.method === 'POST' && url.pathname === '/pair-window') {
+            if (!companionBridge) {
+                res.writeHead(503, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'companion bridge not running' }));
+                return;
+            }
+            const until = companionBridge.openPairingWindow();
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, expiresAt: until }));
+            return;
+        }
+
+        // Token-gated command passthrough to the paired phone. Same authority
+        // as the renderer IPC path, exposed over the bridge so the companion
+        // can be driven and tested without the HUD in the loop.
+        if (req.method === 'POST' && url.pathname === '/companion/command') {
+            let body = '';
+            req.on('data', (chunk) => {
+                body += chunk;
+                if (body.length > 65536) req.destroy();
+            });
+            req.on('end', async () => {
+                try {
+                    const { action, params } = JSON.parse(body || '{}');
+                    if (!companionBridge) throw new Error('companion bridge not running');
+                    const result = await companionBridge.send(action, params || {});
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ ok: true, result }));
+                } catch (e) {
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ ok: false, error: e.message }));
+                }
+            });
+            return;
+        }
+
+        if (req.method === 'GET' && url.pathname === '/companion/devices') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify(companionBridge?.listDevices() ?? []));
             return;
         }
 
@@ -1206,6 +1567,103 @@ function startPhoneBridge() {
         console.log(`Phone bridge listening on port ${PHONE_BRIDGE_PORT} (LAN: ${getLanAddresses().join(', ')})`);
     });
 }
+
+/* =========================
+   ANDROID COMPANION CONTROL PLANE
+   Tier 1+2 run over the companion's WebSocket; Tier 3 shells out to adb.
+========================= */
+function startCompanionBridge() {
+    if (companionBridge) return;
+
+    companionBridge = new CompanionBridge({
+        getToken: () => phoneBridgeToken,
+        onEvent: ({ deviceId, event, payload }) => {
+            // Phone-originated events reuse the existing renderer channel so
+            // the HUD does not need a second notification path.
+            if (event === 'notification' && mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('phone-notification', {
+                    app: String(payload.app || 'phone').slice(0, 64),
+                    title: String(payload.title || '').slice(0, 200),
+                    text: String(payload.text || '').slice(0, 1000),
+                    receivedAt: Date.now()
+                });
+            }
+            if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('companion-event', { deviceId, event, payload });
+            }
+        },
+        onDevicesChanged: () => {
+            if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('companion-devices', companionBridge.listDevices());
+            }
+        }
+    });
+
+    companionBridge.start(PHONE_BRIDGE_PORT);
+}
+
+// Opens the install/pair window and returns a QR the phone can scan.
+ipcMain.handle('companion-open-pairing', async () => {
+    if (!companionBridge) return { error: 'companion bridge not running' };
+
+    const until = companionBridge.openPairingWindow();
+    const addresses = getLanAddresses();
+    if (!addresses.length) {
+        return { error: 'no LAN address — is this machine on Wi-Fi?' };
+    }
+
+    const installUrl = `http://${addresses[0]}:${PHONE_BRIDGE_PORT}/install`;
+    const qrDataUrl = await QRCode.toDataURL(installUrl, {
+        margin: 1,
+        width: 320,
+        color: { dark: '#1accffff', light: '#00000000' } // transparent, matches HUD
+    });
+
+    return {
+        installUrl,
+        qrDataUrl,
+        expiresAt: until,
+        apkBuilt: fsSync.existsSync(COMPANION_APK_PATH),
+        addresses
+    };
+});
+
+ipcMain.handle('companion-close-pairing', () => {
+    companionBridge?.closePairingWindow();
+    return { ok: true };
+});
+
+ipcMain.handle('companion-devices', () => companionBridge?.listDevices() ?? []);
+
+// Generic command passthrough: click, swipe, get_layout, screenshot, tts, ...
+ipcMain.handle('companion-command', async (_e, action, params) => {
+    if (!companionBridge) return { ok: false, error: 'companion bridge not running' };
+    try {
+        const result = await companionBridge.send(action, params || {});
+        return { ok: true, result };
+    } catch (e) {
+        return { ok: false, error: e.message };
+    }
+});
+
+/* ---- Tier 3: ADB ---- */
+ipcMain.handle('adb-command', async (_e, method, args) => {
+    const fn = adbService[method];
+    if (typeof fn !== 'function') {
+        return { ok: false, error: `unknown adb method '${method}'` };
+    }
+    // Only the curated exports are reachable — never a raw shell string from
+    // the renderer or from an LLM tool call.
+    if (method === 'adb' || method === 'shell') {
+        return { ok: false, error: 'raw adb/shell passthrough is disabled' };
+    }
+    try {
+        const result = await fn(...(Array.isArray(args) ? args : []));
+        return { ok: true, result };
+    } catch (e) {
+        return { ok: false, error: e.message };
+    }
+});
 
 ipcMain.handle('get-phone-bridge-info', () => ({
     port: PHONE_BRIDGE_PORT,

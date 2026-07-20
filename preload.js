@@ -31,6 +31,16 @@ contextBridge.exposeInMainWorld('electronAPI', {
     // Phone bridge (Wi-Fi notification relay)
     onPhoneNotification: createSafeListener('phone-notification'),
     getPhoneBridgeInfo: () => ipcRenderer.invoke('get-phone-bridge-info'),
+    // Android companion: onboarding + Tier 1/2 control over the WebSocket link
+    companionOpenPairing: () => ipcRenderer.invoke('companion-open-pairing'),
+    companionClosePairing: () => ipcRenderer.invoke('companion-close-pairing'),
+    companionDevices: () => ipcRenderer.invoke('companion-devices'),
+    companionCommand: (action, params) => ipcRenderer.invoke('companion-command', action, params),
+    onCompanionPaired: createSafeListener('companion-paired'),
+    onCompanionEvent: createSafeListener('companion-event'),
+    onCompanionDevices: createSafeListener('companion-devices'),
+    // Tier 3: wireless ADB (curated methods only — no raw shell passthrough)
+    adbCommand: (method, args) => ipcRenderer.invoke('adb-command', method, args),
     // Event-driven core (JARVIS v4)
     onJarvisEvent: createSafeListener('jarvis-event'),
     getBluetoothAudio: () => ipcRenderer.invoke('get-bluetooth-audio'),
@@ -46,6 +56,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     // Wi-Fi: scan networks + connect to saved profiles (no admin needed)
     wifiScan: () => ipcRenderer.invoke('wifi-scan'),
     wifiConnect: (name) => ipcRenderer.invoke('wifi-connect', name),
+    wifiDisconnect: () => ipcRenderer.invoke('wifi-disconnect'),
+    wifiInfo: () => ipcRenderer.invoke('wifi-info'),
     // Finance watchlist (read + manage; NO order placement exists)
     watchlistGet: () => ipcRenderer.invoke('watchlist-get'),
     watchlistAdd: (entry) => ipcRenderer.invoke('watchlist-add', entry),

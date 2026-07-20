@@ -545,6 +545,94 @@
     body.minimal #command-input-container:focus-within {
       opacity: 1;
     }
+    /* ===== Android Companion pairing overlay ===== */
+    #companion-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 8, 14, 0.82);
+      backdrop-filter: blur(6px);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 9000;
+    }
+    #companion-overlay.visible { display: flex; }
+
+    #companion-card {
+      background: rgba(4, 14, 22, 0.95);
+      border: 1px solid rgba(26, 204, 255, 0.35);
+      border-radius: 10px;
+      box-shadow: 0 0 40px rgba(26, 204, 255, 0.18);
+      padding: 22px 26px;
+      min-width: 460px;
+      font-family: 'Consolas', monospace;
+      color: #1accff;
+    }
+
+    #companion-body {
+      display: flex;
+      gap: 22px;
+      align-items: center;
+      margin: 18px 0 14px;
+    }
+
+    #companion-qr {
+      width: 180px;
+      height: 180px;
+      background: #000;
+      border: 1px solid rgba(26, 204, 255, 0.25);
+      border-radius: 6px;
+      image-rendering: pixelated;
+    }
+
+    #companion-steps p {
+      margin: 0 0 12px;
+      font-size: 12.5px;
+      color: #9fd8ea;
+      letter-spacing: 0.4px;
+    }
+    #companion-steps span {
+      display: inline-block;
+      width: 18px;
+      height: 18px;
+      line-height: 18px;
+      text-align: center;
+      border: 1px solid rgba(26, 204, 255, 0.5);
+      border-radius: 50%;
+      margin-right: 8px;
+      font-size: 11px;
+      color: #1accff;
+    }
+
+    #companion-url {
+      font-size: 11px;
+      color: #5b93a8;
+      word-break: break-all;
+      margin-bottom: 10px;
+    }
+
+    #companion-status {
+      font-size: 11px;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      color: #7aa6b8;
+      margin-bottom: 16px;
+    }
+    #companion-status.ok { color: #4ade80; }
+    #companion-status.err { color: #ff6b6b; }
+
+    #companion-close {
+      background: transparent;
+      border: 1px solid rgba(26, 204, 255, 0.4);
+      color: #1accff;
+      padding: 8px 22px;
+      border-radius: 5px;
+      font-family: inherit;
+      font-size: 12px;
+      letter-spacing: 1px;
+      cursor: pointer;
+    }
+    #companion-close:hover { background: rgba(26, 204, 255, 0.12); }
   </style>
 </head>
 
@@ -702,7 +790,26 @@
     <div id="sources-list"></div>
   </div>
 
+  <!-- Android Companion pairing overlay -->
+  <div id="companion-overlay">
+    <div id="companion-card">
+      <div class="hud-header">Android Companion</div>
+      <div id="companion-body">
+        <img id="companion-qr" alt="Pairing QR code">
+        <div id="companion-steps">
+          <p><span>1</span> Scan with your phone's camera</p>
+          <p><span>2</span> Tap Download, then Install</p>
+          <p><span>3</span> Open JARVIS — it pairs itself</p>
+        </div>
+      </div>
+      <div id="companion-url"></div>
+      <div id="companion-status">Pairing window open for 5 minutes</div>
+      <button id="companion-close">Close</button>
+    </div>
+  </div>
+
   <script type="module" src="./js/scripts.js"></script>
+  <script type="module" src="./js/companionUi.js"></script>
 </body>
 
 </html>
