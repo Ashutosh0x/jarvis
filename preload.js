@@ -94,6 +94,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     chainWatchlistAdd: (opts) => ipcRenderer.invoke('chain-watchlist-add', opts),
     chainWatchlistGet: () => ipcRenderer.invoke('chain-watchlist-get'),
     chainWatchlistRemove: (opts) => ipcRenderer.invoke('chain-watchlist-remove', opts),
+    chainAlertsSummary: () => ipcRenderer.invoke('chain-alerts-summary'),
     fileOperation: (operation, ...args) => ipcRenderer.invoke('file-operation', operation, ...args),
     openWebsite: (url) => ipcRenderer.send('open-website', url),
     readClipboard: () => ipcRenderer.invoke('read-clipboard'),

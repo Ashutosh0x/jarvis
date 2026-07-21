@@ -1589,6 +1589,7 @@ ipcMain.handle('onchain-token', async (event, { chain, token, data }) => {
 ========================= */
 const WsClient = require('ws');
 const { scanBlockTxs, shortAddr: chainShortAddr } = require('./chainWatch');
+const { backoffDelay, createDedup, createBlockTracker, prioritizeAlerts } = require('./streamGuard');
 
 const CHAIN_WS_URLS = {
     ethereum: process.env.JARVIS_ETH_WS || 'wss://ethereum-rpc.publicnode.com',
@@ -1667,10 +1668,27 @@ async function describeParty(address) {
     return ent ? `${ent.name} (per ${ent.source})` : chainShortAddr(address);
 }
 
+/* Alert history — append-only JSONL so "show whale activity today" is
+   answerable from what was actually seen, not from memory. Rotated at 2MB. */
+const CHAIN_ALERTS_FILE = () => path.join(app.getPath('userData'), 'chain-alerts.jsonl');
+async function appendChainAlert(entry) {
+    try {
+        const file = CHAIN_ALERTS_FILE();
+        try {
+            const st = await fs.stat(file);
+            if (st.size > 2 * 1024 * 1024) await fs.rename(file, file + '.1').catch(() => {});
+        } catch { /* no file yet */ }
+        await fs.appendFile(file, JSON.stringify(entry) + '\n', 'utf-8');
+    } catch { /* history is best-effort, never blocks an alert */ }
+}
+
 function stopChainStream() {
     if (!chainStream) return false;
-    try { chainStream.ws.close(); } catch { /* already closed */ }
-    chainStream = null;
+    const s = chainStream;
+    chainStream = null;            // cleared FIRST so close/heartbeat handlers see intent
+    clearInterval(s.heartbeat);
+    clearTimeout(s.reconnectTimer);
+    try { s.ws?.terminate?.(); } catch { /* already gone */ }
     return true;
 }
 
@@ -1680,7 +1698,89 @@ function startChainStream(chainKey = 'ethereum') {
     if (chainStream?.chain === chainKey) return { success: true, already: true };
     stopChainStream();
 
-    const state = { ws: null, chain: chainKey, blocks: 0, alerts: 0, startedAt: Date.now() };
+    const state = {
+        ws: null, chain: chainKey, startedAt: Date.now(),
+        blocks: 0, alerts: 0, reconnects: 0, attempt: 0,
+        lastMsgAt: 0, heartbeat: null, reconnectTimer: null,
+        procTotalMs: 0, procCount: 0,
+        dedup: createDedup({ ttlMs: 10 * 60 * 1000, max: 2048 }),
+        tracker: createBlockTracker({ maxGap: 5 }),
+    };
+
+    /* One block through scan -> dedupe -> prioritise -> announce -> history.
+       Used identically by the live head path and gap backfill, so a backfilled
+       block cannot behave differently from a live one. */
+    const processBlock = async (blockHex, { backfilled = false } = {}) => {
+        const t0 = Date.now();
+        const block = await rpcCall(chainKey, 'eth_getBlockByNumber', [blockHex, true]).catch(() => null);
+        if (!block?.transactions || chainStream !== state) return;
+        state.blocks++;
+
+        const watch = await loadChainWatchlist();
+        const { whales, watchHits } = scanBlockTxs(block.transactions, {
+            chain: chainKey,
+            watch: watch.filter(w => (w.chains || ['ethereum']).includes(chainKey)).map(w => w.address),
+        });
+
+        // Duplicate suppression across reconnect replays and backfill overlap.
+        const freshWhales = whales.filter(w => !state.dedup.seen(`${chainKey}:${w.hash}:w`));
+        const freshHits = watchHits.filter(h => !state.dedup.seen(`${chainKey}:${h.hash}:h`));
+        state.procCount++; state.procTotalMs += Date.now() - t0;
+        if (!freshWhales.length && !freshHits.length) return;
+
+        const price = await getEthUsd();
+        const blockNumber = parseInt(blockHex, 16);
+        const usdOf = (amount) => price ? Math.round(parseFloat(String(amount).replace(/,/g, '')) * price) : null;
+
+        // Watch hits ALWAYS announce — the user asked about these addresses.
+        for (const h of freshHits) {
+            state.alerts++;
+            const entry = watch.find(x => x.address === h.watched);
+            const payload = {
+                ...h, blockNumber, backfilled,
+                label: entry?.label || chainShortAddr(h.watched),
+                counterparty: await describeParty(h.direction === 'out' ? h.to : h.from),
+                usd: usdOf(h.amount),
+            };
+            publishEvent('chain-watch-hit', payload);
+            appendChainAlert({ ts: Date.now(), type: 'watch', chain: chainKey, hash: h.hash, amount: h.amount, usd: payload.usd, from: h.from, to: h.to, blockNumber });
+        }
+
+        // Whales: loudest few speak, the rest collapse into one summary line.
+        const { speak, summary } = prioritizeAlerts(freshWhales, { maxSpoken: 2 });
+        for (const w of speak) {
+            state.alerts++;
+            const payload = {
+                ...w, blockNumber, backfilled,
+                usd: usdOf(w.amount),
+                fromLabel: await describeParty(w.from),
+                toLabel: await describeParty(w.to),
+            };
+            publishEvent('whale-alert', payload);
+            appendChainAlert({ ts: Date.now(), type: 'whale', chain: chainKey, hash: w.hash, amount: w.amount, usd: payload.usd, from: w.from, to: w.to, blockNumber });
+        }
+        if (summary) {
+            state.alerts++;
+            publishEvent('whale-alert', {
+                summary: true, blockNumber, backfilled, chain: chainKey,
+                count: summary.count,
+                largestAmount: summary.largest.amount,
+                largestUsd: usdOf(summary.largest.amount),
+            });
+            for (const w of [summary.largest]) {
+                appendChainAlert({ ts: Date.now(), type: 'whale', chain: chainKey, hash: w.hash, amount: w.amount, usd: usdOf(w.amount), from: w.from, to: w.to, blockNumber, summarized: summary.count });
+            }
+        }
+    };
+
+    const scheduleReconnect = () => {
+        if (chainStream !== state || app.isQuittingJarvis) return;
+        state.reconnects++;
+        const delay = backoffDelay(state.attempt++);
+        console.warn(`Chain stream: reconnecting (${chainKey}) in ${Math.round(delay / 1000)}s (attempt ${state.attempt})`);
+        state.reconnectTimer = setTimeout(connect, delay);
+    };
+
     const connect = () => {
         if (chainStream !== state || app.isQuittingJarvis) return;
         const ws = new WsClient(url);
@@ -1688,73 +1788,107 @@ function startChainStream(chainKey = 'ethereum') {
 
         ws.on('open', () => {
             ws.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_subscribe', params: ['newHeads'] }));
+            state.lastMsgAt = Date.now();
             console.log(`Chain stream: connected (${chainKey})`);
         });
 
         ws.on('message', async (raw) => {
+            state.lastMsgAt = Date.now();
             try {
                 const msg = JSON.parse(raw);
+                // Any successful subscription reply resets the backoff ladder.
+                if (msg.id === 1 && msg.result) { state.attempt = 0; return; }
                 if (msg.method !== 'eth_subscription' || !msg.params?.result?.number) return;
+
                 const blockHex = msg.params.result.number;
+                const n = parseInt(blockHex, 16);
+                const { duplicate, gap, lost } = state.tracker.next(n);
+                if (duplicate) return; // provider replayed a head after reconnect
 
-                // Full block via the existing hedged HTTP path — the WS socket
-                // stays a pure notification channel.
-                const block = await rpcCall(chainKey, 'eth_getBlockByNumber', [blockHex, true]).catch(() => null);
-                if (!block?.transactions || chainStream !== state) return;
-                state.blocks++;
-
-                const watch = await loadChainWatchlist();
-                const { whales, watchHits } = scanBlockTxs(block.transactions, {
-                    chain: chainKey,
-                    watch: watch.filter(w => (w.chains || ['ethereum']).includes(chainKey)).map(w => w.address),
-                });
-                if (!whales.length && !watchHits.length) return;
-
-                const price = await getEthUsd();
-                const blockNumber = parseInt(blockHex, 16);
-
-                for (const w of whales.slice(0, 3)) { // cap: a busy block must not queue 20 announcements
-                    state.alerts++;
-                    publishEvent('whale-alert', {
-                        ...w,
-                        blockNumber,
-                        usd: price ? Math.round(parseFloat(w.amount.replace(/,/g, '')) * price) : null,
-                        fromLabel: await describeParty(w.from),
-                        toLabel: await describeParty(w.to),
-                    });
+                if (lost > 0) console.warn(`Chain stream: ${lost} blocks lost beyond backfill cap (${chainKey})`);
+                // Backfill detected gaps oldest-first BEFORE the live head, so
+                // announcements stay chronological. Dedup makes overlap safe.
+                for (const missed of gap) {
+                    await processBlock('0x' + missed.toString(16), { backfilled: true });
                 }
-                for (const h of watchHits) {
-                    state.alerts++;
-                    const entry = watch.find(x => x.address === h.watched);
-                    publishEvent('chain-watch-hit', {
-                        ...h,
-                        blockNumber,
-                        label: entry?.label || chainShortAddr(h.watched),
-                        counterparty: await describeParty(h.direction === 'out' ? h.to : h.from),
-                        usd: price ? Math.round(parseFloat(h.amount.replace(/,/g, '')) * price) : null,
-                    });
-                }
+                await processBlock(blockHex);
             } catch { /* one bad block must not kill the stream */ }
         });
 
-        ws.on('close', () => {
-            if (chainStream === state && !app.isQuittingJarvis) {
-                console.warn(`Chain stream: disconnected (${chainKey}), reconnecting in 10s`);
-                setTimeout(connect, 10000);
-            }
-        });
+        ws.on('pong', () => { state.lastMsgAt = Date.now(); });
+        ws.on('close', () => { if (chainStream === state) scheduleReconnect(); });
         ws.on('error', (e) => console.warn(`Chain stream error (${chainKey}): ${e.message}`));
     };
+
+    /* Heartbeat: ethereum heads arrive ~12s apart, so 90s of silence means the
+       socket is dead even if TCP hasn't noticed (BT/wifi transitions on this
+       machine kill connections eventlessly — same lesson as the mic watchdog).
+       Ping at 30s; terminate (not close: close waits for the peer) at 90s. */
+    state.heartbeat = setInterval(() => {
+        if (chainStream !== state) return;
+        const ws = state.ws;
+        if (!ws || ws.readyState !== 1) return;
+        const silentMs = Date.now() - state.lastMsgAt;
+        if (silentMs > 90000) {
+            console.warn(`Chain stream: no traffic for ${Math.round(silentMs / 1000)}s, forcing reconnect (${chainKey})`);
+            try { ws.terminate(); } catch { /* close handler reconnects */ }
+        } else if (silentMs > 30000) {
+            try { ws.ping(); } catch { /* dead socket -> heartbeat catches it next tick */ }
+        }
+    }, 15000);
 
     chainStream = state;
     connect();
     return { success: true };
 }
 
+/* Today's alert history, aggregated for "show whale activity today". Reads the
+   JSONL (plus rotation file) and reports only what was actually recorded. */
+ipcMain.handle('chain-alerts-summary', async () => {
+    const midnight = new Date(); midnight.setHours(0, 0, 0, 0);
+    const since = midnight.getTime();
+    const rows = [];
+    for (const f of [CHAIN_ALERTS_FILE() + '.1', CHAIN_ALERTS_FILE()]) {
+        try {
+            const text = await fs.readFile(f, 'utf-8');
+            for (const line of text.split('\n')) {
+                if (!line.trim()) continue;
+                try { const r = JSON.parse(line); if (r.ts >= since) rows.push(r); } catch { /* skip torn line */ }
+            }
+        } catch { /* file may not exist */ }
+    }
+    const whales = rows.filter(r => r.type === 'whale');
+    const watch = rows.filter(r => r.type === 'watch');
+    let largest = null;
+    for (const w of whales) {
+        try { if (!largest || BigInt(Math.round(parseFloat(String(w.amount).replace(/,/g, '')) * 1e6)) > BigInt(Math.round(parseFloat(String(largest.amount).replace(/,/g, '')) * 1e6))) largest = w; } catch { /* skip */ }
+    }
+    return {
+        success: true,
+        since,
+        whaleCount: whales.length,
+        watchCount: watch.length,
+        largest: largest ? { amount: largest.amount, usd: largest.usd || null, from: largest.from, to: largest.to, blockNumber: largest.blockNumber, ts: largest.ts } : null,
+        streaming: !!chainStream,
+    };
+});
+
 ipcMain.handle('chain-stream-start', async (event, { chain } = {}) => startChainStream(chain || 'ethereum'));
 ipcMain.handle('chain-stream-stop', async () => ({ success: true, wasRunning: stopChainStream() }));
 ipcMain.handle('chain-stream-status', async () => chainStream
-    ? { running: true, chain: chainStream.chain, blocks: chainStream.blocks, alerts: chainStream.alerts, connected: chainStream.ws?.readyState === 1 }
+    ? {
+        running: true,
+        chain: chainStream.chain,
+        connected: chainStream.ws?.readyState === 1,
+        blocks: chainStream.blocks,
+        alerts: chainStream.alerts,
+        reconnects: chainStream.reconnects,
+        missedBlocks: chainStream.tracker.missedTotal,
+        lastBlock: chainStream.tracker.lastBlock,
+        uptimeMin: Math.round((Date.now() - chainStream.startedAt) / 60000),
+        avgProcessMs: chainStream.procCount ? Math.round(chainStream.procTotalMs / chainStream.procCount) : null,
+        dedupSize: chainStream.dedup.size,
+    }
     : { running: false });
 
 ipcMain.handle('chain-watchlist-add', async (event, { address, label, chains }) => {

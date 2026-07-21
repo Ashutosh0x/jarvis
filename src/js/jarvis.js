@@ -2100,7 +2100,10 @@ class Jarvis {
 
         // Whale stream control — needs no address. "watch for whales",
         // "monitor whale transfers", "stop whale alerts", "whale watch status".
+        // History summary ("whale activity today") is checked FIRST or the
+        // stream-control verbs would eat it.
         if (/\b(whales?|large transfers?|big moves?)\b/i.test(text)) {
+            if (/\b(today|activity|summary|report|recap|so far)\b/i.test(text)) return { kind: 'whale-summary', chain: 'ethereum' };
             if (/\b(stop|off|disable|end|quit)\b/i.test(text)) return { kind: 'whale-stream', action: 'stop', chain: 'ethereum' };
             if (/\b(status|running|active)\b/i.test(text)) return { kind: 'whale-stream', action: 'status', chain: 'ethereum' };
             if (/\b(watch|monitor|alert|track|stream|start|on|live)\b/i.test(text)) return { kind: 'whale-stream', action: 'start', chain: 'ethereum' };
@@ -2183,6 +2186,10 @@ class Jarvis {
                 await this.handleWhaleStream(intent.action);
                 return;
             }
+            if (intent.kind === 'whale-summary') {
+                await this.handleWhaleSummary();
+                return;
+            }
 
             // Resolve an ENS name to an address up front for reads that need one.
             if (!intent.address && intent.ensName) {
@@ -2248,6 +2255,16 @@ class Jarvis {
        onchain.js — nothing here is estimated or guessed, and chains that fail
        are reported as unreadable rather than silently shown as zero. */
     async handlePortfolio(address, short) {
+        // 45s cache: a repeated "scan X" (or a follow-up question seconds later)
+        // answers instantly instead of re-firing ~20 RPC reads. Balances do not
+        // meaningfully change inside a spoken conversation turn.
+        this._portfolioCache = this._portfolioCache || new Map();
+        const cached = this._portfolioCache.get(address.toLowerCase());
+        if (cached && Date.now() - cached.at < 45000) {
+            this.displayText(cached.display, null);
+            this.speak(cached.spoken + ' From the scan a moment ago.');
+            return;
+        }
         this.displayText(`Scanning ${short} across ${Object.keys(onchain.CHAINS).length} chains...`, null);
 
         const scanChain = async (chainKey) => {
@@ -2304,12 +2321,19 @@ class Jarvis {
 
         const display = [`Cross-chain portfolio for ${short}:`, ...lines];
         if (failed.length) display.push(`Unreadable: ${failed.map(f => f.chainKey).join(', ')}`);
-        this.displayText(display.join('\n'), null);
+        const displayStr = display.join('\n');
+        this.displayText(displayStr, null);
 
         let spoken = `Cross-chain scan complete, Sir. ${short} holds ${spokenParts.slice(0, 3).join('; ')}.`;
         if (spokenParts.length > 3) spoken += ` Plus holdings on ${spokenParts.length - 3} more chains, on screen now.`;
         if (failed.length) spoken += ` ${failed.length} chains could not be read.`;
         this.speak(spoken);
+
+        // Cache only clean, non-empty scans — a partial read must not become
+        // the instant answer for the next 45 seconds.
+        if (!failed.length) {
+            this._portfolioCache.set(address.toLowerCase(), { at: Date.now(), display: displayStr, spoken });
+        }
     }
 
     async handleWatchAddress(address, short) {
@@ -2332,9 +2356,12 @@ class Jarvis {
         }
         if (action === 'status') {
             const s = await window.electronAPI.chainStreamStatus();
-            this.speak(s?.running
-                ? `The chain stream is ${s.connected ? 'live' : 'reconnecting'} on ${s.chain}: ${s.blocks} blocks scanned, ${s.alerts} alerts so far.`
-                : 'The chain stream is not running, Sir.');
+            if (!s?.running) { this.speak('The chain stream is not running, Sir.'); return; }
+            let line = `The chain stream is ${s.connected ? 'live' : 'reconnecting'} on ${s.chain}: ${s.blocks} blocks scanned in ${s.uptimeMin} minutes, ${s.alerts} alerts.`;
+            if (s.reconnects) line += ` ${s.reconnects} reconnects.`;
+            if (s.missedBlocks) line += ` ${s.missedBlocks} blocks were missed and handled.`;
+            this.displayText(`Stream: block ${s.lastBlock}, avg scan ${s.avgProcessMs}ms, dedup ${s.dedupSize} entries`, null);
+            this.speak(line);
             return;
         }
         const r = await window.electronAPI.chainStreamStart({});
@@ -2342,6 +2369,30 @@ class Jarvis {
         this.speak(r?.success
             ? 'Whale monitoring is live, Sir. I will announce native transfers of one hundred ETH or more as blocks confirm on Ethereum.'
             : 'I could not start the chain stream.');
+    }
+
+    // "Show whale activity today" — read back what was actually recorded in the
+    // alert history, never a from-memory impression of the day.
+    async handleWhaleSummary() {
+        if (!window.electronAPI?.chainAlertsSummary) { this.speak('Alert history is not available here.'); return; }
+        const s = await window.electronAPI.chainAlertsSummary();
+        if (!s?.success) { this.speak('I could not read the alert history.'); return; }
+        if (!s.whaleCount && !s.watchCount) {
+            this.speak(s.streaming
+                ? 'No whale or watchlist alerts recorded so far today, Sir.'
+                : 'No alerts recorded today — the chain stream has not been running.');
+            return;
+        }
+        let line = `Today I recorded ${s.whaleCount} whale transfer${s.whaleCount === 1 ? '' : 's'}`;
+        if (s.watchCount) line += ` and ${s.watchCount} watched-address hit${s.watchCount === 1 ? '' : 's'}`;
+        line += '.';
+        if (s.largest) {
+            const usd = s.largest.usd ? ` — about ${s.largest.usd.toLocaleString('en-US')} dollars` : '';
+            line += ` The largest was ${s.largest.amount} ETH${usd}, in block ${s.largest.blockNumber}.`;
+        }
+        if (!s.streaming) line += ' The stream is not currently running.';
+        this.displayText(`Chain activity today: ${s.whaleCount} whales, ${s.watchCount} watch hits.`, null);
+        this.speak(line);
     }
 
     // DETERMINISTIC ERC classification via ERC-165 supportsInterface + ERC-20
@@ -3116,11 +3167,21 @@ class Jarvis {
                         // amounts are exact, USD is contextual, labels arrive
                         // pre-attributed from main (user watchlist or Arkham) —
                         // an unlabeled party is spoken as a shortened address,
-                        // never guessed.
+                        // never guessed. Burst blocks arrive pre-collapsed: the
+                        // loudest transfers as individual alerts, the rest as one
+                        // summary payload, so a busy block costs one sentence.
                         const w = evt.payload;
+                        const late = w.backfilled ? ' (recovered from a missed block)' : '';
+                        if (w.summary) {
+                            const usd = w.largestUsd ? ` (about ${w.largestUsd.toLocaleString('en-US')} dollars)` : '';
+                            const line = `${w.count} further large transfers in block ${w.blockNumber}, the largest ${w.largestAmount} ETH${usd}.`;
+                            this.displayText(`Whale summary: ${line}${late}`, null);
+                            if (this._whaleAlertsOn) this.speak(`Also, ${line}`);
+                            break;
+                        }
                         const usd = w.usd ? `, approximately ${w.usd.toLocaleString('en-US')} dollars,` : '';
                         const line = `${w.amount} ETH${usd} moved from ${w.fromLabel} to ${w.toLabel} in block ${w.blockNumber}.`;
-                        this.displayText(`Whale alert: ${line}`, null);
+                        this.displayText(`Whale alert: ${line}${late}`, null);
                         if (this._whaleAlertsOn) this.speak(`Sir, significant movement on Ethereum. ${line}`);
                         break;
                     }
