@@ -118,13 +118,12 @@ routes('remind me about vines1vzrYbzLMRdu58ou5XTby4qAqVRLmqo36NKPTg', null);
 {
     const detect = Cls.prototype.detectIntent;
     // Minimal `this`: detectIntent reaches for a few helpers on the way past.
-    const ctx = {
-        settings: { get: () => null },
-        _resolveNewsPronoun: Cls.prototype._resolveNewsPronoun,
-        parseNewsQuery: Cls.prototype.parseNewsQuery,
-        parseOnchainQuery: Cls.prototype.parseOnchainQuery,
-        parseNetworkQuery: Cls.prototype.parseNetworkQuery,
-    };
+    /* Built FROM the prototype, not a hand-listed stub: detectIntent calls a
+       dozen helpers on the way past, and a partial stub fails with "is not a
+       function" on whichever one is added next. */
+    const ctx = Object.create(Cls.prototype);
+    ctx.settings = { get: () => null };
+    ctx._lastNewsSubject = null;
     const intentOf = (text) => { try { return detect.call(ctx, text)?.intent ?? null; } catch (e) { return `THREW ${e.message}`; } };
 
     const pastedRelease = `Chrome Releases Release updates from the Chrome team Chrome Beta for iOS Update Tuesday, July 21, 2026 Hi everyone! We've just released Chrome Beta 151 (151.0.7922.43) for iOS; it'll become available on App Store in the next few days. You can see a partial list of the changes in the Git log. If you find a new issue, please let us know by filing a bug. Chrome Release Team`;
@@ -141,18 +140,45 @@ routes('remind me about vines1vzrYbzLMRdu58ou5XTby4qAqVRLmqo36NKPTg', null);
         intentOf('turn on the flashlight on my phone') === 'PHONE_TOOL', String(intentOf('turn on the flashlight on my phone')));
 }
 
+/* --- feed brief vs news -------------------------------------------------------
+   "brief me" reads the ingested event log with provenance; "news about X" is a
+   fresh headline scrape. Different answers, so the router must not conflate
+   them. */
+{
+    const detect = Cls.prototype.detectIntent;
+    /* Built FROM the prototype, not a hand-listed stub: detectIntent calls a
+       dozen helpers on the way past, and a partial stub fails with "is not a
+       function" on whichever one is added next. */
+    const ctx = Object.create(Cls.prototype);
+    ctx.settings = { get: () => null };
+    ctx._lastNewsSubject = null;
+    const intentOf = (t) => { try { return detect.call(ctx, t)?.intent ?? null; } catch (e) { return `THREW ${e.message}`; } };
+
+    check('"brief me" reads the feed log', intentOf('brief me') === 'FEED_BRIEF', String(intentOf('brief me')));
+    check('"what changed today" is a brief', intentOf('what changed today') === 'FEED_BRIEF');
+    check('"anything new" is a brief', intentOf('anything new') === 'FEED_BRIEF');
+    check('"what did i miss" is a brief', intentOf('what did i miss') === 'FEED_BRIEF');
+    check('a week-long brief is recognised', (() => {
+        const i = detect.call(ctx, 'brief me on the week');
+        return i?.intent === 'FEED_BRIEF' && i.hours === 168;
+    })());
+    // Must not steal the existing news path.
+    check('"news about tesla" still routes to news', intentOf('news about tesla') === 'NEWS_QUERY', String(intentOf('news about tesla')));
+    check('"latest news" still routes to news', intentOf('latest news') === 'NEWS_QUERY');
+}
+
 /* --- pronouns in news queries ------------------------------------------------
    "yesterdays news about him" searched for the literal word "him" and returned
    three unrelated stories that happened to contain it. */
 {
-    const ctx = { _lastNewsSubject: null, _resolveNewsPronoun: Cls.prototype._resolveNewsPronoun };
+    const ctx = Object.assign(Object.create(Cls.prototype), { _lastNewsSubject: null });
     const parse = Cls.prototype.parseNewsQuery.bind(ctx);
 
     check('a real subject is captured', parse('news about elon musk')?.topic === 'elon musk');
     check('a following pronoun resolves to that subject', parse('news about him')?.topic === 'elon musk');
     check('the subject persists across a rephrase', parse("what's the latest on him")?.topic === 'elon musk');
 
-    const fresh = { _lastNewsSubject: null, _resolveNewsPronoun: Cls.prototype._resolveNewsPronoun };
+    const fresh = Object.assign(Object.create(Cls.prototype), { _lastNewsSubject: null });
     const parseFresh = Cls.prototype.parseNewsQuery.bind(fresh);
     check('a pronoun with no antecedent falls back to headlines, not the word itself',
         parseFresh('news about him')?.topic === '', JSON.stringify(parseFresh('news about him')));

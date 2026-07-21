@@ -3441,6 +3441,81 @@ function timeAgo(date) {
 }
 
 /* =========================
+   CONTINUOUS INGESTION — verified feeds into a durable event log
+
+   Built on a measurement, not an ambition: Jarvis has seen 227 turns of real
+   conversation and its retrieval corpus holds 2 chunks and 134 characters, with
+   zero durable beliefs. The retrieval engine benchmarks well and has nothing to
+   retrieve. Memory that only fills when the user says something quotable stays
+   empty; this gives it a corpus.
+
+   The registry lives in the renderer's feeds.js so the parser is unit-tested,
+   and main only fetches. SEC endpoints REQUIRE a declared User-Agent with a
+   contact address — anonymous traffic is refused.
+========================= */
+const FEED_STORE = () => path.join(app.getPath('userData'), 'feed-events.jsonl');
+const FEED_SEEN = () => path.join(app.getPath('userData'), 'feed-seen.json');
+const SEC_UA = 'Jarvis/1.0 (ashutoshkumarsingh0x@gmail.com)';
+
+ipcMain.handle('feed-fetch', async (event, { url, needsUserAgent = false } = {}) => {
+    try {
+        const u = new URL(String(url || ''));
+        if (!/^https?:$/.test(u.protocol)) return { success: false, error: 'not an http url' };
+        const res = await fetch(u.href, {
+            headers: {
+                'User-Agent': needsUserAgent ? SEC_UA : 'Mozilla/5.0 Jarvis/1.0',
+                Accept: 'application/xml,text/xml,application/rss+xml,*/*',
+            },
+            signal: AbortSignal.timeout(20000),
+        });
+        if (!res.ok) return { success: false, error: `http ${res.status}` };
+        return { success: true, xml: await res.text(), fetchedAt: Date.now() };
+    } catch (e) { return { success: false, error: e.message }; }
+});
+
+/* Append-only with rotation, like the chain alert log: an event store you can
+   replay is worth more than one you can query quickly. */
+ipcMain.handle('feed-record', async (event, { events } = {}) => {
+    if (!Array.isArray(events) || !events.length) return { success: true, written: 0 };
+    try {
+        const file = FEED_STORE();
+        try {
+            const st = await fs.stat(file);
+            if (st.size > 4 * 1024 * 1024) await fs.rename(file, file + '.1').catch(() => {});
+        } catch { /* first write */ }
+        await fs.appendFile(file, events.map(e => JSON.stringify(e)).join('\n') + '\n', 'utf-8');
+        return { success: true, written: events.length };
+    } catch (e) { return { success: false, error: e.message }; }
+});
+
+ipcMain.handle('feed-history', async (event, { sinceMs } = {}) => {
+    const cutoff = Number.isFinite(sinceMs) && sinceMs > 0 ? Date.now() - sinceMs : 0;
+    const rows = [];
+    for (const f of [FEED_STORE() + '.1', FEED_STORE()]) {
+        try {
+            for (const line of (await fs.readFile(f, 'utf-8')).split('\n')) {
+                if (!line.trim()) continue;
+                try {
+                    const r = JSON.parse(line);
+                    // Filter on the PUBLISHER's time; ingest time would make a
+                    // backfilled feed look like today's news.
+                    if ((r.publishedTs || r.ingestedAt || 0) >= cutoff) rows.push(r);
+                } catch { /* torn line */ }
+            }
+        } catch { /* no file yet */ }
+    }
+    return { success: true, events: rows, total: rows.length };
+});
+
+/** Ids already ingested, so a feed re-read does not duplicate memory. */
+ipcMain.handle('feed-seen-get', async () => readJsonStore(FEED_SEEN(), [], 'feed seen-ids'));
+ipcMain.handle('feed-seen-set', async (event, { ids } = {}) => {
+    // Bounded: the newest 5000 ids are enough to dedupe any feed window.
+    const list = Array.isArray(ids) ? ids.slice(-5000) : [];
+    return writeJsonStore(FEED_SEEN(), list, 'feed seen-ids');
+});
+
+/* =========================
    SECURITY ADVISORIES — Chrome Releases + NVD, both keyless
 
    Built because the model invented a CVE severity and defended it when

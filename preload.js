@@ -109,6 +109,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
     getHistory: (opts) => ipcRenderer.invoke('get-history', opts),
     // Security advisories: Chrome Releases RSS + NVD, both keyless. Exists so
     // CVE answers come from an advisory rather than from the model.
+    // Continuous ingestion: fetch verified feeds, record events with provenance
+    feedFetch: (opts) => ipcRenderer.invoke('feed-fetch', opts),
+    feedRecord: (opts) => ipcRenderer.invoke('feed-record', opts),
+    feedHistory: (opts) => ipcRenderer.invoke('feed-history', opts || {}),
+    feedSeenGet: () => ipcRenderer.invoke('feed-seen-get'),
+    feedSeenSet: (opts) => ipcRenderer.invoke('feed-seen-set', opts),
     securityAdvisories: (opts) => ipcRenderer.invoke('security-advisories', opts || {}),
     cveLookup: (opts) => ipcRenderer.invoke('cve-lookup', opts),
     // Prediction markets (Polymarket + Kalshi). Read-only: no order placement

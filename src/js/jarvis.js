@@ -14,6 +14,7 @@ import * as ens from './services/ens.js';
 import * as chainIntel from './services/chainIntel.js';
 import * as prediction from './services/predictionMarkets.js';
 import * as security from './services/security.js';
+import * as feeds from './services/feeds.js';
 import { parseOndoQuery, ONDO_COUNT, HOT_LIST as ONDO_HOT_LIST } from './services/ondoRegistry.js';
 import * as netInspect from './services/netInspect.js';
 import * as netDiscovery from './services/netDiscovery.js';
@@ -115,6 +116,19 @@ class Jarvis {
                 console.warn('Startup auto-reflection skipped:', e.message);
             }
         }, 45000);
+
+        /* Feed ingestion: once 90s after boot, then every 6 hours. SILENT by
+           design — the corpus is the product, not the announcement, and an
+           assistant that reads the news aloud unprompted is a worse assistant.
+           Ask "brief me" to hear it. Staggered well clear of reflection so the
+           two never contend for the embedder. */
+        setTimeout(() => {
+            this.ingestFeeds({ announce: false }).catch(e => console.warn('Feed ingest skipped:', e.message));
+            setInterval(() => {
+                if (this.isProcessing || this.ttsActive) return;   // never mid-turn
+                this.ingestFeeds({ announce: false }).catch(() => {});
+            }, 6 * 60 * 60 * 1000);
+        }, 90000);
 
         // Camera State
         this.cameraStream = null;
@@ -1238,6 +1252,15 @@ class Jarvis {
         const priceEntity = this.parsePriceQuery(cmd);
         if (priceEntity) return { intent: 'PRICE_QUERY', entity: priceEntity };
 
+        /* FEED BRIEF — "brief me", "what changed today", "anything new".
+           Checked before the news matcher: this reads the ingested event log
+           with provenance, which is a different and better answer than a fresh
+           headline scrape. */
+        if (/\b(brief me|briefing|what'?s changed|what changed|anything new|catch me up on (the )?feeds?|feed brief|what did i miss)\b/.test(cmd)) {
+            const h = /\bweek\b/.test(cmd) ? 168 : /\bhour\b/.test(cmd) ? 1 : 24;
+            return { intent: 'FEED_BRIEF', hours: h };
+        }
+
         /* SECURITY ADVISORIES. Checked before news and before the AI fallback,
            because this is the exact query that produced an invented CVE
            severity and then a defended correction. A CVE identifier is now
@@ -1610,6 +1633,9 @@ class Jarvis {
                     break;
                 case 'NEWS_QUERY':
                     await this.handleNewsQuery(intent.topic);
+                    break;
+                case 'FEED_BRIEF':
+                    await this.handleFeedBrief(intent.hours);
                     break;
                 case 'SECURITY_ADVISORY':
                     await this.handleSecurityAdvisory();
@@ -4276,6 +4302,83 @@ class Jarvis {
             ? ` Note that the freshest story here is ${Math.round(res.newestAgeMinutes / 60)} hours old, Sir, so this feed may not be current.`
             : '';
         this.speak(`${lead}${spoken}.${caveat}`);
+    }
+
+    /* CONTINUOUS INGESTION.
+       One cycle: fetch every probe-verified feed, drop what has already been
+       seen, record the rest with provenance, and put a short form of each into
+       long-term memory. This is the answer to a measured gap — 227 turns of
+       conversation had produced a 2-chunk corpus — so the point is the corpus,
+       not the announcement. It runs quietly and says nothing unless asked. */
+    async ingestFeeds({ domain = null, announce = false } = {}) {
+        if (!window.electronAPI?.feedFetch) return { ingested: 0, failed: [] };
+        const active = feeds.activeFeeds(domain);
+        const seenRes = await window.electronAPI.feedSeenGet().catch(() => null);
+        const seen = new Set(Array.isArray(seenRes) ? seenRes : []);
+
+        const fresh = [];
+        const failed = [];
+        // Sequential on purpose: a dozen feeds fetched at once looks like a
+        // scraper to the publisher, and none of this is time-critical.
+        for (const feed of active) {
+            const r = await window.electronAPI.feedFetch({ url: feed.url, needsUserAgent: !!feed.needsUserAgent }).catch(() => null);
+            if (!r?.success) { failed.push({ id: feed.id, error: r?.error || 'unreachable' }); continue; }
+            fresh.push(...feeds.dedupe(feeds.parseFeed(r.xml, feed, { limit: 20 }), seen));
+        }
+        if (!fresh.length) {
+            if (announce) this.speak(failed.length
+                ? `I could not reach ${failed.length} of my feeds, Sir, and the rest had nothing new.`
+                : 'Nothing new in the feeds, Sir.');
+            return { ingested: 0, failed };
+        }
+
+        await window.electronAPI.feedRecord({ events: fresh });
+        for (const e of fresh) seen.add(e.id);
+        await window.electronAPI.feedSeenSet({ ids: [...seen] });
+
+        /* Into long-term memory, attributed. Ingested as 'feed' so a later
+           forget() can evict the whole class without touching the user's own
+           notes — news ages differently from what someone tells you. */
+        let stored = 0;
+        for (const e of fresh) {
+            const text = feeds.toMemoryText(e);
+            if (!text) continue;
+            try { await ragService.ingest(text, { source: `feed:${e.feedId}`, url: e.url }); stored++; }
+            catch { /* one bad ingest must not stop the cycle */ }
+        }
+        console.log(`Feeds: ${fresh.length} new events, ${stored} into memory, ${failed.length} feeds unreachable`);
+        if (announce) this.speak(feeds.describeBrief(fresh));
+        return { ingested: fresh.length, stored, failed };
+    }
+
+    /** "brief me" / "what changed today" — from the recorded log, not a fresh guess. */
+    async handleFeedBrief(hours = 24) {
+        if (!window.electronAPI?.feedHistory) { this.speak('Feed history is not available here, Sir.'); return; }
+        this.displayText('Checking the feeds...', null);
+        // Pull anything new first so the brief reflects now, not last cycle.
+        const cycle = await this.ingestFeeds({ announce: false });
+        const r = await window.electronAPI.feedHistory({ sinceMs: hours * 3600 * 1000 }).catch(() => null);
+        if (!r?.success) { this.speak('I could not read the feed history, Sir.'); return; }
+
+        const events = r.events || [];
+        if (!events.length) {
+            this.speak(`Nothing in the last ${hours} hours, Sir.` +
+                (cycle.failed.length ? ` ${cycle.failed.length} feeds were unreachable.` : ''));
+            return;
+        }
+        const grouped = feeds.groupByDomain(events);
+        const lines = [`Feed brief — last ${hours}h, ${events.length} items`];
+        for (const [domain, list] of Object.entries(grouped)) {
+            lines.push('', `${domain.toUpperCase()} (${list.length})`);
+            for (const e of list.sort((a, b) => (b.publishedTs || 0) - (a.publishedTs || 0)).slice(0, 6)) {
+                const when = e.published ? new Date(e.published).toLocaleString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) : 'undated';
+                lines.push(`  ${when}  ${e.source}: ${e.title.slice(0, 88)}`);
+            }
+        }
+        if (cycle.failed.length) lines.push('', `Unreachable: ${cycle.failed.map(f => f.id).join(', ')}`);
+        this.displayText(lines.join('\n'), null);
+        this.speak(feeds.describeBrief(events, { hours }));
+        this._lastFactual = { text: lines.join('\n'), at: Date.now() };
     }
 
     /* Chrome security releases, read from the advisory itself.
