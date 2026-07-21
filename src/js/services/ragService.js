@@ -35,9 +35,16 @@
  *   top1-vs-top2 score margin. Adopted below in `adaptiveWeights.js`: zero
  *   added latency, PRF capped at its 0.5 baseline, and equal confidence
  *   reduces to the fixed baseline exactly, so it cannot regress.
+ * - REPAIR (ACL 2026): a reranker can only reorder what the first stage
+ *   surfaced, so relevant passages outside the pool are unrecoverable. Its
+ *   neighbourhood expansion is adopted in `docGraph.js` — but ONLY into a pool
+ *   the reranker then judges, since the paper measures unguided expansion
+ *   LOWERING ranking quality. Its planning reranker and step rewards are not
+ *   portable to a 4B local model; see docGraph.js for the full accounting.
  */
 
 import { adaptiveFusionWeights } from './adaptiveWeights.js';
+import { buildNeighborGraphAsync, expandCandidates } from './docGraph.js';
 
 const STOPWORDS = new Set(['a', 'an', 'the', 'is', 'are', 'was', 'were', 'be', 'been', 'to', 'of', 'in', 'on', 'at', 'for', 'with', 'and', 'or', 'not', 'it', 'its', 'this', 'that', 'i', 'my', 'me', 'you', 'your', 'we', 'do', 'does', 'did', 'have', 'has', 'had', 'what', 'which', 'who', 'when', 'where', 'how', 'about', 'from', 'by', 'as', 'so']);
 
@@ -62,6 +69,14 @@ const PRF_TERMS = 6;       // expansion terms drawn from that pool
 const RERANK_MARGIN = 0.15;   // relative gap below which top-1 is "not clearly best"
 const RERANK_CANDIDATES = 6;  // passages shown to the reranker
 const RERANK_TIMEOUT_MS = 6000;
+
+/* Neighbourhood expansion (REPAIR, ACL 2026 — see docGraph.js). Only ever
+   applied to a pool the reranker is about to judge, because the paper's own
+   measurements show unguided expansion LOWERS ranking quality. */
+const GRAPH_K = 8;                    // neighbours kept per document
+const GRAPH_MIN_SIM = 0.55;           // cosine floor for an edge to exist at all
+const GRAPH_MAX_DOCS = 2000;          // guard on the O(n^2) build
+const RERANK_EXPANDED_CANDIDATES = 10; // pool size once neighbours are added
 
 function tokenize(text) {
     return String(text).toLowerCase()
@@ -165,6 +180,15 @@ class RagService {
         this._index = new Map();   // term -> { df, postings: Map(chunkIdx -> tf) }
         this._docLen = [];         // chunkIdx -> token count
         this._totalLen = 0;
+
+        /* Neighbourhood graph for bounded-recall expansion. Cached against a
+           revision counter rather than chunk count: forget() FILTERS the chunk
+           array, so surviving documents shift index, and a graph built before
+           that would silently expand to the wrong passages. */
+        this._graph = null;
+        this._graphRev = -1;
+        this._graphBuilding = false;
+        this._rev = 0;
     }
 
     _ollamaUrl() {
@@ -242,6 +266,9 @@ class RagService {
                 batch.forEach((c, j) => { c.vector = vectors[j]; });
                 done += batch.length;
             }
+            // Newly-embedded chunks change the neighbourhood graph: one built
+            // while the embedder was down would have no edges at all.
+            if (done) this._rev++;
             if (done) {
                 console.log(`RAG: backfilled ${done} missing embeddings`);
                 this._scheduleSave();
@@ -332,6 +359,7 @@ class RagService {
             this.chunks.push(...fresh);
             // Index incrementally — no full rebuild on every ingest.
             for (let i = 0; i < fresh.length; i++) this._indexChunk(base + i);
+            this._rev++; // invalidates the neighbourhood graph
         }
 
         // Entity graph: names stored lowercase for matching, display-cased in output
@@ -366,6 +394,7 @@ class RagService {
         const removed = before - this.chunks.length;
         if (removed) {
             this._rebuildIndex(); // postings hold chunk indices — stale after a filter
+            this._rev++;          // ...and so is the neighbourhood graph
             this._scheduleSave();
         }
         return removed;
@@ -464,6 +493,76 @@ class RagService {
         return lines.length ? `Known relations:\n${lines.slice(0, 15).join('\n')}` : '';
     }
 
+    /* ---------- bounded-recall expansion (REPAIR / NAR) ---------- */
+
+    /**
+     * The cached neighbourhood graph, or null when one is not currently usable.
+     *
+     * Building is quadratic in the corpus, so it happens detached and in
+     * time-sliced chunks (measured: 1.6s as one block at 2000 documents, which
+     * would visibly freeze the visualiser). The caller simply goes without
+     * expansion until it is ready — recall must never wait on it.
+     *
+     * Returns null rather than a stale graph whenever the corpus has changed,
+     * because forget() renumbers chunks and stale ids would expand to the
+     * wrong passages.
+     */
+    _neighborGraph() {
+        if (this._graph && this._graphRev === this._rev) return this._graph;
+        if (this._graphBuilding) return null;
+        if (this.chunks.length < 2 || this.chunks.length > GRAPH_MAX_DOCS) return null;
+        if (!this.chunks.some(c => c.vector)) return null; // BM25-only mode
+
+        this._graphBuilding = true;
+        const rev = this._rev;
+        (async () => {
+            try {
+                const graph = await buildNeighborGraphAsync(this.chunks.map(c => c.vector), {
+                    k: GRAPH_K, minSim: GRAPH_MIN_SIM, maxDocs: GRAPH_MAX_DOCS,
+                });
+                // Discard the result if the corpus moved while we were building.
+                if (rev === this._rev) {
+                    this._graph = graph;
+                    this._graphRev = rev;
+                }
+            } catch (e) {
+                console.warn('RAG: neighbour graph build failed (expansion disabled)', e.message);
+            } finally {
+                this._graphBuilding = false;
+            }
+        })();
+        return null;
+    }
+
+    /**
+     * Adds graph neighbours of the retrieved passages to the candidate pool —
+     * REPAIR's bounded-recall fix, reduced to its one deterministic mechanism.
+     *
+     * Expanded passages carry score 0 by construction: they were never in the
+     * fused ranking, so there is no fusion score to report for them. Their
+     * position is decided entirely by the reranker that runs next, which is the
+     * only reason adding them is safe.
+     */
+    _expandPool(top) {
+        const graph = this._neighborGraph();
+        if (!graph) return top;
+        const seeds = top.map(r => r.i).filter(Number.isInteger);
+        if (!seeds.length) return top;
+
+        const extra = expandCandidates(graph, seeds, {
+            limit: RERANK_EXPANDED_CANDIDATES - top.length,
+        });
+        if (!extra.length) return top;
+
+        return [...top, ...extra.map(({ i }) => ({
+            i,
+            text: this.chunks[i].text,
+            source: this.chunks[i].source,
+            score: 0,
+            expanded: true,
+        }))];
+    }
+
     /* ---------- selective LLM reranking ---------- */
 
     /**
@@ -484,8 +583,8 @@ class RagService {
      * the original on any failure — reranking is an enhancement, never a
      * dependency, so a slow or malformed response must not break recall.
      */
-    async _rerank(query, top) {
-        const cands = top.slice(0, RERANK_CANDIDATES);
+    async _rerank(query, top, limit = RERANK_CANDIDATES) {
+        const cands = top.slice(0, limit);
         const listing = cands
             .map((r, i) => `[${i + 1}] ${r.text.slice(0, 300)}`)
             .join('\n');
@@ -530,7 +629,7 @@ class RagService {
             if (!reordered.length) return top;
             cands.forEach((c, i) => { if (!seen.has(i)) reordered.push(c); });
 
-            return [...reordered, ...top.slice(RERANK_CANDIDATES)];
+            return [...reordered, ...top.slice(limit)];
         } catch {
             return top; // timeout, offline model, bad JSON — keep lexical order
         }
@@ -650,6 +749,7 @@ class RagService {
             .sort((a, b) => (b[1] - a[1]) || (Number(a[0]) - Number(b[0])))
             .slice(0, MAX_RESULTS) // small context — retrieval-generation gap
             .map(([i, score]) => ({
+                i: Number(i), // kept for neighbourhood expansion
                 text: this.chunks[i].text,
                 source: this.chunks[i].source,
                 score: +score.toFixed(4),
@@ -663,10 +763,25 @@ class RagService {
            added silence is not acceptable on the spoken path, which is Jarvis's
            primary interface. Callers that can afford the wait (typed queries,
            document Q&A) pass {rerank: true}. */
+        /* When that rerank gate fires, the fused ranking is ambiguous — which is
+           exactly the case where the passage that actually answers the query may
+           be sitting just outside the top-MAX_RESULTS cut. REPAIR's bounded-recall
+           argument applies directly, so this is where (and only where) graph
+           neighbours join the pool: no extra model call, no voice-path cost, and
+           the expansion is immediately judged by the reranker rather than trusted
+           on similarity alone. */
         let reranked = false;
+        let expanded = 0;
         if (opts.rerank === true && this._needsRerank(top)) {
             const before = top[0]?.text;
-            top = await this._rerank(query, top);
+            const pool = this._expandPool(top);
+            const ranked = await this._rerank(query, pool, RERANK_EXPANDED_CANDIDATES);
+            // _rerank returns its input unchanged on every failure path. If it
+            // did, drop the expanded passages: unjudged neighbours have no place
+            // in the context, since nothing has vouched for them but similarity.
+            const failed = ranked === pool;
+            top = failed ? top : ranked.slice(0, MAX_RESULTS);
+            expanded = failed ? 0 : pool.length - MAX_RESULTS;
             reranked = top[0]?.text !== before;
         }
 
@@ -687,7 +802,7 @@ class RagService {
             top.forEach((r, i) => sections.push(`[${i + 1}] (${r.source}) ${r.text}`));
         }
 
-        return { context: sections.join('\n\n'), results: top, reranked };
+        return { context: sections.join('\n\n'), results: top, reranked, expanded };
     }
 
     stats() {
@@ -698,6 +813,7 @@ class RagService {
             terms: this._index.size,
             embedded: this.chunks.filter(c => c.vector).length,
             denseSearch: this.embedAvailable === true,
+            graphEdges: this._graph && this._graphRev === this._rev ? this._graph.adj.size : 0,
         };
     }
 }
