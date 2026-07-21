@@ -89,6 +89,7 @@ const toc = [
   { id: "supervision", label: "Process supervision" },
   { id: "retrieval", label: "Retrieval engine" },
   { id: "memory", label: "Cognitive memory" },
+  { id: "evaluation", label: "Evaluation" },
   { id: "finance", label: "Finance & quant" },
   { id: "onchain", label: "On-chain reads" },
   { id: "whales", label: "Real-time whale stream" },
@@ -337,7 +338,57 @@ You use Chrome —
             </p>
           </Section>
 
-          <Section id="finance" eyebrow="07" title="Deterministic finance & quant">
+          <Section id="evaluation" eyebrow="07" title="Evaluation">
+            <p>
+              Speed was measured here long before accuracy was, which is backwards: a fast
+              ranker that puts the wrong passage first is worse than a slow one that does
+              not. Two harnesses now measure the parts that were previously only asserted,
+              and both drive the shipped modules rather than a reimplementation — a
+              benchmark that rebuilds the ranker measures the rebuild.
+            </p>
+            <Table
+              head={["Retrieval config", "P@1", "P@3", "MRR", "ms"]}
+              rows={[
+                ["lexical only (BM25)", "69.0%", "79.3%", "0.737", "<1"],
+                ["dense only", "89.7%", "100%", "0.948", "60"],
+                ["hybrid, as shipped", "72.4%", "93.1%", "0.825", "61"],
+                ["hybrid + rerank", "72.4%", "93.1%", "0.825", "3,243"],
+              ]}
+            />
+            <p>
+              <strong className="text-foreground">The result contradicts the design.</strong>{" "}
+              Dense-only beats the shipped hybrid by 17 points at rank 1, and beats every
+              fusion weighting tried. Lexical retrieval is in the stack to catch rare proper
+              nouns, which embeddings blur — but dense matched it there, 5 of 5, and beat it
+              on every other question type. Its weight is diluting a better ranking rather
+              than protecting a weakness. Reranking changed no answer at all while costing
+              3.2 seconds per query.
+            </p>
+            <p>
+              The default has not been changed on that basis, and the reasons are part of
+              the result: the benchmark&apos;s author also wrote its questions, 29 questions
+              makes anything under seven points a single labelling choice, and BM25 is the
+              only thing that still retrieves when the embedder is down. The honest status
+              is that the shipped weighting is <em>unsupported by the only measurement that
+              exists</em> — which is more useful to know than the paper it was derived from.
+            </p>
+            <p>
+              Memory is measured the same way: replaying scripted observations across
+              simulated days, 3 of 3 genuine preferences became durable, 0 of 2
+              speech-recognition manglings were admitted, and a changed fact replaced its
+              predecessor rather than sitting beside it — the failure that reads as
+              remembering and answers wrongly.
+            </p>
+            <p>
+              What is deliberately <em>not</em> claimed: the corpus is synthetic, so these
+              numbers compare configurations against each other, not against a real user&apos;s
+              memory. And nothing here measures whether retrieved context improves the{" "}
+              <em>answer</em> rather than the ranking. That needs answer-level labels and a
+              judge, and until it exists the claim is not made.
+            </p>
+          </Section>
+
+          <Section id="finance" eyebrow="08" title="Deterministic finance & quant">
             <p>
               The core rule: <strong className="text-foreground">the language model never
               computes a financial number.</strong> Sharpe ratios, volatility, drawdowns,
@@ -361,7 +412,7 @@ blackScholes(S, K, T, sigma, r)  // price + delta/gamma/vega/theta`}</Code>
             </p>
           </Section>
 
-          <Section id="onchain" eyebrow="08" title="On-chain reads">
+          <Section id="onchain" eyebrow="09" title="On-chain reads">
             <p>
               The same rule applies to blockchain data: converting a wei balance to ETH, or
               a raw token amount to a human figure, is exact BigInt arithmetic — never an
@@ -402,7 +453,7 @@ blackScholes(S, K, T, sigma, r)  // price + delta/gamma/vega/theta`}</Code>
             </p>
           </Section>
 
-          <Section id="whales" eyebrow="09" title="Real-time whale stream">
+          <Section id="whales" eyebrow="10" title="Real-time whale stream">
             <p>
               A websocket subscription to new block headers. Every confirmed block is
               scanned for large movements, and every figure announced is read out of that
@@ -460,7 +511,7 @@ blackScholes(S, K, T, sigma, r)  // price + delta/gamma/vega/theta`}</Code>
             </p>
           </Section>
 
-          <Section id="issuance" eyebrow="10" title="Stablecoin issuance">
+          <Section id="issuance" eyebrow="11" title="Stablecoin issuance">
             <p>
               A mint is a transfer <em>from</em> the zero address; a burn is a transfer{" "}
               <em>to</em> it. That makes supply changes one of the few pieces of market
@@ -480,7 +531,7 @@ blackScholes(S, K, T, sigma, r)  // price + delta/gamma/vega/theta`}</Code>
             </p>
           </Section>
 
-          <Section id="providers" eyebrow="11" title="Provider keys">
+          <Section id="providers" eyebrow="12" title="Provider keys">
             <p>
               Every key is optional. Without any, JARVIS reads public endpoints and says so;
               with them, it sees more and still says exactly what it can and cannot reach.
@@ -517,7 +568,7 @@ blackScholes(S, K, T, sigma, r)  // price + delta/gamma/vega/theta`}</Code>
             </p>
           </Section>
 
-          <Section id="tracer" eyebrow="12" title="Fund-flow tracer">
+          <Section id="tracer" eyebrow="13" title="Fund-flow tracer">
             <p>
               A deterministic fund-tracing engine implements the core of TRacer (KDD &apos;22):
               Approximate Personalized PageRank, forward-biased to follow where money goes.
@@ -538,7 +589,7 @@ detectConsistentChains(...)   // structurally coherent paths`}</Code>
             </p>
           </Section>
 
-          <Section id="companion" eyebrow="13" title="Android companion">
+          <Section id="companion" eyebrow="14" title="Android companion">
             <p>
               The companion pairs over Wi-Fi and mirrors the same voice interface to a
               phone. Discovery is by mDNS; the link is a token-authenticated WebSocket with a
@@ -552,7 +603,7 @@ detectConsistentChains(...)   // structurally coherent paths`}</Code>
             </p>
           </Section>
 
-          <Section id="ports" eyebrow="14" title="Network ports">
+          <Section id="ports" eyebrow="15" title="Network ports">
             <p>
               Every listener binds locally or to the LAN. None is exposed to the internet.
             </p>
@@ -568,7 +619,7 @@ detectConsistentChains(...)   // structurally coherent paths`}</Code>
             />
           </Section>
 
-          <Section id="privacy" eyebrow="15" title="Privacy model">
+          <Section id="privacy" eyebrow="16" title="Privacy model">
             <p>
               Privacy is the architecture, not a setting. Your microphone, screen captures,
               and conversations stay on local disk because there is no provider server to
@@ -591,7 +642,7 @@ detectConsistentChains(...)   // structurally coherent paths`}</Code>
             </p>
           </Section>
 
-          <Section id="install" eyebrow="16" title="Install & run">
+          <Section id="install" eyebrow="17" title="Install & run">
             <p>
               Clone the repository, install dependencies, and pull two local models. The
               whole assistant boots from one command.
