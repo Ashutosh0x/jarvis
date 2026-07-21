@@ -2210,6 +2210,11 @@ class Jarvis {
             return { topic: this._resolveNewsPronoun(clean(m[1])) };
         if ((m = cmd.match(/\bwhat(?:'s| is| has| are)\s+(?:the\s+)?(?:latest|happening|new|going on)\s+(?:on|with|about|in|for)\s+(.+)/i)))
             return { topic: this._resolveNewsPronoun(clean(m[1])) };
+        /* Bare "latest on X" / "any update on X" — no leading "what's". The
+           harness found 50 of these falling through to the model, which then
+           answered a news question from its training data. */
+        if ((m = cmd.match(/^(?:the\s+)?(?:latest|any(?:thing)?\s+new|updates?)\s+(?:on|about|for|with)\s+(.+)/i)))
+            return { topic: this._resolveNewsPronoun(clean(m[1])) };
 
         // Beyond this point it is only a news request if it actually mentions
         // news, or is one of a few fixed "catch me up" phrasings. This gate is
@@ -2491,7 +2496,9 @@ class Jarvis {
         // Gas needs no address, but must be unambiguously about a chain (a named
         // chain, "gwei", or "gas fee") so it never eats "gas prices at the pump".
         if (!addr && !ensName && /\bgas\b/i.test(text) &&
-            (/\b(arbitrum|arb|ethereum|eth|mainnet|base|optimism|\bop\b|polygon|matic|chain|network|l1|l2|gwei)\b/i.test(text) || /\bgas fees?\b/i.test(text))) {
+            // bsc/bnb were missing — "gas on bsc" fell through to the model
+            // despite BSC being one of the four chains the key verifies.
+            (/\b(arbitrum|arb|ethereum|eth|mainnet|base|optimism|\bop\b|polygon|matic|bsc|bnb|binance|chain|network|l1|l2|gwei)\b/i.test(text) || /\bgas fees?\b/i.test(text))) {
             return { kind: 'gas', chain: onchain.resolveChain(text, 'ethereum') };
         }
         if (!addr && !ensName) return null; // other on-chain reads need a subject
@@ -2916,7 +2923,14 @@ class Jarvis {
         if (/\b(running (processes|apps|programs)|process list|list (all )?processes|task manager|what(?:'s| is) running|what apps are open|open (apps|programs|windows))\b/.test(t)) {
             return { intent: 'SYS_PROCESSES' };
         }
-        if (/\b(what(?:'s| is) (happening|going on)|system (activity|status|overview|report)|how('s| is) my (pc|computer|laptop|machine|system))\b/.test(t)) {
+        /* "what's happening" must be about THIS MACHINE to mean a system
+           report. Caught by the 1000-prompt harness: "what's happening with
+           nvidia" returned CPU and RAM statistics — 46 finance questions
+           answered with telemetry. A bare "what's happening with X" is a news
+           query about X, so the machine words are now required. */
+        if (/\b(system (activity|status|overview|report)|how('s| is) my (pc|computer|laptop|machine|system))\b/.test(t)
+            || (/\bwhat(?:'s| is) (happening|going on)\b/.test(t)
+                && (/\b(on|with|in) (my |this )?(pc|computer|laptop|machine|system|here)\b/.test(t) || /^what(?:'s| is) (happening|going on)\??$/.test(t.trim())))) {
             return { intent: 'SYS_OVERVIEW' };
         }
         return null;

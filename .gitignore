@@ -20,3 +20,6 @@ docs.md
 *.zip
 # Brackets are a character class in gitignore patterns, so they are escaped.
 \[EXTERNAL\]*.csv
+
+# Harness run artefacts: regenerate with node eval/agent-harness.mjs
+eval/results/

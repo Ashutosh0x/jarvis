@@ -167,6 +167,41 @@ routes('remind me about vines1vzrYbzLMRdu58ou5XTby4qAqVRLmqo36NKPTg', null);
     check('"latest news" still routes to news', intentOf('latest news') === 'NEWS_QUERY');
 }
 
+/* --- regressions found by the 1000-prompt harness -----------------------------
+   Five misroutes surfaced in 88ms that months of hand-written cases had not.
+   Each is pinned here so it cannot come back. */
+{
+    const ctx = Object.create(Cls.prototype);
+    ctx.settings = { get: () => null };
+    ctx._lastNewsSubject = null;
+    const intentOf = (t) => { try { return ctx.detectIntent(t)?.intent ?? null; } catch (e) { return `THREW ${e.message}`; } };
+
+    // 46 finance questions were answered with CPU and RAM statistics.
+    check('"what\'s happening with nvidia" is news, not a system report',
+        intentOf("what's happening with nvidia") === 'NEWS_QUERY', String(intentOf("what's happening with nvidia")));
+    check('a bare "what\'s happening" is still the system report',
+        intentOf("what's happening") === 'SYS_OVERVIEW', String(intentOf("what's happening")));
+    check('"what\'s happening on my machine" is still the system report',
+        intentOf("what's happening on my machine") === 'SYS_OVERVIEW');
+
+    // 50 fell through to the model, which answered from training data.
+    check('"latest on ethereum" is a news query',
+        intentOf('latest on ethereum') === 'NEWS_QUERY', String(intentOf('latest on ethereum')));
+    check('"any update on tesla" is a news query',
+        intentOf('any update on tesla') === 'NEWS_QUERY', String(intentOf('any update on tesla')));
+
+    // BSC is one of the four chains the key verifies, yet gas fell through.
+    check('"gas on bsc" reaches the chain reader',
+        intentOf('gas on bsc') === 'CHAIN_QUERY', String(intentOf('gas on bsc')));
+    check('"gas on bnb chain" too', intentOf('gas on bnb chain') === 'CHAIN_QUERY');
+
+    // "google" is a verb AND a company; the remainder decides which.
+    check('"google stock price" quotes the company, does not type a search',
+        intentOf('google stock price') === 'PRICE_QUERY', String(intentOf('google stock price')));
+    check('"google quantum computing" is still a search',
+        intentOf('google quantum computing') === 'TYPE_TEXT', String(intentOf('google quantum computing')));
+}
+
 /* --- pronouns in news queries ------------------------------------------------
    "yesterdays news about him" searched for the literal word "him" and returned
    three unrelated stories that happened to contain it. */

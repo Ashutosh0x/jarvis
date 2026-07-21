@@ -103,9 +103,14 @@ export function parseInputCommand(cmd) {
     m = raw.match(/^(?:type|write|input|dictate)\s+(?:out\s+)?(.+)$/i);
     if (m) return { intent: 'TYPE_TEXT', text: normalizeDictation(m[1]) };
 
-    // "search for X" / "google X" — type into whatever is focused, then Enter.
+    /* "search for X" / "google X" — type into whatever is focused, then Enter.
+       "google" is also a COMPANY, and the 1000-prompt harness caught the
+       collision: "google stock price" typed "stock price" into the focused
+       window instead of quoting GOOGL. When the remainder is a financial
+       attribute, the word is the subject of the question, not the verb. */
     m = raw.match(/^(?:search(?:\s+for)?|google|look\s+up)\s+(.+)$/i);
-    if (m && !/\b(my|the)\s+(files?|system|processes|network|memory)\b/i.test(m[1])) {
+    const asksAboutSubject = m && /^(?:stock|share)s?\s+price|^(?:price|earnings|market\s+cap|revenue|dividend|valuation|shares?)\b/i.test(m[1]);
+    if (m && !asksAboutSubject && !/\b(my|the)\s+(files?|system|processes|network|memory)\b/i.test(m[1])) {
         return { intent: 'TYPE_TEXT', text: normalizeDictation(m[1]), thenEnter: true, isSearch: true };
     }
 
