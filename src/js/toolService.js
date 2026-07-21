@@ -82,25 +82,80 @@ export async function describeImageLocal(imageInput, question) {
     return (data.message?.content || '').trim();
 }
 
-export async function generateContentLocal(messages, onChunk) {
+/* Deadlines. Ollama had NO timeout here, and the interaction log for
+   21 Jul 2026 shows what that costs: 11 local turns over 30s, four over 120s,
+   worst 125.3s — against a 6.1s median. The machine was at 97% memory, so the
+   model was being evicted and reloaded (or failing outright) while the user
+   kept talking into a dead assistant.
+
+   Bounding total generation time would truncate legitimately long answers, so
+   the two deadlines that matter are bounded instead: time to the FIRST token
+   (nothing is happening yet) and the gap BETWEEN tokens (it stalled). Once
+   tokens flow, streaming TTS is already speaking and the wall-clock is hidden. */
+export const FIRST_TOKEN_TIMEOUT_MS = 25000;
+export const STALL_TIMEOUT_MS = 15000;
+
+/** Error marker so callers can distinguish a timeout from a real Ollama fault. */
+export class LocalTimeoutError extends Error {
+    constructor(phase, ms) {
+        super(phase === 'first-token'
+            ? `local model produced nothing in ${Math.round(ms / 1000)}s`
+            : `local model stalled for ${Math.round(ms / 1000)}s mid-answer`);
+        this.name = 'LocalTimeoutError';
+        this.phase = phase;
+    }
+}
+
+export async function generateContentLocal(messages, onChunk, opts = {}) {
     const { url, model } = getLocalConfig();
     // Time to FIRST token is the number that matters for perceived speed: the
     // streaming TTS path starts speaking on the first completed sentence, so
     // total generation time is largely hidden behind Jarvis already talking.
     const _t0 = Date.now();
     let _firstTokenAt = null;
-    const response = await fetch(`${url}/api/chat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-            model,
-            messages,
-            stream: true,
-            keep_alive: '60m', // keep Gemma in RAM — no cold-load pause mid-conversation
-        }),
-    });
+
+    // One controller for both the caller's cancellation (a new turn superseding
+    // this one) and our own deadlines.
+    const ctrl = new AbortController();
+    let timedOut = null;
+    let timer = null;
+    const arm = (phase, ms) => {
+        clearTimeout(timer);
+        timer = setTimeout(() => { timedOut = new LocalTimeoutError(phase, ms); ctrl.abort(); }, ms);
+    };
+    const onExternalAbort = () => ctrl.abort();
+    if (opts.signal) {
+        if (opts.signal.aborted) throw new DOMException('superseded', 'AbortError');
+        opts.signal.addEventListener('abort', onExternalAbort, { once: true });
+    }
+    const cleanup = () => {
+        clearTimeout(timer);
+        opts.signal?.removeEventListener('abort', onExternalAbort);
+    };
+
+    arm('first-token', FIRST_TOKEN_TIMEOUT_MS);
+
+    let response;
+    try {
+        response = await fetch(`${url}/api/chat`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                model,
+                messages,
+                stream: true,
+                keep_alive: '60m', // keep Gemma in RAM — no cold-load pause mid-conversation
+            }),
+            signal: ctrl.signal,
+        });
+    } catch (e) {
+        cleanup();
+        if (timedOut) throw timedOut;
+        throw e;
+    }
 
     if (!response.ok) {
+        cleanup();
         throw new Error(`Ollama error ${response.status}: is '${model}' pulled? Try: ollama pull ${model}`);
     }
 
@@ -109,34 +164,49 @@ export async function generateContentLocal(messages, onChunk) {
     let fullText = '';
     let buffer = '';
 
-    while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
+    try {
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
 
-        // Ollama streams NDJSON — one JSON object per line. A network chunk
-        // can split a line, so only parse complete lines and keep the tail.
-        const lines = buffer.split('\n');
-        buffer = lines.pop();
-        for (const line of lines) {
-            if (!line.trim()) continue;
-            try {
-                const data = JSON.parse(line);
-                const piece = data.message?.content;
-                if (piece) {
-                    if (_firstTokenAt === null) {
-                        _firstTokenAt = Date.now();
-                        perf.stage('llm.firstToken', _firstTokenAt - _t0);
+            // Ollama streams NDJSON — one JSON object per line. A network chunk
+            // can split a line, so only parse complete lines and keep the tail.
+            const lines = buffer.split('\n');
+            buffer = lines.pop();
+            for (const line of lines) {
+                if (!line.trim()) continue;
+                try {
+                    const data = JSON.parse(line);
+                    const piece = data.message?.content;
+                    if (piece) {
+                        if (_firstTokenAt === null) {
+                            _firstTokenAt = Date.now();
+                            perf.stage('llm.firstToken', _firstTokenAt - _t0);
+                        }
+                        // Progress: restart the clock on the stall deadline.
+                        arm('stall', STALL_TIMEOUT_MS);
+                        fullText += piece;
+                        if (onChunk) onChunk(piece);
                     }
-                    fullText += piece;
-                    if (onChunk) onChunk(piece);
+                } catch (e) {
+                    console.warn('Ollama stream: skipping malformed line', line.slice(0, 80));
                 }
-            } catch (e) {
-                console.warn('Ollama stream: skipping malformed line', line.slice(0, 80));
             }
         }
+    } catch (e) {
+        // A timeout mid-answer keeps whatever was already spoken: partial truth
+        // beats discarding a good half-answer and apologising.
+        if (timedOut && fullText.trim()) {
+            cleanup();
+            perf.stage('llm.total', Date.now() - _t0);
+            return fullText;
+        }
+        cleanup();
+        throw timedOut || e;
     }
 
+    cleanup();
     perf.stage('llm.total', Date.now() - _t0);
     return fullText;
 }
