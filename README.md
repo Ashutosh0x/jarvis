@@ -31,10 +31,15 @@
   <img src="https://img.shields.io/badge/license-ISC-blue?style=flat-square" alt="License" />
 </p>
 
-JARVIS is a desktop assistant that runs entirely on your own machine. Speech
-recognition, language understanding, retrieval, and vision all execute locally.
-No API keys, no network calls to a model provider, and no conversation data
-leaving the device.
+JARVIS is a desktop assistant whose intelligence runs entirely on your own
+machine. Speech recognition, language understanding, retrieval, and vision all
+execute locally. No model API keys, no network calls to a model provider, and no
+conversation data leaving the device.
+
+Some features ask the outside world for facts it alone has — a share price, a
+headline, the state of a blockchain. Those calls send a ticker or an address and
+nothing else: no transcript, no memory, no conversation. Everything else works
+with the network unplugged.
 
 It presents as a frameless, transparent 3D visualizer that floats above your
 desktop, listens continuously, and answers by voice. A companion Android app
@@ -47,6 +52,7 @@ extends the same interface and control surface to a paired phone over Wi-Fi.
 - [What makes this different](#what-makes-this-different)
 - [Architecture](#architecture)
 - [Feature reference](#feature-reference)
+- [On-chain intelligence](#on-chain-intelligence)
 - [Retrieval engine](#retrieval-engine)
 - [Android companion](#android-companion)
 - [Installation](#installation)
@@ -70,11 +76,13 @@ Most assistants send your microphone to a datacenter. This one does not.
 | Embeddings | Hosted API | nomic-embed-text, local |
 | Vision / screen reading | Cloud vision | Gemma 3 multimodal, local |
 | Conversation storage | Provider servers | Local disk only |
-| Works without internet | No | Yes, except web search |
+| Works without internet | No | Yes, except live data lookups |
 | Per-query cost | Metered | Zero |
 
-The only outbound traffic is keyless DuckDuckGo HTML search, and that fires
-only when a query is search-shaped.
+Outbound traffic is limited to fact lookups that cannot be answered locally:
+keyless web search when a query is search-shaped, quote and news endpoints, and
+blockchain RPC. Each sends only the subject of the question — a ticker, a
+search string, an address. Inference never leaves the machine.
 
 ---
 
@@ -337,10 +345,137 @@ is required. Leading "Jarvis" and common mis-hearings are stripped.
 ### Knowledge
 
 - Hybrid retrieval over local memory, detailed below
-- Keyless web search through the DuckDuckGo HTML endpoint, injected as cited
-  context for search-shaped queries
+- Keyless web search with a three-provider failover chain — DuckDuckGo HTML,
+  DuckDuckGo Instant Answer, then Wikipedia — injected as cited context for
+  search-shaped queries. The chain exists because the HTML endpoint starts
+  serving a captcha once an IP is flagged, which silently emptied every result
 - Finance watchlist with crossing alerts. Read-only by design: no order
   placement code exists anywhere in the project
+
+### Markets and quantitative analysis
+
+Every number here is computed by tested code from measured data. The language
+model is never asked to calculate a financial figure, because it cannot be
+trusted with one and a wrong figure stated confidently is worse than no answer.
+
+- Live quotes with day change, resolved name to ticker
+- Deterministic risk analytics in `src/js/services/quant.js`: annualised return,
+  volatility, Sharpe, Sortino, maximum drawdown, beta and alpha against a
+  benchmark, correlation, and Black-Scholes pricing with greeks
+- Headlines from Google News with Bing failover, keyless
+
+---
+
+## On-chain intelligence
+
+Read-only by construction. Only a hard allowlist of JSON-RPC read methods is
+ever sent; there is no signing code, no transaction construction, and no private
+key handling anywhere in the project.
+
+The governing rule is the same one the quant engine follows: **the chain is the
+source of truth, and anything the chain cannot prove is not claimed.** An
+address with no ENS name stays an address. No exchange or entity is ever named
+from a guess.
+
+### Address and contract reads
+
+- Native and ERC-20 balances, gas, nonce, across Ethereum, Arbitrum, Base,
+  Optimism, Polygon and BNB Chain
+- ENS forward and reverse resolution, implemented from a pure keccak-256 in
+  `src/js/services/keccak.js` and verified against public vectors
+- Transaction decode: status, native value, and every ERC-20/721 Transfer in the
+  receipt, resolved to symbols and exact decimal amounts
+- Contract classification through ERC-165 `supportsInterface` and an ERC-20
+  probe. Classification only; this is not a vulnerability auditor
+- Cross-chain portfolio. With an Alchemy key this returns everything a wallet
+  holds, priced; without one it falls back to scanning known tokens per chain
+- Solana wallet assets and recent activity through Helius, including native SOL
+  balance and USDC/USDT supply
+
+### Real-time whale stream
+
+A websocket subscription to new block headers. Each confirmed block is scanned
+for large movements, and everything announced is a fact read out of that block.
+
+```mermaid
+flowchart LR
+    WS(["newHeads over wss"]) --> BLK["eth_getBlockByNumber"]
+    WS --> LOGS["eth_getLogs<br/>Transfer topic, verified tokens"]
+    BLK --> NAT["scanBlockTxs<br/>native transfers >= 100 ETH"]
+    LOGS --> TOK["scanTokenLogs<br/>token transfers >= $1M"]
+    LOGS --> ISS["scanIssuanceLogs<br/>mints and burns"]
+    TOK --> AGG["aggregateTokenWhales<br/>one transaction = one movement"]
+    NAT --> RANK["prioritizeAlerts<br/>ranked by measured USD"]
+    AGG --> RANK
+    RANK --> SAY["Announce top 2, summarise the rest"]
+    ISS --> SAY
+```
+
+- **Token flows, not just native.** Most large value on Ethereum moves as
+  stablecoins. Sampled over five live blocks: 0-2 native ETH whales versus 16
+  token movements
+- **Token decimals are verified on chain** with a `decimals()` call before any
+  amount is decoded. Reading a 6-decimal token as 18 turns $4M into $4
+- **One transaction is one movement.** An arbitrage route through several pools
+  emits the same tokens repeatedly; a live drill caught the same 14,050 WETH
+  being announced three times. Transfers are now grouped per transaction, the
+  source is the address that only sends, the destination the one that only
+  receives, and the hop count and any round trip are stated
+- **Ranked across assets by measured USD.** 100 ETH has more raw units than
+  4,000,000 USDC, so unit ordering picks the wrong headline
+- **Stablecoin issuance.** A mint is a Transfer from the zero address and a burn
+  is one to it, so supply changes need no label database. Live-verified against
+  mainnet: a 5,414,317 USDC mint, and in one hour DAI net +6.9M against USDC net
+  -6.0M
+- **Address context on both ends**: ENS name, contract or wallet via
+  `eth_getCode`, transactions sent, ETH held. The display carries full addresses
+  and the transaction hash; speech carries the readable form
+- **Operational hardening**: exponential backoff with jitter, 30s heartbeat and
+  90s silence detection, gap detection with in-order backfill through the same
+  code path as live blocks, and bounded dedup so memory stays flat
+
+### What is deliberately not built
+
+| Asked for | Why not |
+| --- | --- |
+| Exchange labels ("from Binance") | Not on-chain data. It requires a proprietary attribution database; naming a wallet on a guess is the one thing that would make these alerts untrustworthy. Arkham is supported *with your own key*, and its labels are spoken attributed |
+| Wallet classification by the model | A 4B model producing "institutional accumulator" is a confabulated verdict, not analysis |
+| Mempool alerts | Pending transactions get dropped and replaced. An alert about a transaction that never lands is misinformation |
+| Global Solana whale scanning | Measured: the Helius socket delivers over 200 token-program events in 15 seconds. Filtering that firehose is not something this machine does while also running voice |
+| Bitcoin monitoring | A different data source entirely, and none is connected |
+
+### Provider keys
+
+All optional. JARVIS runs keyless and degrades honestly, saying which chains it
+can read and why one is missing.
+
+| Key | Unlocks | Without it |
+| --- | --- | --- |
+| `ALCHEMY_API_KEY` | Full wallet holdings with prices, faster RPC, keyed websocket | Public endpoints, known-token scanning only |
+| `HELIUS_API_KEY` | Solana wallets, activity, stablecoin supply | No Solana |
+| `DUNE_API_KEY` | Aggregate analytics: top holders, USD-priced flows | Those queries state the key is needed |
+| `ARKHAM_API_KEY` | Entity labels, spoken with attribution | Addresses stay addresses |
+
+Networks are **discovered, not assumed**: each candidate endpoint must return
+the chain ID it claims before it is used. On the free Alchemy tier this
+correctly rejects Optimism and Polygon, which answer 403, rather than failing
+later with a confusing error.
+
+Measured provider limits that shape the design: Alchemy's free tier caps
+`eth_getLogs` at 10 blocks, 1rpc at 50, and drpc handles a few hundred but
+refuses under load. Wide-range log queries are therefore chunked at 50 blocks
+across the keyless pool, and any chunk that fails is reported rather than
+silently dropped — "nothing happened this hour" and "I could only read half the
+hour" are different answers.
+
+### Fund tracing
+
+`src/js/services/tracer.js` implements the deterministic Approximate
+Personalized PageRank from the TRacer paper, with its tracing-tendency and
+weighted-pollution strategies, plus structural pattern detection (amount
+consistency, cycles, consistent chains). It reports pattern presence, never a
+verdict. The algorithm is tested and works; live tracing needs address history,
+which public RPC cannot enumerate, so it awaits an Etherscan-family key.
 
 ---
 
@@ -704,13 +839,40 @@ available as environment variables:
 | `JARVIS_LOCAL_MODEL` | `gemma3:4b` |
 | `JARVIS_OCR_URL` | `http://127.0.0.1:10000` |
 | `JARVIS_ADB_PATH` | auto-detected |
+| `JARVIS_ETH_WS` | keyed endpoint if available, else `wss://ethereum-rpc.publicnode.com` |
+
+### Provider keys and `.env`
+
+Copy `.env.example` to `.env` and fill in whatever you have. Every key is
+optional; see [Provider keys](#provider-keys) for what each unlocks. The file is
+git-ignored, values are never logged (only the key *names* appear at startup),
+and a real environment variable always wins over the file.
+
+```bash
+cp .env.example .env
+```
+
+```
+ALCHEMY_API_KEY=      # EVM RPC, portfolio, prices
+HELIUS_API_KEY=       # Solana RPC, assets, activity
+# DUNE_API_KEY=       # aggregate analytics
+# ARKHAM_API_KEY=     # entity labels, spoken with attribution
+```
+
+At startup the log states exactly what was found and what it can reach:
+
+```
+[env] loaded keys: ALCHEMY_API_KEY, HELIUS_API_KEY
+[chain] Alchemy verified in 394ms: arbitrum, ethereum, base, bsc | unavailable: optimism, polygon
+```
 
 ### Credentials
 
 Secrets are held in an Electron `safeStorage` vault backed by Windows DPAPI. The
 renderer can set, list, and delete entries but can never read raw values. The
 typed command `store key <name> <value>` bypasses the model and conversation
-memory entirely.
+memory entirely. Provider keys can live here instead of `.env`, and the
+environment is checked first.
 
 ---
 
@@ -737,6 +899,15 @@ preload.js               Context-isolated IPC surface
 companionBridge.js       Companion WebSocket server and mDNS advertisement
 adbService.js            Tier 3 wireless ADB control
 
+                         Root CommonJS modules. Main cannot import the
+                         renderer's ES modules, so pure logic it needs lives
+                         here and is unit-tested from src/js/services/__tests__.
+chainProviders.js        Keyed provider layer, chain-ID probe and discovery
+chainWatch.js            Whale, token flow, issuance and aggregation logic
+rpcHedge.js              Hedged endpoint racing with sticky last-good ordering
+streamGuard.js           Backoff, dedup, block-gap tracking, alert priority
+metricStore.js           Telemetry persistence, rollups, threshold events
+
 src/
   index.html             HUD markup, GLSL shaders, styles
   config.js              Local credentials, gitignored
@@ -755,6 +926,15 @@ src/
       voiceService.js    VAD, mic selection, STT transport
       ragService.js      Hybrid retrieval engine
       phoneTools.js      Natural language to structured phone intents
+      quant.js           Deterministic financial mathematics
+      onchain.js         BigInt units, calldata encoding, chain and token maps
+      chainIntel.js      Provider payload parsing, portfolio and Solana output
+      ens.js, keccak.js  ENS resolution over a pure keccak-256
+      tracer.js          Fund tracing, personalized PageRank, patterns
+      ondoRegistry.js    Tokenized-security catalogue and query parsing
+      groundingGuard.js  Blocks invented identifiers before they are spoken
+      factStore.js       Belief memory with confidence and revision
+      __tests__/         934 checks across 24 suites, run with plain node
     capture-processor.js AudioWorklet, capture
     playback-processor.js AudioWorklet, playback
 
@@ -864,8 +1044,22 @@ These are deliberate or platform-imposed, not defects.
   on an untrusted network.
 - **The orb is cropped in portrait.** The desktop camera sits at `z=14`, which
   assumes a landscape aspect ratio.
-- **No order placement.** The finance module is read-only by construction. No
-  code path anywhere in the project can place a trade.
+- **No order placement, no signing.** The finance and on-chain modules are
+  read-only by construction. No code path anywhere in the project can place a
+  trade, sign a transaction, or handle a private key.
+- **No entity attribution.** JARVIS will not tell you a wallet belongs to
+  Binance or Coinbase, because that fact is not on-chain. It comes from a
+  proprietary database, and guessing it is how alerts become untrustworthy. With
+  your own Arkham key, labels are used and spoken with attribution.
+- **The whale stream is Ethereum only.** Arbitrum's sub-second blocks and
+  Solana's event rate — over 200 token-program events in 15 seconds, measured —
+  are firehoses this machine cannot filter while also running voice.
+- **Address history needs an indexer.** Public RPC cannot enumerate the
+  transactions of an address, so the fund tracer is tested against synthetic
+  graphs and awaits an Etherscan-family key for live use.
+- **Historical log windows are chunked and may be partial.** Free RPC endpoints
+  cap `eth_getLogs` ranges between 10 and 50 blocks and rate-limit under load.
+  Coverage is reported rather than assumed.
 
 ---
 
