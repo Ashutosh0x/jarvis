@@ -28,7 +28,16 @@
  * - NGM-RAG (arXiv:2607.11159): combining Levenshtein name matching with BM25
  *   beat either alone, and cutting context to sentence level took token cost
  *   from ~11k to ~0.8k per query WITHOUT losing answer quality.
+ * - QuDAR (ACL 2026): optimal fusion weights are not universal — they shift
+ *   per query, across BOTH the retriever-type axis (sparse/dense) and the
+ *   query-format axis (original/expanded — here, the PRF list). Its
+ *   training-free, LLM-free "confidence" variant weights each list by its
+ *   top1-vs-top2 score margin. Adopted below in `adaptiveWeights.js`: zero
+ *   added latency, PRF capped at its 0.5 baseline, and equal confidence
+ *   reduces to the fixed baseline exactly, so it cannot regress.
  */
+
+import { adaptiveFusionWeights } from './adaptiveWeights.js';
 
 const STOPWORDS = new Set(['a', 'an', 'the', 'is', 'are', 'was', 'were', 'be', 'been', 'to', 'of', 'in', 'on', 'at', 'for', 'with', 'and', 'or', 'not', 'it', 'its', 'this', 'that', 'i', 'my', 'me', 'you', 'your', 'we', 'do', 'does', 'did', 'have', 'has', 'had', 'what', 'which', 'who', 'when', 'where', 'how', 'about', 'from', 'by', 'as', 'so']);
 
@@ -615,16 +624,26 @@ class RagService {
         /* Reciprocal Rank Fusion. Hybrid beat dense-only and sparse-only for
            EVERY embedding model in PubHealthBench, and it is what lets a small
            local stack behave like a much larger one. PRF is down-weighted: it is
-           derived evidence, not the user's actual question. */
+           derived evidence, not the user's actual question.
+
+           QuDAR-confidence (ACL 2026): rather than fixed weights, each list is
+           weighted by how decisively it ranks its top candidate (top1-top2
+           margin), covering BOTH of the paper's axes: retriever-type
+           (sparse/dense) and query-format (the PRF list is the expanded-query
+           signal). Total budget stays 2.5 and PRF is capped at its 0.5 baseline
+           (dilute-but-never-corrupt); equal confidence yields exactly
+           {1, 1, 0.5} — the proven baseline. Pure arithmetic on scores already
+           computed: no added latency. */
+        const { sparse: wSparse, dense: wDense, prf: wPrf } = adaptiveFusionWeights(sparseRanks, denseRanks, prfRanks);
         const rrf = {};
         const fuse = (list, weight = 1) => {
             list.forEach((s, rank) => {
                 rrf[s.i] = (rrf[s.i] || 0) + weight / (RRF_K + rank + 1);
             });
         };
-        fuse(sparseRanks, 1);
-        fuse(denseRanks, 1);
-        fuse(prfRanks, 0.5);
+        fuse(sparseRanks, wSparse);
+        fuse(denseRanks, wDense);
+        fuse(prfRanks, wPrf);
 
         let top = Object.entries(rrf)
             // Same determinism requirement as _bm25: tie-break on chunk index.
