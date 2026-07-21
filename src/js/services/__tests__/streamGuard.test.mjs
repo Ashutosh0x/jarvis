@@ -86,6 +86,27 @@ const check = (n, c) => { c ? pass++ : fail++; console.log(`${c ? 'PASS' : 'FAIL
     const a = { valueWei: (1000n * 10n ** 18n + 1n).toString(), amount: 'bigger' };
     const b = { valueWei: (1000n * 10n ** 18n).toString(), amount: 'smaller' };
     check('prioritize: wei-exact ordering', prioritizeAlerts([b, a], { maxSpoken: 1 }).speak[0].amount === 'bigger');
+
+    /* Cross-asset ranking. 4,000,000 USDC (6dp) is a far bigger movement than
+       100 ETH, but its raw unit count is smaller — ranking on units alone would
+       announce the wrong one as the headline of the block. */
+    const ethWhale = { valueWei: (100n * 10n ** 18n).toString(), amount: '100', asset: 'ETH', usd: 194169, hash: '0xa' };
+    const usdcWhale = { raw: (4_000_000n * 10n ** 6n).toString(), amount: '4,000,000', asset: 'USDC', usd: 4000000, hash: '0xb' };
+    check('prioritize: ranks across assets by measured USD, not raw units',
+        prioritizeAlerts([ethWhale, usdcWhale], { maxSpoken: 1 }).speak[0].asset === 'USDC');
+    check('prioritize: unit ordering alone would have been wrong here',
+        BigInt(ethWhale.valueWei) > BigInt(usdcWhale.raw));
+
+    const unpriced = { raw: '999', amount: '999', asset: 'MYSTERY', usd: null, hash: '0xc' };
+    check('prioritize: a priced alert outranks an unpriced one of unknown size',
+        prioritizeAlerts([unpriced, ethWhale], { maxSpoken: 1 }).speak[0].asset === 'ETH');
+
+    check('prioritize: equal values order deterministically by hash', (() => {
+        const x = { usd: 5, hash: '0xb', amount: 'x' }, y = { usd: 5, hash: '0xa', amount: 'y' };
+        const one = prioritizeAlerts([x, y], { maxSpoken: 2 }).speak.map(r => r.amount).join();
+        const two = prioritizeAlerts([y, x], { maxSpoken: 2 }).speak.map(r => r.amount).join();
+        return one === two && one === 'y,x';
+    })());
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

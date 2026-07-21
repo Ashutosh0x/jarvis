@@ -11,7 +11,14 @@ import reflectionService from './services/reflectionService.js';
 import * as quant from './services/quant.js';
 import * as onchain from './services/onchain.js';
 import * as ens from './services/ens.js';
+import * as chainIntel from './services/chainIntel.js';
+import { parseOndoQuery, ONDO_COUNT, HOT_LIST as ONDO_HOT_LIST } from './services/ondoRegistry.js';
+import * as netInspect from './services/netInspect.js';
+import * as netDiscovery from './services/netDiscovery.js';
+import * as sysInspect from './services/sysInspect.js';
+import * as inputControl from './services/inputControl.js';
 import { LocalVoiceService } from './services/voiceService.js';
+import { guardOutput } from './services/groundingGuard.js';
 import { config } from '../config.js';
 import perf from './services/perf.js';
 
@@ -618,7 +625,12 @@ class Jarvis {
                 // Extract command after wake word
                 const command = transcript.replace(/hey jarvis|jarvis/gi, '').trim();
                 if (command && !this.isProcessing) {
-                    setTimeout(() => this.processCommand(command), 500);
+                    // Re-check inside the timer, not only before arming it: a
+                    // turn can start during these 500ms, and dispatching on the
+                    // stale check is what let turns overlap in the logs.
+                    setTimeout(() => {
+                        if (!this.isProcessing) this.processCommand(command);
+                    }, 500);
                 }
                 return;
             }
@@ -1082,6 +1094,25 @@ class Jarvis {
             cmd === 'disconnect' || cmd === 'disconnect wifi' || cmd === 'disconnect the wifi') {
             return { intent: 'WIFI_DISCONNECT' };
         }
+        // Keyboard/window control ("type ...", "press enter", "close notepad").
+        // Checked before the system/network matchers so "close chrome" acts on
+        // the window rather than being read as a process question.
+        const inputQ = inputControl.parseInputCommand(command);
+        if (inputQ) return inputQ;
+
+        // Process/system-activity questions. Checked before the socket matcher
+        // so "what's using my CPU" is not read as a network question.
+        const sysQ = this.parseSystemQuery(cmd);
+        if (sysQ) return sysQ;
+
+        // Live socket-level questions ("what IP are you connected to", "who is
+        // my computer talking to", "which ports are open"). Checked BEFORE the
+        // Wi-Fi matcher: the log shows "why don't you have network details...
+        // every IP address and packet flow" being answered with the Wi-Fi link
+        // report, which describes the radio, not the connections.
+        const netQ = this.parseNetworkQuery(cmd);
+        if (netQ) return netQ;
+
         // Network / device intelligence — real measured data about the current
         // connection (the "device" you connect to over Wi-Fi is the hotspot/router)
         if (/\b(which (wi-?fi|network)|what (wi-?fi|network))\b.*\b(am i|connected)\b/.test(cmd) ||
@@ -1128,8 +1159,12 @@ class Jarvis {
         if (cmd.startsWith('store key ') || cmd.startsWith('set key ')) return { intent: 'SET_KEY', raw: command };
         if (cmd === 'list keys' || cmd === 'list my keys') return { intent: 'LIST_KEYS' };
 
-        // Finance watchlist
-        if (cmd.includes('watchlist') || cmd.startsWith('watch ')) {
+        // Finance watchlist. Whale-stream and address-watch commands must fall
+        // through to the chain parser — a real log shows "watch for whales"
+        // becoming WATCHLIST_ADD "FOR" because this block ran first.
+        if ((cmd.includes('watchlist') || cmd.startsWith('watch ')) &&
+            !/\b(whales?|large transfers?|big moves?)\b/.test(cmd) &&
+            !/0x[0-9a-fA-F]{40}/.test(cmd) && !/\b[a-z0-9-]+\.eth\b/.test(cmd)) {
             if (cmd.includes('remove') || cmd.includes('delete')) {
                 const rm = cmd.match(/(?:remove|delete)\s+([a-z0-9.\-]{1,15})/);
                 if (rm) return { intent: 'WATCHLIST_REMOVE', symbol: rm[1] };
@@ -1253,6 +1288,26 @@ class Jarvis {
 
     // Process Command
     async processCommand(command) {
+        /* TURN SERIALISATION.
+           Callers check `isProcessing` before dispatching, but the wake-word
+           path checks it and THEN defers by 500ms (see onresult), so the check
+           is stale by the time the turn actually starts. With a slow local
+           model that window is wide open, and the 21 Jul 2026 log caught it:
+           four turns at 15:03:25-15:03:50 completed inside 25 seconds while
+           each reported 33-51s of latency, and their answers were shifted onto
+           each other's inputs ("time" answered about stocks, "search latest
+           stocks data" answered about the time).
+
+           The new turn wins — a user who speaks again is correcting course, not
+           queueing — so the in-flight one is aborted rather than blocked. */
+        this._turnSeq = (this._turnSeq || 0) + 1;
+        const turnId = this._turnSeq;
+        if (this._turnAbort) {
+            try { this._turnAbort.abort(); } catch { /* already settled */ }
+        }
+        const turnAbort = new AbortController();
+        this._turnAbort = turnAbort;
+
         this.isProcessing = true;
 
         if (this.recognition) {
@@ -1272,11 +1327,31 @@ class Jarvis {
         perf.stage('intent', Date.now() - _intentT0);
         console.log('Intent:', intent);
 
-        // Interaction-log bookkeeping: reset this turn's response buffer (filled
-        // by _rememberSpoken) and start the latency clock.
+        // Interaction-log bookkeeping: this turn's response buffer (filled by
+        // _rememberSpoken) and the latency clock.
+        //
+        // The buffer is an object owned by THIS invocation, not a shared field.
+        // It used to be `this._turnResponse`, so a superseded turn's late speech
+        // accumulated into whatever turn was current when it finally arrived and
+        // got logged under that turn's input. Holding the reference locally
+        // means a turn can only ever log its own words.
         const _turnStartedAt = Date.now();
-        this._turnResponse = '';
+        const _buf = { text: '' };
+        this._activeBuffer = _buf;
         let _turnOk = true;
+
+        // A pending "shall I…?" owns the next turn: "yes"/"do it" must complete
+        // the offered action rather than being re-parsed as a fresh command.
+        if (this._pendingConfirm) {
+            try {
+                if (await this._consumeConfirmation(command)) {
+                    this._logInteraction(command, { intent: 'CONFIRMATION' }, _turnStartedAt, true, _buf);
+                    this.isProcessing = false;
+                    if (this.commandInput) this.commandInput.disabled = false;
+                    return;
+                }
+            } catch (e) { console.error('Confirmation error:', e); this._pendingConfirm = null; }
+        }
 
         try {
             switch (intent.intent) {
@@ -1367,6 +1442,69 @@ class Jarvis {
                     break;
                 case 'WIFI_INFO':
                     await this.handleWifiInfo();
+                    break;
+                case 'NET_CONNECTIONS':
+                    await this.handleNetConnections();
+                    break;
+                case 'NET_PROCESS':
+                    await this.handleNetProcess(intent.name);
+                    break;
+                case 'NET_LISTENING':
+                    await this.handleNetListening();
+                    break;
+                case 'NET_TRAFFIC':
+                    await this.handleNetTraffic();
+                    break;
+                case 'NET_CAPTURE_INFO':
+                    await this.handleNetCaptureInfo();
+                    break;
+                case 'SYS_TOP':
+                    await this.handleSysTop(intent.resource);
+                    break;
+                case 'SYS_PROCESSES':
+                    await this.handleSysProcesses();
+                    break;
+                case 'SYS_PROCESS':
+                    await this.handleSysProcess(intent.name);
+                    break;
+                case 'SYS_OVERVIEW':
+                    await this.handleSysOverview();
+                    break;
+                case 'DICTATE_START':
+                    await this.handleDictateStart();
+                    break;
+                case 'TYPE_TEXT':
+                    await this.handleTypeText(intent);
+                    break;
+                case 'PRESS_KEY':
+                    await this.handlePressKey(intent);
+                    break;
+                case 'FOCUS_WINDOW':
+                    await this.handleFocusWindow(intent.name);
+                    break;
+                case 'CLOSE_APP':
+                    await this.handleCloseApp(intent.name);
+                    break;
+                case 'FOCUSED_WINDOW':
+                    await this.handleFocusedWindow();
+                    break;
+                case 'SYS_HISTORY':
+                    await this.handleSysHistory(intent.hours);
+                    break;
+                case 'SYS_EVENTS':
+                    await this.handleSysEvents(intent.hours);
+                    break;
+                case 'RESOLVE_HOST':
+                    await this.handleResolveHost(intent.target);
+                    break;
+                case 'WIFI_NETWORK_DETAIL':
+                    await this.handleWifiNetworkDetail(intent.ssid);
+                    break;
+                case 'LAN_DEVICES':
+                    await this.handleLanDevices();
+                    break;
+                case 'BT_DEVICES':
+                    await this.handleBluetoothDevices();
                     break;
                 case 'REMEMBER': {
                     const r = await ragService.ingest(intent.text, { source: 'voice-note' });
@@ -1522,28 +1660,69 @@ class Jarvis {
                     await this.handleAICommand(command);
             }
         } catch (error) {
-            console.error('Command processing error:', error);
-            _turnOk = false;
-            this.speak('I apologize, but I encountered an error processing that command.');
-        } finally {
-            // Persist the turn for later analysis before releasing the loop.
-            this._logInteraction(command, intent, _turnStartedAt, _turnOk);
-            this.isProcessing = false;
-            this.wakeWordDetected = false;
-            if (this.commandInput) {
-                this.commandInput.disabled = false;
+            // A superseded turn was cancelled on purpose — the user spoke again.
+            // It is not a failure and must not apologise over the new answer.
+            if (error?.name === 'AbortError' || turnAbort.signal.aborted) {
+                console.log(`Turn ${turnId} superseded by a newer command.`);
+            } else {
+                console.error('Command processing error:', error);
+                _turnOk = false;
+                this.speak('I apologize, but I encountered an error processing that command.');
             }
-            this.startAlwaysOnListening();
+        } finally {
+            const superseded = turnId !== this._turnSeq;
+
+            // Persist the turn for later analysis, from ITS OWN buffer.
+            this._logInteraction(command, intent, _turnStartedAt, _turnOk && !superseded, _buf);
+            /* Remember answers that came from MEASUREMENT rather than the model,
+               so a bare follow-up is grounded in them. AI_COMMAND is excluded
+               on purpose: feeding a model's own output back as "factual" is how
+               an invented device name would become established truth. */
+            if (_turnOk && !superseded && intent.intent !== 'AI_COMMAND' && _buf.text) {
+                this._rememberFactualAnswer(intent.intent, _buf.text);
+            }
+
+            /* Only the newest turn owns the input loop. A superseded turn
+               reaching its finally must not clear isProcessing or restart the
+               recogniser underneath the turn that replaced it. */
+            if (!superseded) {
+                this.isProcessing = false;
+                this.wakeWordDetected = false;
+                if (this.commandInput) {
+                    this.commandInput.disabled = false;
+                }
+                this.startAlwaysOnListening();
+            }
         }
     }
 
     // System Control Handlers
     async handleOpenApp(app) {
-        if (window.electronAPI) {
-            window.electronAPI.openApp(app);
+        if (!window.electronAPI) { this.speak(`I cannot open ${app} in this environment`); return; }
+        window.electronAPI.openApp(app);
+
+        /* Text-editing apps are the whole point of voice typing, so offer it
+           rather than making the user ask separately. The offer waits for the
+           window to actually appear and takes focus from the REAL window —
+           never from a process picked by name, which is how a test of mine
+           once typed into an unrelated document that happened to be open. */
+        const TEXT_APPS = ['notepad', 'wordpad', 'word', 'vscode', 'code'];
+        if (!TEXT_APPS.includes(String(app).toLowerCase()) || !window.electronAPI.focusedWindow) {
             this.speak(`Opening ${app}`);
-        } else {
-            this.speak(`I cannot open ${app} in this environment`);
+            return;
+        }
+        this.speak(`Opening ${app}`);
+        const before = (await window.electronAPI.focusedWindow().catch(() => null))?.pid;
+        for (let i = 0; i < 12; i++) {
+            await new Promise(r => setTimeout(r, 500));
+            const now = await window.electronAPI.focusedWindow().catch(() => null);
+            if (now?.success && now.pid && now.pid !== before &&
+                String(now.process || '').toLowerCase() !== 'electron') {
+                this._armConfirmation('dictate-start', 'start voice typing');
+                this.displayText(`${now.title} is ready. Say "yes" to start voice typing, or "start typing" any time.`, null);
+                this.speak(`${app} is open, Sir. Shall I start voice typing into it?`);
+                return;
+            }
         }
     }
 
@@ -1876,8 +2055,15 @@ class Jarvis {
         let m;
         if ((m = cmd.match(/\b(?:price|quote)\s+(?:of|for)\s+(.+)/i))) return clean(m[1]) || null;
         if ((m = cmd.match(/\b(.+?)\s+(?:stock|share)\s+price\b/i))) return clean(m[1]) || null;
-        if ((m = cmd.match(/\bhow much (?:is|are|does)\s+(.+?)(?:\s+cost|\s+worth|\s+trading|\s+stock|\s+shares?)?\s*\??$/i))
-            && /\b(stock|shares?|worth|trading|cost|price)\b/i.test(cmd)) return clean(m[1]) || null;
+        if ((m = cmd.match(/\bhow much (?:is|are|does)\s+(.+?)(?:\s+cost|\s+worth|\s+trading|\s+stock|\s+shares?)?\s*\??$/i))) {
+            const ent = clean(m[1]);
+            // Fires on a finance word ("how much is X worth") OR a known asset
+            // name. Real log: "how much is bitcoin" had neither guard-word, fell
+            // to Gemma, and Gemma fabricated "$17,500" — the exact failure the
+            // deterministic quote engine exists to prevent.
+            const known = ent && Jarvis.SYMBOL_MAP[ent.toLowerCase()];
+            if (ent && (known || /\b(stock|shares?|worth|trading|cost|price)\b/i.test(cmd))) return ent;
+        }
         if ((m = cmd.match(/\bwhat(?:'s| is)\s+(.+?)\s+(?:stock\s+)?(?:trading at|worth|at now|priced at)\b/i))) return clean(m[1]) || null;
         if ((m = cmd.match(/\bhow(?:'s| is)\s+(.+?)\s+(?:stock|shares?)\s+doing\b/i))) return clean(m[1]) || null;
         return null;
@@ -2071,6 +2257,33 @@ class Jarvis {
         const txMatch = text.match(/0x[0-9a-fA-F]{64}/);
         if (txMatch) return { kind: 'tx', hash: txMatch[0], chain: onchain.resolveChain(text, 'ethereum') };
 
+        // Which chains can actually be read right now — "which chains can you
+        // read", "chain providers", "are you connected to alchemy".
+        if (/\b(which|what) chains?\b.*\b(read|see|access|support)\b/i.test(text) ||
+            /\b(chain (providers?|coverage|access)|provider status|alchemy|helius)\b/i.test(text)) {
+            return { kind: 'chain-capabilities', chain: 'ethereum' };
+        }
+
+        /* Solana. A base58 address is NOT self-identifying the way an 0x address
+           is — plenty of ordinary words are valid base58 — so Solana reads
+           require the chain to be named explicitly. Speech-safe by design. */
+        if (/\bsol(ana)?\b/i.test(text)) {
+            const solAddr = (text.match(/\b[1-9A-HJ-NP-Za-km-z]{32,44}\b/) || [])[0] || null;
+            if (solAddr) {
+                if (/\b(activity|transactions?|txs?|history|recent|what happened|moves?)\b/i.test(text)) {
+                    return { kind: 'solana-activity', address: solAddr, chain: 'solana' };
+                }
+                return { kind: 'solana-assets', address: solAddr, chain: 'solana' };
+            }
+        }
+
+        // Ondo GM tokenized securities — "supply of tokenized apple", "mints and
+        // redemptions for tokenized nvidia", "top holders of aaplon". The parser
+        // is strictly gated (see ondoRegistry.js) so quote/quant/news speech
+        // ("price of apple", "analyze tesla") is never stolen.
+        const ondoQ = parseOndoQuery(text);
+        if (ondoQ) return { chain: 'ethereum', ...ondoQ };
+
         const addr = onchain.extractAddress(text);
         // An ENS name works anywhere an address does ("balance of vitalik.eth").
         const ensMatch = !addr && text.match(/\b([a-z0-9-]+(?:\.[a-z0-9-]+)*\.eth)\b/i);
@@ -2102,11 +2315,47 @@ class Jarvis {
         // "monitor whale transfers", "stop whale alerts", "whale watch status".
         // History summary ("whale activity today") is checked FIRST or the
         // stream-control verbs would eat it.
+        /* Stablecoin issuance — "did Circle mint any USDC", "any big USDC
+           burns today", "stablecoin supply". Checked BEFORE the whale block:
+           "big USDC mints" contains no whale word, but "whale" plus "mint"
+           would otherwise route to the whale stream. */
+        // Plurals matter: "whale alerts" and "usdc burns" both fell through to
+        // the model in his log because the regexes only matched the singular.
+        if (/\b(mints?|minted|minting|burns?|burned|burnt|issuance|issued|supply)\b/i.test(text) &&
+            /\b(usdc|usdt|tether|circle|stablecoins?|dai)\b/i.test(text)) {
+            const solana = /\bsol(ana)?\b/i.test(text);
+            return { kind: solana ? 'solana-supply' : 'issuance', chain: solana ? 'solana' : 'ethereum' };
+        }
+
+        /* Whale stream control. NOTE the `s?` on alert: his log has
+           "give me whale alerts of solana" falling through this whole block to
+           the model, which then invented an entire workflow ("I am sending the
+           command to begin searching... the search is complete, no alerts
+           available"). The plural simply did not match. */
         if (/\b(whales?|large transfers?|big moves?)\b/i.test(text)) {
+            /* A chain this stream does not cover must be answered honestly, not
+               by starting an Ethereum stream and calling it Solana. */
+            const askedChain = /\bsol(ana)?\b/i.test(text) ? 'solana'
+                : /\b(bitcoin|btc)\b/i.test(text) ? 'bitcoin'
+                    : /\b(polygon|matic)\b/i.test(text) ? 'polygon' : null;
+            if (askedChain) return { kind: 'whale-unsupported', askedChain, chain: 'ethereum' };
+            // Recorded activity over a window — "whales in the last hour",
+            // "whale summary for the last five minutes".
+            if (/\b(last|past)\s+(\d+\s+)?(minute|min|hour|hr)/i.test(text)) {
+                return { kind: 'whale-window', text, chain: 'ethereum' };
+            }
+        }
+        if (/\b(whales?|large transfers?|big moves?)\b/i.test(text)) {
+            // USD-priced whale flows come from Dune (key-gated) — the local
+            // stream sees native-unit transfers only. Checked before the
+            // summary so "whale activity today in dollars" routes here.
+            if (/\b(dollars?|usd|dollar terms|by (dollar )?value|priced)\b/i.test(text)) {
+                return { kind: 'whale-usd', chain: onchain.resolveChain(text, 'ethereum') };
+            }
             if (/\b(today|activity|summary|report|recap|so far)\b/i.test(text)) return { kind: 'whale-summary', chain: 'ethereum' };
             if (/\b(stop|off|disable|end|quit)\b/i.test(text)) return { kind: 'whale-stream', action: 'stop', chain: 'ethereum' };
             if (/\b(status|running|active)\b/i.test(text)) return { kind: 'whale-stream', action: 'status', chain: 'ethereum' };
-            if (/\b(watch|monitor|alert|track|stream|start|on|live)\b/i.test(text)) return { kind: 'whale-stream', action: 'start', chain: 'ethereum' };
+            if (/\b(watch|monitor|alerts?|track|stream|start|on|live|give me|show)\b/i.test(text)) return { kind: 'whale-stream', action: 'start', chain: 'ethereum' };
         }
 
         // Gas needs no address, but must be unambiguously about a chain (a named
@@ -2190,6 +2439,24 @@ class Jarvis {
                 await this.handleWhaleSummary();
                 return;
             }
+            // Ondo tokenized securities + USD-priced whale flows need no address.
+            if (String(intent.kind).startsWith('ondo-')) {
+                await this.handleOndoQuery(intent);
+                return;
+            }
+            if (intent.kind === 'whale-usd') {
+                await this.handleWhaleUsd(intent);
+                return;
+            }
+            // Keyed-provider reads. Checked before ENS resolution: a Solana
+            // address is not an EVM address and has no ENS name to resolve.
+            if (intent.kind === 'chain-capabilities') { await this.handleChainCapabilities(); return; }
+            if (intent.kind === 'whale-unsupported') { await this.handleWhaleUnsupported(intent.askedChain); return; }
+            if (intent.kind === 'whale-window') { await this.handleWhaleWindow(intent.text); return; }
+            if (intent.kind === 'issuance') { await this.handleIssuance(); return; }
+            if (intent.kind === 'solana-supply') { await this.handleSolanaSupply(); return; }
+            if (intent.kind === 'solana-assets') { await this.handleSolanaAssets(intent.address); return; }
+            if (intent.kind === 'solana-activity') { await this.handleSolanaActivity(intent.address); return; }
 
             // Resolve an ENS name to an address up front for reads that need one.
             if (!intent.address && intent.ensName) {
@@ -2250,6 +2517,968 @@ class Jarvis {
         }
     }
 
+    /* =========================
+       NETWORK CONNECTION INSPECTION
+       Every live socket, its remote IP and owning process — the answer to
+       "the IP address you are connected to", which the log shows Gemma
+       refusing ("I do not have access to network connection details") because
+       the capability genuinely did not exist. All figures come from the pure
+       netInspect engine; the model is not in this path. */
+
+    /** Text -> network intent, or null. Ordered so the most specific wins. */
+    parseNetworkQuery(cmd) {
+        const t = String(cmd || '').toLowerCase();
+        if (!t) return null;
+
+        // Packet-level asks are answered with a truthful capability report
+        // rather than a pretend capture.
+        if (/\b(packet|packets|wireshark|sniff|capture|pcap|deep packet|packet flow|tcpdump)\b/.test(t)) {
+            return { intent: 'NET_CAPTURE_INFO' };
+        }
+        // Bluetooth enumeration. Checked before the audio/earbuds matcher only
+        // for scan-shaped phrasings, so "earbuds battery" still routes there.
+        if (/\b(bluetooth|bt)\b/.test(t) && /\b(scan|devices|list|nearby|around|near me|discover|find)\b/.test(t)) {
+            return { intent: 'BT_DEVICES' };
+        }
+        // Devices on the LAN — "what devices are on my network", "who else is
+        // on my wifi". Distinct from NET_CONNECTIONS (this machine's sockets).
+        if (/\b(devices?|machines?|hosts?|who else|anyone else|what else)\b/.test(t) &&
+            /\b(on|connected to|joined)\b/.test(t) &&
+            /\b(my |the )?(network|wi-?fi|lan|router|hotspot)\b/.test(t)) {
+            return { intent: 'LAN_DEVICES' };
+        }
+        // "what's the IP of <name>" — a REAL resolution. The log shows this
+        // falling through to the model, which invented "192.168.1.10"; the
+        // number now comes from the resolver or is reported as unresolvable.
+        let hm = t.match(/\b(?:what(?:'s| is)?\s+)?(?:the\s+)?ip(?:\s+address)?\s+(?:of|for)\s+([a-z0-9 ._-]{2,40}?)\s*[?.!]*$/);
+        if (!hm) hm = t.match(/\b(?:resolve|look ?up|ping)\s+([a-z0-9._-]{2,40})\s*[?.!]*$/);
+        if (hm) {
+            const raw = hm[1].trim();
+            // "ip of this machine / my pc" asks for the LOCAL address, which the
+            // Wi-Fi report already answers. Tested against the RAW text: an
+            // earlier version stripped the leading "my" first, so "ip of my
+            // computer" survived the guard and became a lookup for "computer".
+            const isSelf = /^(the|my|your|this|that)?\s*(pc|computer|laptop|machine|system|device|network|wi-?fi|internet|router)$/.test(raw)
+                || /^(me|you|us|it|this|that|mine|yours)$/.test(raw);
+            const target = raw.replace(/^(the|my|a)\s+/, '');
+            if (!isSelf && target) return { intent: 'RESOLVE_HOST', target };
+        }
+        // Details of a network in range that is NOT the one we are joined to.
+        let nm = t.match(/\b(?:details?|info(?:rmation)?|signal|channel|strength|about)\b.*\b(?:network|wi-?fi|ssid)\s+(?:called\s+|named\s+)?([a-z0-9 ._-]{2,40}?)\s*[?.!]*$/);
+        if (!nm) nm = t.match(/\b(?:another|other|different)\s+(?:wi-?fi|network)\b.*?\b(?:which is|called|named|is)\s+([a-z0-9 ._-]{2,40}?)\s*[?.!]*$/);
+        if (nm) return { intent: 'WIFI_NETWORK_DETAIL', ssid: nm[1].trim() };
+        // Data volume moved.
+        if (/\b(how much data|data (used|usage|transferred|sent)|bandwidth|bytes (sent|received))\b/.test(t)) {
+            return { intent: 'NET_TRAFFIC' };
+        }
+        // Exposed surface.
+        if (/\b(open ports?|listening|ports? (are )?(open|listening)|what.s listening|exposed)\b/.test(t)) {
+            return { intent: 'NET_LISTENING' };
+        }
+        // Per-application: "what is chrome connecting to".
+        let m = t.match(/\b(?:what|where|who)\s+(?:is|are)\s+([a-z0-9 ._-]{2,30}?)\s+(?:connect(?:ing|ed)?|talking|sending|reaching)\b/);
+        if (m && !/\b(my (pc|computer|laptop|machine|system)|you|jarvis|this (pc|computer|machine))\b/.test(m[1])) {
+            return { intent: 'NET_PROCESS', name: m[1].trim() };
+        }
+        m = t.match(/\b(?:connections?|sockets?|traffic)\s+(?:of|for|from|by)\s+([a-z0-9 ._-]{2,30})\b/);
+        if (m) return { intent: 'NET_PROCESS', name: m[1].trim() };
+
+        // General connection questions, including the exact phrasings from the log.
+        if (/\b(ip address(es)?|ip'?s)\b.*\b(connect|connected|talking|using|to)\b/.test(t) ||
+            /\b(connect(ed|ing)?)\b.*\b(ip address(es)?)\b/.test(t) ||
+            /\b(network (connections?|details)|active connections?|open connections?|established connections?)\b/.test(t) ||
+            /\b(who|what)\b.*\b(is|are)\b.*\b(my (pc|computer|laptop|machine|system)|this (pc|computer|machine)|we|you)\b.*\b(talking to|connected to|connecting to|communicating with)\b/.test(t) ||
+            /\b(show|list|check)\b.*\b(connections?|sockets?)\b/.test(t) ||
+            /\bwhat (servers?|hosts?|addresses)\b.*\b(connect|talking)\b/.test(t)) {
+            return { intent: 'NET_CONNECTIONS' };
+        }
+        return null;
+    }
+
+    /* Load Windows' own port->service table once per session. Until this
+       resolves, ports simply go unnamed — which is correct, because the
+       alternative is a hand-written guess list. */
+    async _ensurePortServices() {
+        if (this._portServicesLoaded) return;
+        this._portServicesLoaded = true;
+        try {
+            const r = await window.electronAPI?.portServices?.();
+            if (r?.success) netInspect.setPortServices(netInspect.parseServicesFile(r.text));
+        } catch { /* unnamed ports are an acceptable degradation */ }
+    }
+
+    /** Fetch + parse the live socket table. Returns rows or null (already spoken). */
+    async _netRows() {
+        await this._ensurePortServices();
+        if (!window.electronAPI?.networkConnections) {
+            this.speak('Network inspection is not available in this environment.');
+            return null;
+        }
+        const r = await window.electronAPI.networkConnections();
+        if (!r?.success) {
+            this.speak(`I could not read the connection table. ${r?.error || ''}`.trim());
+            return null;
+        }
+        return netInspect.parseNetstat(r.netstat, netInspect.parseProcessTable(r.procs));
+    }
+
+    async handleNetConnections() {
+        this.displayText('Reading the live connection table...', null);
+        const rows = await this._netRows();
+        if (!rows) return;
+        const s = netInspect.summarize(rows);
+        if (!s.established) {
+            this.speak('There are no established connections right now, Sir.');
+            return;
+        }
+        // Resolve only the public remotes actually being reported.
+        const top = s.remotes.filter(r => r.scope === 'public').slice(0, 12);
+        let names = {};
+        if (window.electronAPI?.networkResolve && top.length) {
+            const rr = await window.electronAPI.networkResolve({ addresses: top.map(r => r.address) });
+            names = rr?.names || {};
+        }
+        const label = (r) => (names[r.address] ? `${r.address} (${names[r.address]})` : r.address);
+        const lines = top.map(r =>
+            `${label(r)}  :${r.ports.join(',')}  ${r.service || ''}  <- ${r.processes.join(', ')}${r.count > 1 ? `  x${r.count}` : ''}`);
+        const procLine = s.processes.slice(0, 6).map(p => `${p.name} (${p.count})`).join(', ');
+        this.displayText(
+            `${s.established} established connections - ${s.scopes.public} to the internet, ${s.scopes.private} on your LAN, ${s.scopes.loopback} internal.\n` +
+            `Busiest processes: ${procLine}\n\nRemote hosts:\n${lines.join('\n')}\n\n` +
+            `${s.listening} listening sockets. Ask "which ports are open" for the exposed ones.`, null);
+        const t1 = s.remotes[0];
+        this.speak(
+            `${s.established} established connections, Sir. ${s.scopes.public} to the internet, ${s.scopes.private} on your local network, ${s.scopes.loopback} internal to this machine. ` +
+            `The busiest process is ${s.processes[0].name} with ${s.processes[0].count}. ` +
+            (t1 ? `The most-used remote host is ${names[t1.address] || t1.address}${t1.service ? ` over ${t1.service}` : ''}. ` : '') +
+            'The full list is on screen.');
+    }
+
+    async handleNetProcess(name) {
+        this.displayText(`Checking what ${name} is connected to...`, null);
+        const rows = await this._netRows();
+        if (!rows) return;
+        const mine = netInspect.connectionsForProcess(rows, name);
+        if (!mine.length) {
+            // Honest distinction: not running vs running with no open sockets.
+            const anySocket = rows.some(r => r.process.toLowerCase().includes(String(name).toLowerCase()));
+            this.speak(anySocket
+                ? `${name} has sockets open but no established connections right now, Sir.`
+                : `I see no process matching ${name} with network connections, Sir.`);
+            return;
+        }
+        const remotes = netInspect.groupByRemote(mine);
+        const pub = remotes.filter(r => r.scope === 'public').map(r => r.address);
+        let names = {};
+        if (window.electronAPI?.networkResolve && pub.length) {
+            const rr = await window.electronAPI.networkResolve({ addresses: pub.slice(0, 12) });
+            names = rr?.names || {};
+        }
+        const lines = remotes.slice(0, 15).map(r =>
+            `${names[r.address] ? `${r.address} (${names[r.address]})` : r.address}  :${r.ports.join(',')}  ${r.service || ''}  ${r.scope}${r.count > 1 ? `  x${r.count}` : ''}`);
+        this.displayText(`${mine[0].process}: ${mine.length} established connections to ${remotes.length} hosts\n\n${lines.join('\n')}`, null);
+        const first = remotes[0];
+        this.speak(`${mine[0].process} has ${mine.length} established connections to ${remotes.length} hosts, Sir. ` +
+            `The top one is ${names[first.address] || first.address}${first.service ? ` over ${first.service}` : ''}. Details on screen.`);
+    }
+
+    async handleNetListening() {
+        this.displayText('Reading listening sockets...', null);
+        const rows = await this._netRows();
+        if (!rows) return;
+        const s = netInspect.summarize(rows);
+        if (!s.exposedPorts.length) {
+            this.speak('Nothing is listening on an address reachable from outside this machine, Sir.');
+            return;
+        }
+        const lines = s.exposedPorts.map(p => `${p.port}  ${p.service || ''}  <- ${p.process}`);
+        this.displayText(`${s.exposedPorts.length} ports reachable from your network (of ${s.listening} listening sockets):\n${lines.join('\n')}`, null);
+        const named = s.exposedPorts.filter(p => p.service).slice(0, 4)
+            .map(p => `${p.port} for ${p.service}`).join(', ');
+        this.speak(`${s.exposedPorts.length} ports are reachable from your network, Sir${named ? `, including ${named}` : ''}. The full list is on screen. Loopback-only sockets are excluded because nothing outside this machine can reach them.`);
+    }
+
+    async handleNetTraffic() {
+        if (!window.electronAPI?.networkTraffic) { this.speak('Adapter statistics are not available here.'); return; }
+        this.displayText('Reading adapter counters...', null);
+        const r = await window.electronAPI.networkTraffic();
+        if (!r?.success || !r.adapters?.length) { this.speak('I could not read the adapter statistics, Sir.'); return; }
+        const lines = r.adapters.map(a =>
+            `${a.Name}: received ${netInspect.formatBytes(a.ReceivedBytes)}, sent ${netInspect.formatBytes(a.SentBytes)}`);
+        this.displayText(lines.join('\n') + '\n\n(Counters are since the adapter last reset, typically at boot.)', null);
+        const a = r.adapters[0];
+        this.speak(`On ${a.Name}, ${netInspect.formatBytes(a.ReceivedBytes)} received and ${netInspect.formatBytes(a.SentBytes)} sent since the adapter last reset, Sir.`);
+    }
+
+    /* Truthful answer to "you should see every packet". States what is actually
+       available on this machine instead of implying capture that is not
+       happening — the same rule that keeps the chain and finance layers from
+       inventing figures. */
+    async handleNetCaptureInfo() {
+        const cap = window.electronAPI?.networkCaptureCapability
+            ? await window.electronAPI.networkCaptureCapability() : null;
+        const rows = await this._netRows();
+        const s = rows ? netInspect.summarize(rows) : null;
+
+        const have = s ? `I can see every open socket: ${s.established} established connections, their remote IP addresses and ports, and which process owns each one. ` : '';
+        let lack = 'I cannot read packet contents or per-packet timing. That needs a capture driver, which needs Administrator rights I do not have.';
+        if (cap?.success) {
+            if (cap.admin && cap.pktmon) lack = 'Packet capture is available: pktmon is present and this session is elevated. Say the word and I will explain the capture command, though I will not start one without you asking.';
+            else if (cap.pktmon) lack = 'Windows pktmon is installed but this session is not elevated, so packet capture would fail. Connection-level detail is what I can give you right now.';
+            if (cap.npcap) lack += ' Wireshark or Npcap is installed on this machine, so a full capture is possible there, outside my reach.';
+        }
+        const line = `${have}${lack}`;
+        this.displayText(line, null);
+        this.speak(line);
+    }
+
+    /* =========================
+       SYSTEM PROCESS VISIBILITY — read-only.
+       Answers "what is running", "what is eating my CPU", "is X running",
+       "what's happening on my machine". Every figure is measured by the
+       collector and shaped by the pure sysInspect engine; the model is not in
+       this path, so no number here can be invented. */
+
+    /** Text -> system intent, or null. */
+    parseSystemQuery(cmd) {
+        const t = String(cmd || '').toLowerCase();
+        if (!t) return null;
+
+        // "is X running" / "is X open"
+        let m = t.match(/\bis\s+([a-z0-9 ._-]{2,30}?)\s+(?:still\s+)?(?:running|open|active|up)\b/);
+        if (m) return { intent: 'SYS_PROCESS', name: m[1].trim() };
+        m = t.match(/\b(?:how much|what)\s+(?:cpu|memory|ram)\s+(?:is\s+)?([a-z0-9 ._-]{2,30}?)\s+(?:using|taking|eating)\b/);
+        if (m) return { intent: 'SYS_PROCESS', name: m[1].trim() };
+
+        const resource = /\b(cpu|memory|ram|processor)\b/.test(t);
+        const whatUses = /\b(what|which|who)\b.*\b(using|eating|hogging|consuming|taking|slowing)\b/.test(t);
+        if (resource && whatUses) {
+            return { intent: 'SYS_TOP', resource: /\b(memory|ram)\b/.test(t) ? 'memory' : 'cpu' };
+        }
+        // "why is my computer slow"
+        if (/\bwhy\b.*\b(slow|lagging|freezing|sluggish|hot|fan)\b/.test(t) &&
+            /\b(pc|computer|laptop|machine|system|it)\b/.test(t)) {
+            return { intent: 'SYS_TOP', resource: 'cpu' };
+        }
+        // HISTORY questions go to the metric store, not to the live reading.
+        // "what was my CPU an hour ago" was previously unanswerable: telemetry
+        // was displayed and discarded.
+        const past = /\b(was|were|has been|earlier|yesterday|last night|this morning|an hour ago|history|over the last|過)\b/.test(t);
+        if (past && /\b(cpu|memory|ram|processor|usage|load|performance)\b/.test(t)) {
+            let hours = 24;
+            const hm = t.match(/\b(?:last|past)\s+(\d{1,3})\s*(hour|hr|minute|min|day)/);
+            if (hm) {
+                const n = parseInt(hm[1], 10);
+                hours = /day/.test(hm[2]) ? n * 24 : /min/.test(hm[2]) ? Math.max(1, Math.ceil(n / 60)) : n;
+            } else if (/\ban hour ago\b/.test(t)) hours = 2;
+            else if (/\byesterday\b/.test(t)) hours = 48;
+            return { intent: 'SYS_HISTORY', hours: Math.min(hours, 24 * 30) };
+        }
+        // "what happened today" -> the derived event log.
+        if (/\b(what happened|any (alerts?|events?|problems?|issues?)|event log|anything (unusual|wrong))\b/.test(t)) {
+            return { intent: 'SYS_EVENTS', hours: /\byesterday\b/.test(t) ? 48 : 24 };
+        }
+
+        // Process listings and general "what's happening"
+        if (/\b(running (processes|apps|programs)|process list|list (all )?processes|task manager|what(?:'s| is) running|what apps are open|open (apps|programs|windows))\b/.test(t)) {
+            return { intent: 'SYS_PROCESSES' };
+        }
+        if (/\b(what(?:'s| is) (happening|going on)|system (activity|status|overview|report)|how('s| is) my (pc|computer|laptop|machine|system))\b/.test(t)) {
+            return { intent: 'SYS_OVERVIEW' };
+        }
+        return null;
+    }
+
+    /** Collect + analyse. Returns {summary, cores} or null (already spoken). */
+    async _sysSummary() {
+        if (!window.electronAPI?.systemProcesses) {
+            this.speak('Process inspection is not available in this environment.');
+            return null;
+        }
+        const r = await window.electronAPI.systemProcesses();
+        if (!r?.success) {
+            this.speak(`I could not read the process list. ${r?.error || ''}`.trim());
+            return null;
+        }
+        return { summary: sysInspect.summarize(r.procs, { cores: r.cores }), cores: r.cores };
+    }
+
+    async handleSysTop(resource) {
+        this.displayText(`Measuring ${resource === 'memory' ? 'memory' : 'CPU'} usage...`, null);
+        const s = await this._sysSummary();
+        if (!s) return;
+        const { summary } = s;
+        const list = resource === 'memory' ? summary.topMemory : summary.topCpu;
+        const fmt = (g) => resource === 'memory'
+            ? `${g.friendly}  ${sysInspect.formatMB(g.memMB)}  (${g.count} process${g.count === 1 ? '' : 'es'})`
+            : `${g.friendly}  ${g.cpuPct}%  (${g.count} process${g.count === 1 ? '' : 'es'})`;
+        this.displayText(
+            `Top by ${resource}:\n${list.slice(0, 8).map(fmt).join('\n')}\n\n` +
+            `${summary.processCount} processes in ${summary.groupCount} groups. ` +
+            `Total measured CPU ${summary.totalCpuPct}% across ${summary.cores} cores, ` +
+            `${sysInspect.formatMB(summary.totalMemMB)} resident.`, null);
+
+        const top = list.slice(0, 3);
+        const spoken = top.map(g => resource === 'memory'
+            ? `${g.friendly} at ${sysInspect.formatMB(g.memMB)}`
+            : `${g.friendly} at ${g.cpuPct} percent`).join(', ');
+        this.speak(`The biggest consumers of ${resource === 'memory' ? 'memory' : 'CPU'} right now, Sir: ${spoken}. Full list on screen.`);
+    }
+
+    async handleSysProcesses() {
+        this.displayText('Reading the process table...', null);
+        const s = await this._sysSummary();
+        if (!s) return;
+        const { summary } = s;
+        const apps = summary.userApps;
+        const lines = apps.map(g =>
+            `${g.friendly}  ${sysInspect.formatMB(g.memMB)}  ${g.cpuPct}%  ${g.windows[0] ? `- ${g.windows[0].slice(0, 60)}` : ''}`);
+        this.displayText(
+            `Applications with open windows:\n${lines.join('\n')}\n\n` +
+            `${summary.processCount} processes total (${summary.groupCount} distinct programs), ` +
+            `including Windows' own background services.`, null);
+        this.speak(`${apps.length} applications have open windows, Sir, out of ${summary.processCount} processes in total. ` +
+            (apps[0] ? `The largest is ${apps[0].friendly} at ${sysInspect.formatMB(apps[0].memMB)}. ` : '') +
+            'The list is on screen.');
+    }
+
+    async handleSysProcess(name) {
+        this.displayText(`Looking for ${name}...`, null);
+        const s = await this._sysSummary();
+        if (!s) return;
+        const g = sysInspect.findProcess(s.summary.groups, name);
+        if (!g) {
+            this.speak(`${name} is not running, Sir.`);
+            this.displayText(`No process matching "${name}" is running.`, null);
+            return;
+        }
+        const line = `${g.friendly} is running: ${g.count} process${g.count === 1 ? '' : 'es'}, ` +
+            `${g.cpuPct}% CPU, ${sysInspect.formatMB(g.memMB)} memory` +
+            (g.windows.length ? `, window "${g.windows[0].slice(0, 70)}"` : ', no visible window') + '.';
+        this.displayText(line + `\n\nCumulative processor time since start: ${g.cpuSeconds} seconds (this is total work done, not current usage).`, null);
+        this.speak(line);
+    }
+
+    /* Historical metrics. Answered from the persisted time-series, never from
+       the model — and when there is not enough history yet, it says so rather
+       than describing a past it cannot see. */
+    async handleSysHistory(hours) {
+        if (!window.electronAPI?.getMetricHistory) { this.speak('Metric history is not available here.'); return; }
+        this.displayText(`Reading the last ${hours} hours of measurements...`, null);
+        const r = await window.electronAPI.getMetricHistory({ hours });
+        if (!r?.success) { this.speak('I could not read the metric history, Sir.'); return; }
+
+        const s = r.samples || [];
+        if (s.length < 2) {
+            const line = `I have only ${s.length} recorded sample${s.length === 1 ? '' : 's'} in that window, Sir. ` +
+                `I began keeping metric history this session, so there is not enough yet to describe a trend. ` +
+                `It records one reading a minute from now on.`;
+            this.displayText(line, null); this.speak(line);
+            return;
+        }
+        const cpu = this._statsOf(s, 'c');
+        const mem = this._statsOf(s, 'm');
+        /* Span in whichever unit is not absurd. Rounding straight to hours made
+           a short window read "Over the last 0 hours, Sir" (logged 14:33:49),
+           which sounds like a bug and hides that the window really was minutes. */
+        const spanMs = s[s.length - 1].t - s[0].t;
+        const spanH = Math.round((spanMs / 3600000) * 10) / 10;
+        const spanPhrase = spanMs < 3600000
+            ? `${Math.max(1, Math.round(spanMs / 60000))} minutes`
+            : `${spanH} hours`;
+        // Which process held the top slot most often.
+        const tally = new Map();
+        for (const x of s) if (x.p) tally.set(x.p, (tally.get(x.p) || 0) + 1);
+        const top = [...tally.entries()].sort((a, b) => b[1] - a[1])[0];
+
+        const rollLines = (r.rollups || []).slice(-7).map(d =>
+            `${d.day}  CPU avg ${d.cpu?.avg ?? '?'}% peak ${d.cpu?.peak ?? '?'}%  mem avg ${d.mem?.avg ?? '?'}%  ${d.topProcess ? `busiest ${d.topProcess.name}` : ''}`);
+        this.displayText(
+            `Last ${spanH}h from ${s.length} samples:\n` +
+            `CPU  avg ${cpu.avg}%  peak ${cpu.peak}%  p95 ${cpu.p95}%\n` +
+            `Mem  avg ${mem.avg}%  peak ${mem.peak}%\n` +
+            (top ? `Busiest process: ${top[0]} (top in ${Math.round((top[1] / s.length) * 100)}% of readings)\n` : '') +
+            (rollLines.length ? `\nDaily history:\n${rollLines.join('\n')}` : ''), null);
+        this.speak(
+            `Over the last ${spanPhrase}, Sir, CPU averaged ${cpu.avg} percent and peaked at ${cpu.peak}. ` +
+            `Memory averaged ${mem.avg} percent. ` +
+            (top ? `${top[0]} was the busiest process most of the time.` : ''));
+    }
+
+    /** avg/peak/p95 over a stored field. Nulls skipped, never counted as zero. */
+    _statsOf(samples, field) {
+        const v = samples.map(x => x[field]).filter(x => typeof x === 'number').sort((a, b) => a - b);
+        if (!v.length) return { avg: 0, peak: 0, p95: 0 };
+        const sum = v.reduce((a, b) => a + b, 0);
+        return {
+            avg: Math.round((sum / v.length) * 10) / 10,
+            peak: v[v.length - 1],
+            p95: v[Math.min(v.length - 1, Math.max(0, Math.ceil(0.95 * v.length) - 1))],
+        };
+    }
+
+    /* The derived event log — threshold crossings and watched program
+       start/stop, already deduped and debounced in the store. */
+    async handleSysEvents(hours) {
+        if (!window.electronAPI?.getSystemEvents) { this.speak('The event log is not available here.'); return; }
+        this.displayText('Reading the event log...', null);
+        const r = await window.electronAPI.getSystemEvents({ hours });
+        if (!r?.success) { this.speak('I could not read the event log, Sir.'); return; }
+        const evs = r.events || [];
+        if (!evs.length) {
+            this.speak(`Nothing notable was recorded in the last ${hours} hours, Sir. No threshold crossings and no watched programs starting or stopping.`);
+            return;
+        }
+        const fmt = (e) => {
+            const d = new Date(e.t);
+            const hh = String(d.getHours()).padStart(2, '0'), mm = String(d.getMinutes()).padStart(2, '0');
+            return `${hh}:${mm}  ${e.text}`;
+        };
+        const recent = evs.slice(-25);
+        this.displayText(`${evs.length} events in the last ${hours}h:\n${recent.map(fmt).join('\n')}`, null);
+        const thresholds = evs.filter(e => String(e.kind).endsWith('-high'));
+        this.speak(`${evs.length} events in the last ${hours} hours, Sir. ` +
+            (thresholds.length
+                ? `${thresholds.length} were resource thresholds being crossed. The most recent: ${thresholds[thresholds.length - 1].text}`
+                : `The most recent: ${evs[evs.length - 1].text}`));
+    }
+
+    async handleSysOverview() {
+        this.displayText('Taking a system reading...', null);
+        const s = await this._sysSummary();
+        if (!s) return;
+        const { summary } = s;
+        const obs = sysInspect.observations(summary);
+        const apps = summary.userApps.slice(0, 5).map(g => g.friendly).join(', ');
+        this.displayText(
+            `${summary.processCount} processes, ${summary.groupCount} distinct programs.\n` +
+            `CPU ${summary.totalCpuPct}% of ${summary.cores} cores. Memory resident ${sysInspect.formatMB(summary.totalMemMB)}.\n` +
+            `Foreground apps: ${apps}\n\n${obs.map(o => '- ' + o).join('\n')}`, null);
+        this.speak(
+            `${summary.processCount} processes running, Sir, using ${summary.totalCpuPct} percent of your ${summary.cores} cores ` +
+            `and ${sysInspect.formatMB(summary.totalMemMB)} of memory. ` +
+            (obs[0] || 'Nothing stands out as unusual.'));
+    }
+
+    /* =========================
+       KEYBOARD + WINDOW CONTROL
+       Typing lands in whatever window has focus, and the assistant cannot see
+       the screen — so every confirmation NAMES the window that received the
+       keystrokes. Parsing is rule-based (inputControl.js), never model-driven:
+       a mis-parse here types into the wrong place. */
+
+    async handleTypeText(intent) {
+        const api = window.electronAPI;
+        if (!api?.typeText) { this.speak('Keyboard control is not available in this environment.'); return; }
+
+        const where = await api.focusedWindow();
+        if (!where?.success || !where.title) {
+            this.speak('I cannot tell which window has focus, Sir, so I will not type blindly. Click the field you want and ask again.');
+            return;
+        }
+        const proc = String(where.process || '').toLowerCase();
+
+        /* "search for X" used to mean a WEB search answered by the model, and
+           that must keep working. It only becomes typing when a browser is
+           actually in front — which is the case the user described (Chrome on
+           google.com, wanting the words in the search box). */
+        const BROWSERS = ['chrome', 'msedge', 'firefox', 'brave', 'opera', 'vivaldi'];
+        if (intent.isSearch && !BROWSERS.includes(proc)) {
+            await this.handleAICommand(`search ${intent.text}`);
+            return;
+        }
+
+        // Refuse to type into ourselves — the orb has no text field, and it
+        // would mean the user has not focused their target yet.
+        if (proc === 'electron') {
+            this.speak(`Focus is on my own window, Sir. Click the field you want the text in, then ask again.`);
+            return;
+        }
+
+        let encoded = inputControl.escapeSendKeys(intent.text);
+        if (intent.thenEnter) encoded += '{ENTER}';
+        this.displayText(`Typing into ${where.title}...`, null);
+        const r = await api.typeText({ encoded });
+        if (!r?.success) { this.speak(`I could not send the keystrokes. ${r?.error || ''}`.trim()); return; }
+
+        const target = r.target?.title || where.title;
+        this.displayText(`Typed into ${target}:\n${intent.text}${intent.thenEnter ? '\n(then Enter)' : ''}`, null);
+        this.speak(intent.isSearch
+            ? `Searched for ${intent.text} in ${target}, Sir.`
+            : `Typed into ${target}, Sir.`);
+    }
+
+    /* ---- VOICE TYPING (dictation mode) -----------------------------------
+       While active, every transcript is typed into the window that had focus
+       when dictation STARTED — captured once, so that a stray click mid-
+       sentence cannot redirect the user's words somewhere unexpected. The
+       target is re-asserted before each burst and verified afterwards. */
+    async handleDictateStart() {
+        const api = window.electronAPI;
+        if (!api?.typeText) { this.speak('Keyboard control is not available in this environment.'); return; }
+
+        const where = await api.focusedWindow();
+        if (!where?.success || !where.title) {
+            this.speak('I cannot tell which window has focus, Sir. Click the text field you want to dictate into, then say start typing.');
+            return;
+        }
+        if (String(where.process || '').toLowerCase() === 'electron') {
+            this.speak('My own window has focus, Sir. Click the document or search box you want to dictate into, then say start typing.');
+            return;
+        }
+        this._dictation = { target: { pid: where.pid, title: where.title, process: where.process }, count: 0 };
+        this._showTranscript(`DICTATING into ${where.title}`, 'acted', 'VOICE TYPING', 60000);
+        this.displayText(
+            `Voice typing into: ${where.title}\n\n` +
+            `Everything you say is typed there. Say "new line", "delete that", "undo", "select all" or "save it" for editing.\n` +
+            `Say "stop typing" when you are done.`, null);
+        this.speak(`Voice typing into ${where.title}, Sir. Say stop typing when you are done.`);
+    }
+
+    /** Handle one transcript while dictation is active. Returns true if consumed. */
+    async handleDictationTranscript(text) {
+        const d = this._dictation;
+        if (!d) return false;
+        const parsed = inputControl.parseDictationInput(text);
+
+        if (parsed.kind === 'stop') {
+            const n = d.count;
+            this._dictation = null;
+            this._showTranscript('voice typing ended', 'ambient', 'STOPPED', 3000);
+            this.displayText(`Voice typing stopped after ${n} entr${n === 1 ? 'y' : 'ies'}.`, null);
+            this.speak(`Voice typing stopped, Sir.`);
+            return true;
+        }
+
+        const api = window.electronAPI;
+        const encoded = parsed.kind === 'key'
+            ? parsed.chord
+            : inputControl.escapeSendKeys(parsed.text ? parsed.text + ' ' : '');
+        if (!encoded) return true;
+
+        // Re-target the window dictation began in, so a stray focus change does
+        // not scatter the user's words into another application.
+        const r = await api.typeText({ encoded, targetPid: d.target.pid });
+        if (!r?.success) {
+            this._dictation = null;
+            this.speak(`I lost the typing target, Sir, so I stopped voice typing. ${r?.error || ''}`.trim());
+            return true;
+        }
+        d.count++;
+        // Show what was typed and where — the user cannot otherwise verify it.
+        const landed = r.target?.title || d.target.title;
+        this._showTranscript(
+            parsed.kind === 'key' ? `[${parsed.label}] -> ${landed}` : `${parsed.text} -> ${landed}`,
+            'acted', 'TYPED', 6000);
+        return true;
+    }
+
+    async handlePressKey(intent) {
+        const api = window.electronAPI;
+        if (!api?.typeText) { this.speak('Keyboard control is not available here.'); return; }
+        const where = await api.focusedWindow();
+        if (String(where?.process || '').toLowerCase() === 'electron') {
+            this.speak('Focus is on my own window, Sir. Click where you want the keypress to go.');
+            return;
+        }
+        const r = await api.typeText({ encoded: intent.chord });
+        if (!r?.success) { this.speak(`I could not send that key. ${r?.error || ''}`.trim()); return; }
+        const target = r.target?.title || where?.title || 'the active window';
+        this.displayText(`Sent ${intent.spoken} to ${target}`, null);
+        this.speak(`${intent.spoken} sent to ${target}, Sir.`);
+    }
+
+    async handleFocusWindow(name) {
+        const api = window.electronAPI;
+        if (!api?.listWindows) { this.speak('Window control is not available here.'); return; }
+        const list = await api.listWindows();
+        if (!list?.success) { this.speak('I could not enumerate the open windows, Sir.'); return; }
+        const hit = inputControl.matchWindow(list.windows, name);
+        if (!hit) {
+            const open = list.windows.slice(0, 8).map(w => w.desc || w.process).join(', ');
+            this.speak(`I see no open window matching ${name}, Sir. Currently open: ${open}.`);
+            return;
+        }
+        const r = await api.focusWindow({ pid: hit.pid });
+        if (!r?.success) { this.speak(`I could not bring ${hit.desc || hit.process} to the front, Sir.`); return; }
+        this.displayText(`Focused: ${r.focused?.title || hit.title}`, null);
+        this.speak(`${hit.desc || hit.process} is in front, Sir.`);
+    }
+
+    async handleCloseApp(name) {
+        const api = window.electronAPI;
+        if (!api?.listWindows) { this.speak('Window control is not available here.'); return; }
+        const list = await api.listWindows();
+        if (!list?.success) { this.speak('I could not enumerate the open windows, Sir.'); return; }
+        const hit = inputControl.matchWindow(list.windows, name);
+        if (!hit) { this.speak(`${name} does not appear to have an open window, Sir.`); return; }
+        if (String(hit.process).toLowerCase() === 'electron') {
+            this.speak('I will not close my own window, Sir.');
+            return;
+        }
+        const r = await api.closeWindow({ pid: hit.pid });
+        if (!r?.success) { this.speak(`I could not close ${name}, Sir. ${r?.error || ''}`.trim()); return; }
+        // exited=false is the honest case: the app is probably asking to save.
+        this.speak(r.exited
+            ? `${hit.desc || hit.process} is closed, Sir.`
+            : `I asked ${hit.desc || hit.process} to close, Sir, but it is still running. It may be asking you to save.`);
+    }
+
+    async handleFocusedWindow() {
+        const r = await window.electronAPI?.focusedWindow?.();
+        if (!r?.success || !r.title) { this.speak('I cannot read the focused window, Sir.'); return; }
+        const line = `Focus is on ${r.title}${r.process ? ` (${r.process})` : ''}.`;
+        this.displayText(line, null);
+        this.speak(line);
+    }
+
+    /* ---- one-shot spoken confirmation for state-changing actions ----------
+       Armed by a handler, consumed by the NEXT turn only. Kept deliberately
+       narrow: a stale "yes" thirty seconds later must not flip a radio. */
+    _armConfirmation(action, description) {
+        this._pendingConfirm = { action, description, at: Date.now() };
+    }
+
+    /** Returns true if this turn was consumed as an answer to a pending ask. */
+    async _consumeConfirmation(cmd) {
+        const p = this._pendingConfirm;
+        if (!p) return false;
+        this._pendingConfirm = null;            // one shot, whatever the answer
+        if (Date.now() - p.at > 60000) return false;
+
+        const t = String(cmd || '').toLowerCase().trim();
+        const yes = /^(yes|yeah|yep|yup|sure|ok|okay|do it|go ahead|please do|affirmative|switch it on|turn it on|proceed|confirm)\b/.test(t);
+        const no = /^(no|nope|don'?t|cancel|stop|never ?mind|negative|leave it)\b/.test(t);
+        if (!yes && !no) return false;          // unrelated: let normal routing run
+        if (no) { this.speak('Understood, Sir. I will leave it as it is.'); return true; }
+
+        if (p.action === 'bluetooth-on') {
+            this.displayText('Switching Bluetooth on...', null);
+            const r = await window.electronAPI.radioSet({ kind: 'bluetooth', state: 'on' });
+            if (r?.success && r.applied) {
+                this.speak('Bluetooth is on, Sir. Shall I list the paired devices?');
+                this._armConfirmation('bluetooth-list', 'list paired Bluetooth devices');
+            } else {
+                // Never claim success the radio did not report.
+                this.speak(`I could not switch Bluetooth on, Sir. ${r?.error || `the radio still reads ${r?.state || 'unknown'}`}.`);
+            }
+            return true;
+        }
+        if (p.action === 'bluetooth-list') { await this.handleBluetoothDevices(); return true; }
+        if (p.action === 'dictate-start') { await this.handleDictateStart(); return true; }
+        return false;
+    }
+
+    /* Record a deterministic answer so short follow-ups can be answered FROM IT
+       instead of from the model's imagination.
+
+       The log: BT_DEVICES correctly reported one paired device, then "them."
+       and "tell me." fell through to Gemma, which produced "Headphones_XYZ"
+       and "Smartwatch_ABC" — placeholder names it pattern-completed — and then
+       defended them when challenged. */
+    _rememberFactualAnswer(intent, text) {
+        this._lastFactual = { intent, text: String(text || '').slice(0, 1200), at: Date.now() };
+    }
+
+    /** True for "them.", "tell me.", "and?", "go on" — a follow-up carrying no
+     *  new content, which must not be treated as a fresh question. */
+    _isBareFollowUp(cmd) {
+        const t = String(cmd || '').toLowerCase().replace(/[?.!,]+$/, '').trim();
+        if (!t || t.split(/\s+/).length > 4) return false;
+        return /^(them|those|it|that|this|tell me|tell me more|show me|show them|list them|go on|continue|and|and\?|more|what about them|which ones|the names|names)$/.test(t);
+    }
+
+    /* Resolve a name to an address for real. The log contains the failure this
+       replaces: asked for the IP of "pro haven", the model answered
+       "192.168.1.10" — invented. Unresolvable now means unresolvable. */
+    async handleResolveHost(target) {
+        if (!window.electronAPI?.resolveHost) { this.speak('Name resolution is not available here.'); return; }
+        // Speech gives "pro haven"; hostnames have no spaces. Try the spoken
+        // form joined and hyphenated, plus .local for mDNS names.
+        const base = String(target).trim();
+        const variants = [...new Set([
+            base, base.replace(/\s+/g, ''), base.replace(/\s+/g, '-'),
+            `${base.replace(/\s+/g, '-')}.local`, `${base.replace(/\s+/g, '')}.local`,
+        ])].filter(v => /^[a-zA-Z0-9._-]+$/.test(v));
+
+        this.displayText(`Resolving ${base}...`, null);
+        for (const v of variants) {
+            const r = await window.electronAPI.resolveHost({ host: v });
+            if (r?.success && r.found && r.addresses?.length) {
+                const list = r.addresses.map(a => a.address);
+                const line = `${v} resolves to ${list.join(', ')}.`;
+                this.displayText(line, null);
+                this.speak(`${base} resolves to ${list[0]}${list.length > 1 ? `, and ${list.length - 1} more` : ''}, Sir.`);
+                return;
+            }
+        }
+        // Explicitly refuse to produce a number here.
+        const line = `${base} does not resolve to any address from this machine. I tried ${variants.length} name forms including mDNS. If it is a Wi-Fi network rather than a host, it has no IP address for me until I am connected to it — I will not invent one.`;
+        this.displayText(line, null);
+        this.speak(`${base} does not resolve to any address, Sir. If it is a Wi-Fi network rather than a device, it has no IP for me unless I am connected to it. I will not guess a number.`);
+    }
+
+    /* Radio facts for a network in range we are NOT joined to. */
+    async handleWifiNetworkDetail(ssid) {
+        if (!window.electronAPI?.wifiNetworksDetail) { this.speak('Wi-Fi scanning is not available here.'); return; }
+        this.displayText(`Scanning for ${ssid}...`, null);
+        const r = await window.electronAPI.wifiNetworksDetail();
+        if (!r?.success) { this.speak('I could not scan the Wi-Fi radios, Sir.'); return; }
+        const nets = netDiscovery.parseWifiNetworks(r.raw);
+        const hit = netDiscovery.matchNetwork(nets, ssid);
+        if (!hit) {
+            const names = nets.map(n => n.ssid).join(', ');
+            this.displayText(`No network matching "${ssid}" is in range.\nVisible now: ${names || 'none'}`, null);
+            this.speak(`I cannot see a network called ${ssid} from here, Sir. ${nets.length ? `What is visible: ${names}.` : 'No networks are visible at all.'}`);
+            return;
+        }
+        const ap = hit.bssids[0] || {};
+        const lines = hit.bssids.map(b =>
+            `${b.bssid}  ${b.signal != null ? b.signal + '%' : '?'}  ${b.band || ''} ch ${b.channel ?? '?'}  ${b.radio || ''}${b.stations != null ? `  ${b.stations} stations` : ''}`);
+        this.displayText(`${hit.ssid}\nSecurity: ${hit.auth || 'unknown'} (${hit.encryption || 'unknown'})\nAccess points:\n${lines.join('\n')}\n\nNot connected to this network, so it has no IP address from here.`, null);
+        this.speak(`${hit.ssid} is in range, Sir. Signal ${ap.signal ?? 'unknown'} percent, ${ap.band || 'unknown band'}, channel ${ap.channel ?? 'unknown'}, security ${hit.auth || 'unknown'}${hit.bssids.length > 1 ? `, across ${hit.bssids.length} access points` : ''}. I am not connected to it, so it has no IP address from here.`);
+    }
+
+    /* Devices this machine has actually exchanged traffic with on the LAN. */
+    async handleLanDevices() {
+        if (!window.electronAPI?.lanNeighbours) { this.speak('LAN inspection is not available here.'); return; }
+        this.displayText('Reading the neighbour table...', null);
+        const r = await window.electronAPI.lanNeighbours();
+        if (!r?.success) { this.speak('I could not read the neighbour table, Sir.'); return; }
+        const all = netDiscovery.parseArpTable(r.raw);
+        // Virtual adapters (VirtualBox/Hyper-V) are not devices on his network.
+        const real = all.filter(d => !/^192\.168\.56\./.test(d.ip));
+        if (!real.length) { this.speak('No other devices are in the neighbour table right now, Sir.'); return; }
+
+        const named = await Promise.all(real.slice(0, 20).map(async (d) => {
+            const rr = window.electronAPI.networkResolve
+                ? await window.electronAPI.networkResolve({ addresses: [d.ip] }) : null;
+            // No vendor guess: the IEEE OUI registry is not on this machine,
+            // so only what the address itself proves is reported.
+            const f = netDiscovery.macFacts(d.mac);
+            return { ...d, host: rr?.names?.[d.ip] || null, randomised: !!f?.locallyAdministered };
+        }));
+        const lines = named.map(d =>
+            `${d.ip}  ${d.mac}${d.randomised ? '  (randomised MAC)' : ''}${d.host ? `  ${d.host}` : ''}`);
+        this.displayText(`${real.length} devices in the neighbour table:\n${lines.join('\n')}\n\n(From the ARP cache — devices this machine has exchanged traffic with, not an active sweep of the network.)`, null);
+        this.speak(`${real.length} devices are in my neighbour table, Sir${named[0] ? `, including ${named[0].ip}` : ''}. The list is on screen. This is from the address cache, not an active scan of your network.`);
+    }
+
+    /* Bluetooth devices Windows knows about.
+       The radio's POWER STATE is checked first. The log shows this listing
+       paired devices while Bluetooth was switched off, with no mention of it —
+       the PnP tree reports the adapter as "OK" even when the radio is off, so
+       only the WinRT radio state can tell the truth here. */
+    async handleBluetoothDevices() {
+        if (!window.electronAPI?.bluetoothDevices) { this.speak('Bluetooth enumeration is not available here.'); return; }
+        this.displayText('Checking the Bluetooth radio...', null);
+
+        if (window.electronAPI.radioState) {
+            const rs = await window.electronAPI.radioState();
+            const bt = rs?.success ? rs.radios.find(x => String(x.kind).toLowerCase() === 'bluetooth') : null;
+            if (bt && String(bt.state).toLowerCase() !== 'on') {
+                const canSet = rs.access === 'Allowed' && !!window.electronAPI.radioSet;
+                const line = `Bluetooth is turned ${String(bt.state).toLowerCase()}, Sir.` +
+                    (canSet ? ' Shall I switch it on?' : ' I cannot switch it on from here — Windows denied radio access. Say "open bluetooth settings" and I will take you there.');
+                this.displayText(line, null);
+                this.speak(line);
+                // Arm a one-shot confirmation. Nothing is switched until he answers.
+                if (canSet) this._armConfirmation('bluetooth-on', 'switch Bluetooth on');
+                return;
+            }
+            if (!bt && !rs?.success) {
+                // Unknown state is reported as unknown rather than assumed on.
+                this.displayText(`I could not read the Bluetooth radio state (${rs?.error || 'unknown error'}); listing what Windows has paired.`, null);
+            }
+        }
+
+        this.displayText('Reading Bluetooth devices...', null);
+        const r = await window.electronAPI.bluetoothDevices();
+        if (!r?.success) { this.speak('I could not enumerate Bluetooth devices, Sir.'); return; }
+        const devs = netDiscovery.parseBluetoothDevices(r.devices);
+        const paired = devs.filter(d => d.kind === 'device');
+        if (!paired.length) {
+            this.speak('Windows knows no paired Bluetooth devices on this machine, Sir.');
+            return;
+        }
+        const lines = paired.map(d => `${d.connected ? '[connected]' : '[not connected]'}  ${d.name}`);
+        const adapter = devs.find(d => d.kind === 'adapter');
+        this.displayText(
+            `${paired.length} paired Bluetooth devices:\n${lines.join('\n')}` +
+            (adapter ? `\n\nAdapter: ${adapter.name}` : '') +
+            '\n\nThese are devices already paired with Windows. Discovering nearby UNPAIRED devices needs the Windows Runtime radio API, which I cannot reach from here.', null);
+        const conn = paired.filter(d => d.connected);
+        this.speak(
+            `${paired.length} paired Bluetooth devices, Sir` +
+            (conn.length ? `, and ${conn.length === 1 ? `${conn[0].name} is connected` : `${conn.length} are connected`}` : ', none currently connected') +
+            '. These are already-paired devices; I cannot sweep for new unpaired ones from here.');
+    }
+
+    /* =========================
+       ONDO GM TOKENS — tokenized securities, read-only
+       Supply and decimals via eth_call on BOTH chains; 24h mint/redeem flows
+       via bounded keyless eth_getLogs (Ethereum only — free BSC endpoints cap
+       log ranges at ~2h of blocks, which would be presented as a day's flows,
+       so it is refused rather than misstated); holder rankings and issuance
+       history via key-gated Dune. The 1:1 backing is ONDO'S CLAIM and is
+       always attributed as such — the supply and the price are measured. */
+
+    // "$33.3 million" style — spoken dollar figures for measured supply value.
+    _fmtBigUsd(v) {
+        if (!(v > 0)) return null;
+        if (v >= 1e9) return `$${(v / 1e9).toFixed(1)} billion`;
+        if (v >= 1e6) return `$${(v / 1e6).toFixed(1)} million`;
+        return `$${onchain.groupThousands(String(Math.round(v)))}`;
+    }
+
+    async handleOndoQuery(intent) {
+        const api = window.electronAPI;
+        if (!api?.onchainCall) { this.speak('On-chain reads are not available in this environment.'); return; }
+        try {
+            if (intent.kind === 'ondo-catalog') {
+                const hot = ONDO_HOT_LIST.map(t => t.k).join(', ');
+                this.displayText(`Ondo Global Markets: ${ONDO_COUNT} tokenized securities (ERC-20, Ethereum + BNB Chain)\nExamples: ${hot}\nAsk: supply, mint/redeem flows, or top holders of any of them.`, null);
+                this.speak(`I track ${ONDO_COUNT} Ondo tokenized securities on Ethereum and BNB Chain — stocks and ETFs. Ask about the supply, flows, or holders of any of them.`);
+                return;
+            }
+            const tok = intent.ondo;
+            if (!tok) { this.speak('I could not tell which tokenized security you meant.'); return; }
+            if (intent.kind === 'ondo-holders') { await this.handleOndoHolders(tok); return; }
+            if (intent.kind === 'ondo-flows') { await this.handleOndoFlows(tok, intent.days); return; }
+            await this.handleOndoSupply(tok, intent.kind === 'ondo-info');
+        } catch (e) {
+            console.error('Ondo query error:', e);
+            this.speak('That tokenized-security read failed.');
+        }
+    }
+
+    async handleOndoSupply(tok, wantIntro) {
+        const api = window.electronAPI;
+        this.displayText(`Reading ${tok.s} supply on Ethereum and BNB Chain...`, null);
+        const [ethSup, bscSup, decRaw, quote] = await Promise.all([
+            api.onchainCall({ chain: 'ethereum', to: tok.e, data: onchain.SELECTORS.totalSupply }),
+            tok.b ? api.onchainCall({ chain: 'bsc', to: tok.b, data: onchain.SELECTORS.totalSupply }) : Promise.resolve(null),
+            api.onchainCall({ chain: 'ethereum', to: tok.e, data: onchain.SELECTORS.decimals }),
+            api.getQuote ? api.getQuote(tok.k).catch(() => null) : Promise.resolve(null),
+        ]);
+        if (!ethSup?.success && !bscSup?.success) {
+            this.speak(`I could not read the ${tok.s} supply on either chain right now.`);
+            return;
+        }
+        const decimals = decRaw?.success ? Number(onchain.hexToBigInt(decRaw.raw)) : 18;
+        const ethWei = ethSup?.success ? onchain.hexToBigInt(ethSup.raw) : null;
+        const bscWei = bscSup?.success ? onchain.hexToBigInt(bscSup.raw) : null;
+        const total = (ethWei ?? 0n) + (bscWei ?? 0n);
+        const fmt = (wei) => onchain.groupThousands(onchain.formatUnits(wei, decimals, 2));
+
+        const parts = [];
+        if (ethWei !== null) parts.push(`${fmt(ethWei)} on Ethereum`);
+        if (bscWei !== null) parts.push(`${fmt(bscWei)} on BNB Chain`);
+        // A chain that failed to answer is reported unreadable, never as zero.
+        if (ethWei === null) parts.push('Ethereum unreadable right now');
+        if (bscWei === null && tok.b) parts.push('BNB Chain unreadable right now');
+
+        let valueLine = '';
+        if (quote?.success && quote.price > 0) {
+            const usd = this._fmtBigUsd(Number(onchain.formatUnits(total, decimals, 6)) * quote.price);
+            if (usd) valueLine = ` At the current ${tok.k} price of ${this._fmtMoney(quote.price, quote.currency)}, that supply represents approximately ${usd} — the one-to-one backing is Ondo's claim; the supply and the price are measured.`;
+        }
+        const intro = wantIntro ? `${tok.s} is Ondo's tokenized ${tok.n}${tok.t === 'ETF' ? ' ETF' : ''}, an ERC-20 on Ethereum and BNB Chain. ` : '';
+        const line = `${intro}${fmt(total)} ${tok.s} exist — ${parts.join(', ')}.${valueLine}`;
+        this.displayText(line, null);
+        this.speak(line);
+    }
+
+    async handleOndoFlows(tok, days) {
+        const api = window.electronAPI;
+        // A period ("over 30 days", "history") needs an indexer — key-gated Dune.
+        if (days) {
+            this.displayText(`Querying ${tok.s} issuance history (${days} days) via Dune...`, null);
+            const r = await api.duneSupplyHistory({ tokenAddress: tok.e, days });
+            if (r?.needsKey) {
+                this.speak('Issuance history needs a Dune API key. Say: store key dune underscore api underscore key, followed by the key. A free Dune account works.');
+                this.displayText('Needs a Dune API key in the vault:\n  store key dune_api_key <key>\nFree tier at dune.com works.', null);
+                return;
+            }
+            if (!r?.success) { this.speak(`The ${tok.s} issuance-history query failed: ${r?.error || 'unknown error'}.`); return; }
+            const rows = r.rows || [];
+            if (!rows.length) { this.speak(`Dune shows no ${tok.s} mint or redemption events on Ethereum in the last ${days} days.`); return; }
+            const minted = rows.reduce((a, x) => a + (Number(x.minted) || 0), 0);
+            const redeemed = rows.reduce((a, x) => a + (Number(x.redeemed) || 0), 0);
+            const table = rows.slice(0, 10).map(x => `${String(x.day).slice(0, 10)}  +${(Number(x.minted) || 0).toFixed(2)} / -${(Number(x.redeemed) || 0).toFixed(2)}`).join('\n');
+            this.displayText(`${tok.s} issuance, last ${days} days (Ethereum, via Dune${r.cached ? ', cached' : ''}):\nminted ${minted.toFixed(2)}, redeemed ${redeemed.toFixed(2)}\n${table}`, null);
+            this.speak(`Over the last ${days} days on Ethereum, ${tok.s} minted ${minted.toFixed(0)} and redeemed ${redeemed.toFixed(0)} tokens — net ${minted - redeemed >= 0 ? 'issuance' : 'redemption'} of ${Math.abs(minted - redeemed).toFixed(0)}.`);
+            return;
+        }
+
+        // Keyless 24h window via bounded eth_getLogs. Ethereum only: free BSC
+        // endpoints cap log ranges at about two hours of blocks — refusing that
+        // beats speaking two hours of flows as if they were a day.
+        this.displayText(`Scanning ${tok.s} mint and redeem events (~24h, Ethereum)...`, null);
+        const ZERO_TOPIC = '0x' + '0'.repeat(64);
+        const [mints, redeems, decRaw] = await Promise.all([
+            api.onchainLogs({ chain: 'ethereum', address: tok.e, topics: [onchain.TRANSFER_TOPIC, ZERO_TOPIC] }),
+            api.onchainLogs({ chain: 'ethereum', address: tok.e, topics: [onchain.TRANSFER_TOPIC, null, ZERO_TOPIC] }),
+            api.onchainCall({ chain: 'ethereum', to: tok.e, data: onchain.SELECTORS.decimals }),
+        ]);
+        if (!mints?.success || !redeems?.success) {
+            this.speak(`I could not scan the ${tok.s} transfer logs right now.`);
+            return;
+        }
+        const decimals = decRaw?.success ? Number(onchain.hexToBigInt(decRaw.raw)) : 18;
+        const sum = (logs) => logs.reduce((a, l) => { try { return a + BigInt(l.data); } catch { return a; } }, 0n);
+        const mintedWei = sum(mints.logs || []);
+        const redeemedWei = sum(redeems.logs || []);
+        const net = mintedWei - redeemedWei;
+        const fmt = (wei) => onchain.groupThousands(onchain.formatUnits(wei < 0n ? -wei : wei, decimals, 2));
+        const line = (mints.logs.length + redeems.logs.length) === 0
+            ? `No ${tok.s} mint or redemption events on Ethereum in roughly the last 24 hours.`
+            : `Over roughly the last 24 hours on Ethereum, ${tok.s} recorded ${mints.logs.length} mints totaling ${fmt(mintedWei)} and ${redeems.logs.length} redemptions totaling ${fmt(redeemedWei)} — net ${net >= 0n ? 'issuance' : 'redemption'} of ${fmt(net)}.`;
+        this.displayText(`${line}\n(BNB Chain flows not covered: free log endpoints there serve ~2h windows.)`, null);
+        this.speak(line);
+    }
+
+    async handleOndoHolders(tok) {
+        const api = window.electronAPI;
+        this.displayText(`Querying top ${tok.s} holders via Dune...`, null);
+        const r = await api.duneTopHolders({ tokenAddress: tok.e });
+        if (r?.needsKey) {
+            this.speak('Holder rankings need a Dune API key. Say: store key dune underscore api underscore key, followed by the key. A free Dune account works.');
+            this.displayText('Needs a Dune API key in the vault:\n  store key dune_api_key <key>\nFree tier at dune.com works.', null);
+            return;
+        }
+        if (!r?.success) { this.speak(`The ${tok.s} holder query failed: ${r?.error || 'unknown error'}.`); return; }
+        const rows = (r.rows || []).filter(x => x.address);
+        if (!rows.length) { this.speak(`Dune returned no ${tok.s} holders on Ethereum.`); return; }
+        const list = rows.map((x, i) => `${i + 1}. ${onchain.shortAddress(String(x.address))} — ${onchain.groupThousands((Number(x.balance) || 0).toFixed(2))} ${tok.s}`).join('\n');
+        this.displayText(`Top ${tok.s} holders on Ethereum (via Dune${r.cached ? ', cached' : ''}):\n${list}`, null);
+        const top = rows.slice(0, 3).map((x, i) => `number ${i + 1}, ${onchain.shortAddress(String(x.address))} with ${onchain.groupThousands((Number(x.balance) || 0).toFixed(0))}`).join('; ');
+        this.speak(`The top ${tok.s} holders on Ethereum: ${top}. Full list on screen.`);
+    }
+
+    /* USD-priced whale transfers via Dune (key-gated). The local stream sees
+       native-unit values only; dollar framing needs Dune's price joins. */
+    async handleWhaleUsd(intent) {
+        const api = window.electronAPI;
+        if (!api?.duneWhaleTransfers) { this.speak('Dune queries are not available in this environment.'); return; }
+        const duneChain = intent.chain === 'bsc' ? 'bnb' : intent.chain;
+        this.displayText(`Querying transfers over $1M on ${duneChain} (24h) via Dune...`, null);
+        const r = await api.duneWhaleTransfers({ chain: duneChain, minUsd: 1000000, hours: 24 });
+        if (r?.needsKey) {
+            this.speak('Dollar-priced whale flows need a Dune API key. Say: store key dune underscore api underscore key, followed by the key.');
+            this.displayText('Needs a Dune API key in the vault:\n  store key dune_api_key <key>\nFree tier at dune.com works.', null);
+            return;
+        }
+        if (!r?.success) { this.speak(`The whale-transfer query failed: ${r?.error || 'unknown error'}.`); return; }
+        const rows = r.rows || [];
+        if (!rows.length) { this.speak(`Dune shows no transfers over one million dollars on ${duneChain} in the last 24 hours.`); return; }
+        const list = rows.slice(0, 10).map((x, i) =>
+            `${i + 1}. ${this._fmtBigUsd(Number(x.amount_usd) || 0) || '$?'} ${x.symbol || '?'}  ${onchain.shortAddress(String(x.sender || ''))} -> ${onchain.shortAddress(String(x.receiver || ''))}`).join('\n');
+        this.displayText(`Largest transfers, 24h, ${duneChain} (via Dune${r.cached ? ', cached' : ''}):\n${list}`, null);
+        const top = rows[0];
+        this.speak(`${rows.length} transfers over one million dollars on ${duneChain} in the last day. The largest: ${this._fmtBigUsd(Number(top.amount_usd) || 0)} of ${top.symbol || 'an unlabeled token'}. Full list on screen.`);
+    }
+
     /* Cross-chain portfolio: every chain and every known token queried in
        PARALLEL over the existing read-only IPC. Deterministic formatting via
        onchain.js — nothing here is estimated or guessed, and chains that fail
@@ -2265,6 +3494,48 @@ class Jarvis {
             this.speak(cached.spoken + ' From the scan a moment ago.');
             return;
         }
+        // Keyed path first. The keyless scan below can only ask about tokens it
+        // already knows the address of, so it CANNOT see an unlisted holding;
+        // Alchemy returns whatever the wallet actually holds, priced. When no
+        // key is configured (or the call fails) we fall through rather than
+        // fail — a degraded answer beats no answer.
+        if (window.electronAPI?.chainPortfolio) {
+            const keyed = await window.electronAPI.chainPortfolio({ address }).catch(() => null);
+            if (keyed?.success) {
+                const holdings = chainIntel.parseTokenHoldings(keyed.payload, keyed.slugMap || {});
+                if (holdings.length) {
+                    const byChain = new Map();
+                    for (const h of holdings) {
+                        const chainKey = keyed.slugMap?.[h.network]?.chain || h.network;
+                        if (!byChain.has(chainKey)) byChain.set(chainKey, []);
+                        byChain.get(chainKey).push(h);
+                    }
+                    const lines = [`Portfolio for ${short}:`];
+                    for (const [chainKey, rows] of byChain) {
+                        const name = onchain.CHAINS[chainKey]?.name || chainKey;
+                        const bits = rows
+                            .sort((a, b) => (b.valueUsd ?? -1) - (a.valueUsd ?? -1))
+                            .slice(0, 8)
+                            .map(h => `${onchain.groupThousands(h.exact.replace(/\.?0+$/, '') || '0')} ${h.symbol || 'unnamed token'}` +
+                                (h.valueUsd != null ? ` (${chainIntel.formatUsd(h.valueUsd)})` : ''));
+                        lines.push(`${name}: ${bits.join(', ')}`);
+                    }
+                    const { totalUsd, priced } = chainIntel.portfolioTotal(holdings);
+                    if (priced) lines.push(`Total priced value: ${chainIntel.formatUsd(totalUsd)}`);
+                    lines.push(`Source: Alchemy, ${(keyed.networks || []).length} networks.`);
+                    const displayStr = lines.join('\n');
+                    this.displayText(displayStr, null);
+                    const spoken = chainIntel.describePortfolio(holdings);
+                    this.speak(spoken);
+                    this._portfolioCache.set(address.toLowerCase(), { at: Date.now(), display: displayStr, spoken });
+                    return;
+                }
+                // A keyed read that came back genuinely empty is an answer, but
+                // only for the networks the key covers — the keyless scan below
+                // reaches chains Alchemy rejected, so it still runs.
+            }
+        }
+
         this.displayText(`Scanning ${short} across ${Object.keys(onchain.CHAINS).length} chains...`, null);
 
         const scanChain = async (chainKey) => {
@@ -2336,6 +3607,138 @@ class Jarvis {
         }
     }
 
+    /* What chain data Jarvis can actually reach right now. Answers from the
+       startup PROBE, not from a list of chains someone hoped were available —
+       and names the ones that were rejected, so "why can't you read polygon"
+       has a real answer instead of a shrug. */
+    async handleChainCapabilities() {
+        if (!window.electronAPI?.chainProvidersStatus) {
+            this.speak('Provider status is not available in this environment, Sir.');
+            return;
+        }
+        const s = await window.electronAPI.chainProvidersStatus().catch(() => null);
+        if (!s?.success) { this.speak('I could not read the provider status, Sir.'); return; }
+
+        const keyed = Object.keys(s.alchemy?.networks || {});
+        const rejected = Object.entries(s.alchemy?.unavailable || {});
+        const lines = ['Chain data access:'];
+        lines.push(`Keyless public RPC: ${Object.keys(onchain.CHAINS).join(', ')}`);
+        lines.push(`Alchemy key: ${s.alchemy?.keyed ? (keyed.length ? keyed.join(', ') : 'configured, no networks verified') : 'not configured'}`);
+        for (const [chain, why] of rejected) lines.push(`  unavailable — ${chain}: ${why}`);
+        lines.push(`Helius (Solana): ${s.helius?.keyed ? 'configured' : 'not configured'}`);
+        this.displayText(lines.join('\n'), null);
+
+        let spoken;
+        if (!s.alchemy?.keyed && !s.helius?.keyed) {
+            spoken = `No provider keys are configured, Sir. I read ${Object.keys(onchain.CHAINS).length} chains over public endpoints, which covers balances, gas and transactions but not full wallet holdings or Solana.`;
+        } else {
+            spoken = keyed.length
+                ? `With the Alchemy key I have verified access to ${keyed.join(', ')}`
+                : 'The Alchemy key is configured but no networks verified';
+            if (rejected.length) spoken += `. ${rejected.map(([c]) => c).join(' and ')} ${rejected.length === 1 ? 'is' : 'are'} not on the plan`;
+            spoken += s.helius?.keyed ? '. Solana is available through Helius.' : '. Solana is not configured.';
+        }
+        this.speak(spoken);
+    }
+
+    /* Solana holdings via Helius DAS. Everything spoken here is provider-
+       measured — balances, prices and the asset names come off the payload. */
+    async handleSolanaAssets(address) {
+        if (!window.electronAPI?.solanaAssets) { this.speak('Solana reads are not available in this environment, Sir.'); return; }
+        this.displayText(`Reading Solana wallet ${address.slice(0, 4)}...${address.slice(-4)}`, null);
+        const r = await window.electronAPI.solanaAssets({ address }).catch(() => null);
+        if (r?.needsKey) { this.speak('I have no Helius key configured, Sir, so I cannot read Solana. Say: store key helius api key, followed by the key.'); return; }
+        if (!r?.success) { this.speak(`That Solana read failed, Sir. ${r?.error || ''}`.trim()); return; }
+
+        const parsed = chainIntel.parseSolanaAssets(r.payload, { limit: 20 });
+        const lines = [`Solana wallet ${address.slice(0, 6)}...${address.slice(-4)}:`];
+        if (parsed.nativeSol) {
+            lines.push(`SOL: ${parsed.nativeSol.sol.toFixed(6)}` +
+                (parsed.nativeSol.valueUsd != null ? ` (${chainIntel.formatUsd(parsed.nativeSol.valueUsd)})` : ''));
+        }
+        for (const a of parsed.assets) {
+            lines.push(`${a.symbol || a.name || a.id.slice(0, 8)}${a.amount != null ? `: ${a.amount}` : ''} [${a.interface}${a.compressed ? ', compressed' : ''}]`);
+        }
+        this.displayText(lines.join('\n'), null);
+        this.speak(chainIntel.describeSolanaAssets(parsed));
+    }
+
+    /* Recent Solana activity. Helius already returns a human sentence per
+       transaction; speaking it verbatim is grounded provider output, which is
+       exactly the thing the model is forbidden to produce on its own. */
+    async handleSolanaActivity(address) {
+        if (!window.electronAPI?.solanaActivity) { this.speak('Solana reads are not available in this environment, Sir.'); return; }
+        this.displayText(`Reading recent Solana activity...`, null);
+        const r = await window.electronAPI.solanaActivity({ address, limit: 10 }).catch(() => null);
+        if (r?.needsKey) { this.speak('I have no Helius key configured, Sir, so I cannot read Solana history.'); return; }
+        if (!r?.success) { this.speak(`That Solana history read failed, Sir. ${r?.error || ''}`.trim()); return; }
+
+        const items = chainIntel.parseSolanaActivity(r.payload, { limit: 10 });
+        const lines = [`Recent Solana activity for ${address.slice(0, 6)}...${address.slice(-4)}:`];
+        for (const i of items) {
+            lines.push(`${new Date(i.timestamp || 0).toLocaleString()} — ${i.type}${i.description ? `: ${i.description}` : ''}`);
+        }
+        this.displayText(lines.join('\n'), null);
+        this.speak(chainIntel.describeSolanaActivity(items));
+    }
+
+    /* What can honestly be said about an address, in descending order of
+       strength. Every field is measured on-chain or comes from the user's own
+       watchlist — there is no entity guessing here, which is why an unknown
+       address stays an unknown address instead of becoming "Binance".
+
+       Cached for the session: whale blocks repeat the same hot addresses, and
+       each lookup is 3 RPC reads. */
+    async describeAddress(address) {
+        if (!address) return { address: null, name: 'a contract creation', facts: [] };
+        const key = address.toLowerCase();
+        this._addrFacts = this._addrFacts || new Map();
+        if (this._addrFacts.has(key)) return this._addrFacts.get(key);
+
+        const [ensName, code, txc, bal] = await Promise.all([
+            this.reverseEns(address).catch(() => null),
+            window.electronAPI.onchainCode?.({ chain: 'ethereum', address }).catch(() => null),
+            window.electronAPI.onchainTxCount?.({ chain: 'ethereum', address }).catch(() => null),
+            window.electronAPI.onchainBalance?.({ chain: 'ethereum', address }).catch(() => null),
+        ]);
+
+        const facts = [];
+        const isContract = code?.success ? code.isContract : null;
+        if (isContract === true) facts.push('a contract');
+        else if (isContract === false) facts.push('a wallet');
+        // Nonce means "transactions sent" for a wallet but "contracts deployed"
+        // for a contract — the live drill printed "a contract with 1 outgoing
+        // transactions", which is not what that number means. Only wallets get it.
+        if (isContract === false && txc?.success && Number.isFinite(txc.count)) {
+            facts.push(`${onchain.groupThousands(String(txc.count))} transactions sent`);
+        }
+        if (bal?.success) {
+            const eth = onchain.formatEther(bal.wei, 2);
+            if (parseFloat(eth) > 0) facts.push(`holding ${onchain.groupThousands(eth)} ETH`);
+        }
+
+        const info = {
+            address,
+            // ENS is on-chain identity: the address itself claims that name.
+            name: ensName || onchain.shortAddress(address),
+            ensName: ensName || null,
+            isContract,
+            txCount: txc?.success ? txc.count : null,
+            facts,
+        };
+        this._addrFacts.set(key, info);
+        return info;
+    }
+
+    /** "0x28c6…ae44, a wallet with 1,204 transactions" — spoken form. */
+    _partyPhrase(info, preLabel) {
+        // A label from main (user watchlist or an attributed source) outranks
+        // anything derived: the user named this address themselves.
+        const base = preLabel && !/^0x/.test(preLabel) ? preLabel : info.name;
+        if (!info.facts.length) return base;
+        return `${base}, ${info.facts.slice(0, 2).join(' with ')}`;
+    }
+
     async handleWatchAddress(address, short) {
         const r = await window.electronAPI.chainWatchlistAdd({ address, label: short !== onchain.shortAddress(address) ? short : null });
         if (!r?.success) { this.speak(`I could not add ${short} to the watch list.`); return; }
@@ -2367,8 +3770,120 @@ class Jarvis {
         const r = await window.electronAPI.chainStreamStart({});
         this._whaleAlertsOn = true;
         this.speak(r?.success
-            ? 'Whale monitoring is live, Sir. I will announce native transfers of one hundred ETH or more as blocks confirm on Ethereum.'
+            ? 'Whale monitoring is live, Sir. I will announce transfers of one hundred ETH or more, and stablecoin or wrapped-token movements above one million dollars, as blocks confirm on Ethereum. For each one I will tell you the amount, both addresses, and whatever the chain itself says about them.'
             : 'I could not start the chain stream.');
+    }
+
+    /* A chain the whale stream does not cover. His log shows the alternative:
+       "give me whale alerts of solana" reached the model, which reported
+       starting a search, then reported it complete, then reported no results —
+       three fabrications about work that never happened. Saying what is and is
+       not monitored costs one sentence and is true. */
+    async handleWhaleUnsupported(askedChain) {
+        const names = { solana: 'Solana', bitcoin: 'Bitcoin', polygon: 'Polygon' };
+        const name = names[askedChain] || askedChain;
+        const why = {
+            // Measured, not assumed: the Helius socket delivered 239 token-program
+            // events in 15 seconds. Filtering that on this machine is a different
+            // kind of build, not a flag I can flip.
+            solana: 'Solana emits token events far too fast to scan whole-network on this machine — I measured over two hundred in fifteen seconds. What I can do on Solana right now is read any wallet you name, its recent activity, and USDC and USDT supply.',
+            bitcoin: 'Bitcoin is a different data source entirely and I am not connected to one.',
+            polygon: 'My Alchemy key does not cover Polygon — it returns a plan error, so I have no reliable feed for it.',
+        }[askedChain] || 'I have no feed for that chain.';
+        const line = `I do not monitor whales on ${name}, Sir. ${why} My whale stream is Ethereum only: transfers over one hundred ETH, and stablecoin or wrapped-token movements over one million dollars.`;
+        this.displayText(line, null);
+        this.speak(line);
+    }
+
+    /* "Whales in the last hour" — answered from the recorded alert history, so
+       the window covers what was actually observed while watching, never an
+       impression. If the stream was not running, that is what gets said. */
+    async handleWhaleWindow(text) {
+        if (!window.electronAPI?.chainAlertsSummary) { this.speak('Alert history is not available here.'); return; }
+        const m = String(text).match(/\b(last|past)\s+(\d+)?\s*(minute|min|hour|hr)/i);
+        const n = m && m[2] ? parseInt(m[2], 10) : (m && /hour|hr/i.test(m[3]) ? 1 : 5);
+        const minutes = m && /hour|hr/i.test(m[3]) ? n * 60 : n;
+        const s = await window.electronAPI.chainAlertsSummary({ sinceMs: minutes * 60 * 1000 });
+        if (!s?.success) { this.speak('I could not read the alert history, Sir.'); return; }
+
+        const label = minutes >= 60 ? `${Math.round(minutes / 60)} hour${minutes >= 120 ? 's' : ''}` : `${minutes} minutes`;
+        if (!s.whaleCount && !s.watchCount && !s.issuanceCount) {
+            this.speak(s.streaming
+                ? `Nothing above my thresholds in the last ${label}, Sir. I am watching.`
+                : `I have no record for the last ${label}, Sir — the chain stream is not running, so nothing was observed.`);
+            return;
+        }
+        const parts = [];
+        for (const [sym, v] of Object.entries(s.byAsset || {})) {
+            parts.push(`${v.count} ${sym} movement${v.count === 1 ? '' : 's'}${v.totalUsd ? ` worth ${this._fmtBigUsd(v.totalUsd)}` : ''}`);
+        }
+        let spoken = `In the last ${label}, Sir: ${parts.join(', ') || `${s.whaleCount} movements`}.`;
+        if (s.largest) {
+            spoken += ` Largest: ${s.largest.amount} ${s.largest.asset || 'ETH'}${s.largest.usd ? `, ${this._fmtBigUsd(s.largest.usd)}` : ''}.`;
+        }
+        if (s.issuanceCount) spoken += ` ${s.issuanceCount} stablecoin mint or burn events.`;
+        this.displayText([`Chain activity, last ${label}:`, ...parts.map(p => `  ${p}`),
+            s.largest ? `  Largest: ${s.largest.amount} ${s.largest.asset || 'ETH'} — tx ${s.largest.hash || 'n/a'}` : null].filter(Boolean).join('\n'), null);
+        this.speak(spoken);
+    }
+
+    /* Stablecoin issuance. A mint is a Transfer from the zero address and a
+       burn is one to it — supply changes are on-chain fact, so this needs no
+       label database. Who ASKED for the mint is not on chain, and is not
+       claimed. */
+    async handleIssuance() {
+        if (!window.electronAPI?.chainIssuance) { this.speak('Issuance reads are not available here, Sir.'); return; }
+        this.displayText('Reading stablecoin mints and burns...', null);
+        const r = await window.electronAPI.chainIssuance({ chain: 'ethereum', spanBlocks: 300 });
+        if (!r?.success) { this.speak(`I could not read issuance activity, Sir. ${r?.error || ''}`.trim()); return; }
+
+        // Partial coverage is stated, not smoothed over: "nothing happened" and
+        // "I could only read part of the window" are different answers.
+        const caveat = r.partial
+            ? ` I could only read ${r.coverage} of the window — the free endpoints refused the rest, so this covers roughly ${r.approxMinutes} of the last ${r.requestedMinutes} minutes.`
+            : '';
+        const syms = Object.entries(r.summary || {});
+        if (!syms.length) {
+            this.speak(`No stablecoin mints or burns above one hundred thousand in roughly the last ${r.approxMinutes} minutes on Ethereum, Sir.${caveat}`);
+            return;
+        }
+        const fmt = (n) => this._fmtBigUsd(n).replace('$', '');
+        const lines = [`Stablecoin issuance, last ~${r.approxMinutes} minutes on Ethereum (blocks ${r.fromBlock}-${r.toBlock}):`];
+        const spokenParts = [];
+        for (const [sym, v] of syms) {
+            lines.push(`${sym}: ${v.mints} mints totalling ${fmt(v.minted)}, ${v.burns} burns totalling ${fmt(v.burned)} — net ${v.net >= 0 ? '+' : ''}${fmt(Math.abs(v.net))}`);
+            spokenParts.push(`${sym} saw ${fmt(v.minted)} minted and ${fmt(v.burned)} burned, a net ${v.net >= 0 ? 'increase' : 'decrease'} of ${fmt(Math.abs(v.net))}`);
+        }
+        for (const e of (r.events || []).slice(0, 5)) {
+            lines.push(`  ${e.kind.toUpperCase()} ${e.amount} ${e.symbol} — ${e.kind === 'mint' ? 'to' : 'from'} ${e.counterparty} (block ${e.blockNumber})`);
+        }
+        this.displayText(lines.join('\n'), null);
+        this.speak(`Over roughly the last ${r.approxMinutes} minutes on Ethereum, Sir: ${spokenParts.join('. ')}. Supply changes are measured on chain; who requested them is not something the chain records.${caveat}`);
+    }
+
+    /* Solana stablecoin supply. Read from the mint account itself — exact, and
+       the delta between two readings is a mint or a burn. */
+    async handleSolanaSupply() {
+        if (!window.electronAPI?.solanaSupply) { this.speak('Solana reads are not available here, Sir.'); return; }
+        const r = await window.electronAPI.solanaSupply({});
+        if (r?.needsKey) { this.speak('I have no Helius key configured, Sir, so I cannot read Solana.'); return; }
+        if (!r?.success || !Object.keys(r.supplies || {}).length) { this.speak('I could not read Solana stablecoin supply, Sir.'); return; }
+
+        this._solSupply = this._solSupply || {};
+        const lines = ['Solana stablecoin supply:'];
+        const spoken = [];
+        for (const [sym, v] of Object.entries(r.supplies)) {
+            const prev = this._solSupply[sym];
+            // A delta is only meaningful against a reading I actually took.
+            const delta = prev ? v.amount - prev.amount : null;
+            lines.push(`${sym}: ${v.amount.toLocaleString('en-US', { maximumFractionDigits: 0 })}` +
+                (delta ? ` (${delta > 0 ? '+' : ''}${delta.toLocaleString('en-US', { maximumFractionDigits: 0 })} since my last reading)` : ''));
+            spoken.push(`${sym} supply on Solana is ${this._fmtBigUsd(v.amount).replace('$', '')}` +
+                (delta ? `, ${delta > 0 ? 'up' : 'down'} ${this._fmtBigUsd(Math.abs(delta)).replace('$', '')} since I last checked` : ''));
+            this._solSupply[sym] = v;
+        }
+        this.displayText(lines.join('\n'), null);
+        this.speak(spoken.join('. ') + '.');
     }
 
     // "Show whale activity today" — read back what was actually recorded in the
@@ -2942,13 +4457,18 @@ class Jarvis {
         // First words out is the latency the user actually perceives; everything
         // after this lands while they are already listening.
         perf.markFirstWord();
-        this._turnResponse = ((this._turnResponse || '') + ' ' + text).trim();
+        // Appends to whichever turn is current WHEN THE WORDS ARE SPOKEN. A
+        // superseded turn's own buffer is held by reference in processCommand,
+        // so late speech can no longer be attributed to the wrong input.
+        if (this._activeBuffer) {
+            this._activeBuffer.text = (this._activeBuffer.text + ' ' + text).trim();
+        }
     }
 
     // Append one local turn to the persistent interaction log. Best-effort and
     // fully guarded — telemetry must never break or slow a turn. Secret-bearing
     // commands are dropped here so a key never reaches disk via this path.
-    _logInteraction(input, intent, startedAt, ok) {
+    _logInteraction(input, intent, startedAt, ok, buf) {
         try {
             if (!window.electronAPI?.logInteraction) return;
             const name = (intent && intent.intent) || 'AI';
@@ -2960,7 +4480,7 @@ class Jarvis {
                 intent: name,
                 latencyMs: Date.now() - startedAt,
                 ok: ok !== false,
-                response: String(this._turnResponse || '').slice(0, 500),
+                response: String((buf ? buf.text : this._activeBuffer?.text) || '').slice(0, 500),
                 // Per-stage breakdown: which command is slow was already
                 // answerable; this says where inside it the time went.
                 stages: profile ? profile.stages : undefined,
@@ -3025,6 +4545,15 @@ class Jarvis {
             return;
         }
 
+        // Bare numbers are almost always the mic hearing Jarvis's own spoken
+        // figures — the word-overlap echo guard needs 3+ words so it can't
+        // catch them. Real log: Jarvis said "beta is 1.75", the mic fed back
+        // "1.75" as a user turn, and Gemma answered it with an invented price.
+        if (/^[\d\s.,:%$-]+$/.test(cmd)) {
+            this._showTranscript(t, 'ambient', 'HEARD (number only - ignored)', 2500);
+            return;
+        }
+
         // ECHO GUARD: the ttsActive gate is necessary but not sufficient —
         // SAPI audio bypasses Chromium's AEC, and the tail of an utterance can
         // land after the flag clears. Real logs show Jarvis's own words coming
@@ -3033,6 +4562,15 @@ class Jarvis {
         // talking to itself. Compare against what was recently spoken.
         if (this._isEchoOfSelf(cmd)) {
             this._showTranscript(t, 'ambient', 'ECHO IGNORED', 2500);
+            return;
+        }
+
+        // VOICE TYPING owns the transcript while it is active: the words are
+        // the user's text, not commands for the model. Checked after the echo
+        // guard so Jarvis's own speech is never dictated into the document.
+        if (this._dictation) {
+            this._lastInputWasVoice = true;
+            this.handleDictationTranscript(cmd);
             return;
         }
 
@@ -3174,15 +4712,55 @@ class Jarvis {
                         const late = w.backfilled ? ' (recovered from a missed block)' : '';
                         if (w.summary) {
                             const usd = w.largestUsd ? ` (about ${w.largestUsd.toLocaleString('en-US')} dollars)` : '';
-                            const line = `${w.count} further large transfers in block ${w.blockNumber}, the largest ${w.largestAmount} ETH${usd}.`;
+                            const line = `${w.count} further large transfers in block ${w.blockNumber}, the largest ${w.largestAmount} ${w.largestAsset || 'ETH'}${usd}.`;
                             this.displayText(`Whale summary: ${line}${late}`, null);
                             if (this._whaleAlertsOn) this.speak(`Also, ${line}`);
                             break;
                         }
+                        // Both ends of the movement, described from measured
+                        // on-chain facts. Screen gets the full addresses and the
+                        // tx hash; speech gets the readable form, because a
+                        // 42-character hex string is unusable as audio.
+                        const [fromInfo, toInfo] = await Promise.all([
+                            this.describeAddress(w.from),
+                            this.describeAddress(w.to),
+                        ]);
+                        const asset = w.asset || 'ETH';
                         const usd = w.usd ? `, approximately ${w.usd.toLocaleString('en-US')} dollars,` : '';
-                        const line = `${w.amount} ETH${usd} moved from ${w.fromLabel} to ${w.toLabel} in block ${w.blockNumber}.`;
-                        this.displayText(`Whale alert: ${line}${late}`, null);
-                        if (this._whaleAlertsOn) this.speak(`Sir, significant movement on Ethereum. ${line}`);
+                        // A multi-hop route is one movement taking a path, and a
+                        // round trip is money that ended up back where it began —
+                        // saying "moved from A to B" for either would misdescribe it.
+                        const route = w.hops > 1 ? ` It took ${w.hops} hops inside one transaction${w.roundTrip ? ', and returned to where it started' : ''}.` : '';
+                        const spokenLine = `${w.amount} ${asset}${usd} moved from ${this._partyPhrase(fromInfo, w.fromLabel)} to ${this._partyPhrase(toInfo, w.toLabel)} in block ${w.blockNumber}.${route}`;
+
+                        const detail = [
+                            `Whale alert — ${w.amount} ${asset}${w.usd ? ` ($${w.usd.toLocaleString('en-US')})` : ''} on ${w.chain || 'ethereum'}${late}`,
+                            w.hops > 1 ? `ROUTE ${w.hops} hops in one transaction${w.roundTrip ? ' (round trip)' : ''}` : null,
+                            `FROM ${w.from || 'contract creation'}${fromInfo.ensName ? ` (${fromInfo.ensName})` : ''}${fromInfo.facts.length ? ` — ${fromInfo.facts.join(', ')}` : ''}`,
+                            `TO   ${w.to || 'contract creation'}${toInfo.ensName ? ` (${toInfo.ensName})` : ''}${toInfo.facts.length ? ` — ${toInfo.facts.join(', ')}` : ''}`,
+                            w.contract ? `TOKEN ${asset} at ${w.contract}` : null,
+                            `TX   ${w.hash}`,
+                            `Block ${w.blockNumber}`,
+                        ].filter(Boolean).join('\n');
+                        this.displayText(detail, null);
+                        if (this._whaleAlertsOn) this.speak(`Sir, significant movement on ${w.chain === 'ethereum' || !w.chain ? 'Ethereum' : w.chain}. ${spokenLine}`);
+                        break;
+                    }
+
+                    case 'stablecoin-issuance': {
+                        /* Supply changed. This is a different event from money
+                           moving, and often the more meaningful one — but the
+                           chain records only WHAT happened, not who asked for
+                           it, so no issuer is named as the actor. */
+                        const e = evt.payload;
+                        const verb = e.kind === 'mint' ? 'minted into' : 'burned from';
+                        const line = `${e.amount} ${e.symbol} was ${verb} circulation in block ${e.blockNumber}.`;
+                        this.displayText([
+                            `Stablecoin ${e.kind.toUpperCase()} — ${e.amount} ${e.symbol} on ${e.chain}`,
+                            `${e.kind === 'mint' ? 'TO  ' : 'FROM'} ${e.counterparty}`,
+                            `TX   ${e.hash}`,
+                        ].join('\n'), null);
+                        if (this._whaleAlertsOn) this.speak(`Sir, stablecoin supply change. ${line}`);
                         break;
                     }
 
@@ -3193,8 +4771,14 @@ class Jarvis {
                         const verb = h.direction === 'out' ? 'sent' : 'received';
                         const other = h.direction === 'out' ? 'to' : 'from';
                         const usd = h.usd ? ` — roughly ${h.usd.toLocaleString('en-US')} dollars` : '';
-                        const line = `${h.label} just ${verb} ${h.amount} ETH ${other} ${h.counterparty} in block ${h.blockNumber}${usd}.`;
-                        this.displayText(`Watched address: ${line}`, null);
+                        const cpInfo = await this.describeAddress(h.counterpartyAddress);
+                        const line = `${h.label} just ${verb} ${h.amount} ${h.asset || 'ETH'} ${other} ${this._partyPhrase(cpInfo, h.counterparty)} in block ${h.blockNumber}${usd}.`;
+                        this.displayText([
+                            `Watched address ${h.direction === 'out' ? 'SENT' : 'RECEIVED'} ${h.amount} ${h.asset || 'ETH'}${h.usd ? ` ($${h.usd.toLocaleString('en-US')})` : ''}`,
+                            `WATCHED ${h.watched}`,
+                            `${h.direction === 'out' ? 'TO  ' : 'FROM'} ${h.counterpartyAddress || 'unknown'}${cpInfo.ensName ? ` (${cpInfo.ensName})` : ''}${cpInfo.facts.length ? ` — ${cpInfo.facts.join(', ')}` : ''}`,
+                            `TX   ${h.hash}`,
+                        ].join('\n'), null);
                         this.speak(`Sir, your watched wallet has activity. ${line}`);
                         break;
                     }
@@ -3567,6 +5151,20 @@ class Jarvis {
 
         // Live web grounding: for search-shaped questions, fetch keyless
         // DuckDuckGo results and let Gemma answer from them with sources.
+        /* A bare follow-up ("them.", "tell me.") right after a measured answer
+           must be answered FROM that answer. Without this the model has only
+           the conversation and invents plausible content — the log shows it
+           producing "Headphones_XYZ" and "Smartwatch_ABC" after a real
+           Bluetooth listing, then defending them when challenged. */
+        let factContext = '';
+        if (this._lastFactual && Date.now() - this._lastFactual.at < 180000) {
+            const bare = this._isBareFollowUp(query);
+            factContext = `\n\nThe last factual answer you gave, produced by a real measurement on this machine, was:\n"${this._lastFactual.text}"\n`
+                + (bare
+                    ? 'The user is asking you to elaborate on THAT answer. Restate or expand it using ONLY the facts in it. If it does not contain what he is asking for, say the measurement did not include that and offer to run it again. Do not add any name, number or item that is not in it.'
+                    : 'Use it if relevant, but never add items to it.');
+        }
+
         let webContext = '';
         const needsWeb = /\b(search|look up|google|news|latest|current|today|yesterday|price of|who is|what is|happening|weather in)\b/i.test(query);
         if (needsWeb && window.electronAPI?.webSearch) {
@@ -3614,7 +5212,13 @@ class Jarvis {
                     // treating that noise as meaningful and inventing theories
                     // about "system probing" and "diagnostic loops".
                     + ' Your input comes from speech recognition and may be garbled or incomplete. If a message is unclear, briefly ask what he meant. Never speculate about system probing, diagnostics, repeated input, or your own internal state.'
-                    + sysContext + memoryContext + webContext
+                    // Logged fabrication: asked for the IP of a host called
+                    // "pro haven" the model answered "192.168.1.10". Nothing
+                    // resolved it; the address was invented and stated as fact.
+                    // Concrete identifiers are the highest-harm thing to guess,
+                    // because he acts on them.
+                    + ' NEVER state a specific IP address, MAC address, port number, hostname, price, balance, device name, network name, or any other concrete measured value unless it appears verbatim in the context above. You have no ability to look these up or scan for them while answering. If you do not have the value, say you do not have it and stop — a plausible-looking number or a placeholder name is worse than no answer. Never invent example names such as "Device_XYZ".'
+                    + sysContext + memoryContext + webContext + factContext
             },
             ...history,
             { role: 'user', content: query }
@@ -3625,8 +5229,43 @@ class Jarvis {
         // time-to-first-word from ~5-10s to ~1-2s.
         let displayed = '';
         let spokenUpTo = 0;
+
+        /* GROUNDING: everything the model was actually given. Any concrete
+           identifier it emits must appear in here verbatim or it is invented.
+           The prompt already forbids this and the model does it anyway (see
+           groundingGuard.js for the logged cases), so the rule is enforced on
+           the way OUT, per sentence, before anything is spoken. */
+        const groundingContext = [sysContext, memoryContext, webContext, factContext,
+            history.map(h => h.content).join('\n'), query].join('\n');
+        let tainted = false;
+
+        // Guard one sentence. Returns false once the answer is tainted, which
+        // stops the rest of a fabricating response from reaching the speaker.
+        const speakGuarded = (sentence) => {
+            if (tainted) return false;
+            const g = guardOutput(sentence, groundingContext);
+            if (!g.blocked) { this._speakQueued(sentence); return true; }
+
+            tainted = true;
+            console.warn('Grounding guard blocked ungrounded output:',
+                g.found.map(f => `${f.kind}=${f.value}`).join(', '));
+            this._speakQueued(g.text);
+            this.displayText(`${displayed}\n\n[blocked: ${g.found.map(f => f.value).join(', ')} — not present in any measurement]`, null);
+            /* Store the refusal, never the fabrication. When the invention was
+               allowed into history the model quoted it back as established fact
+               on the next turn and defended it when challenged. */
+            this.memory.addMessage('assistant', g.text);
+            return false;
+        };
+
+        // This turn's cancellation token, captured now: if a newer turn arrives
+        // it replaces this._turnAbort, but the signal handed to the generator
+        // stays bound to this turn and aborts it.
+        const signal = this._turnAbort?.signal;
+
         try {
             const fullText = await generateContentLocal(messages, (chunk) => {
+                if (tainted) return;
                 displayed += chunk;
                 this.displayText(displayed, null);
 
@@ -3635,17 +5274,36 @@ class Jarvis {
                 const m = pending.match(/^[\s\S]*?[.!?](?=\s|$)/);
                 if (m && m[0].trim().length > 1) {
                     spokenUpTo += m[0].length;
-                    this._speakQueued(m[0]);
+                    speakGuarded(m[0]);
                 }
-            });
+            }, { signal });
             // Speak whatever remains after the stream ends
             const tail = displayed.slice(spokenUpTo).trim();
-            if (tail) this._speakQueued(tail);
-            this.memory.addMessage('assistant', fullText);
+            if (tail) speakGuarded(tail);
+            if (!tainted) this.memory.addMessage('assistant', fullText);
         } catch (error) {
             console.error('Local AI error:', error);
-            this.speak('Local inference failed. ' + error.message);
+            this.speak(this._describeLocalFailure(error));
         }
+    }
+
+    /* Turn a local-inference failure into something worth hearing. The raw
+       error was spoken verbatim — "Ollama error 500: is 'gemma3:4b' pulled?
+       Try: ollama pull gemma3:4b" — which is a developer's message read aloud
+       to a user whose real problem was that the machine sat at 97% memory and
+       the model was being evicted. */
+    _describeLocalFailure(error) {
+        const msg = String(error?.message || error || '');
+        if (error?.name === 'LocalTimeoutError' || /stalled|produced nothing/i.test(msg)) {
+            return 'The local model did not respond in time, Sir. It is usually memory pressure — closing a few Chrome tabs normally fixes it. Ask me again when you are ready.';
+        }
+        if (/50\d/.test(msg)) {
+            return 'The local model failed to load, Sir. That is normally low memory. I have left the request alone rather than guess an answer.';
+        }
+        if (/fetch|network|ECONNREFUSED|Failed to fetch/i.test(msg)) {
+            return 'I cannot reach the local model server, Sir. Ollama does not appear to be running.';
+        }
+        return 'Local inference failed, Sir, so I have no answer for that rather than an invented one.';
     }
 
     // Queued speech for streaming answers: does NOT cancel prior utterances

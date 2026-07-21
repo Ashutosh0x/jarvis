@@ -132,7 +132,13 @@ function createBlockTracker(opts = {}) {
  * beyond that becomes a single summary carrying the count and the largest
  * remaining transfer, so a burst block costs one sentence, not twelve.
  *
- * @param {Array<{valueWei:string}>} whales
+ * Ordering across ASSETS (100 ETH versus 4,000,000 USDC) cannot be done on raw
+ * units — they are different scales of different things. So a measured USD
+ * value wins when present, and raw units are the fallback only among alerts
+ * that have no price, where they are at least same-asset comparable. Ties break
+ * on the tx hash so a burst block announces the same order every time.
+ *
+ * @param {Array<{valueWei?:string, raw?:string, usd?:number|null, hash?:string}>} whales
  * @param {{maxSpoken?: number}} [opts]
  * @returns {{speak: Array, summary: null | {count:number, largest:object}}}
  */
@@ -140,9 +146,17 @@ function prioritizeAlerts(whales, opts = {}) {
     const maxSpoken = opts.maxSpoken ?? 2;
     if (!Array.isArray(whales) || !whales.length) return { speak: [], summary: null };
 
+    const units = (x) => { try { return BigInt(x.valueWei ?? x.raw ?? '0'); } catch { return 0n; } };
     const sorted = [...whales].sort((a, b) => {
-        const av = BigInt(a.valueWei || '0'), bv = BigInt(b.valueWei || '0');
-        return av === bv ? 0 : (av > bv ? -1 : 1);
+        const au = Number.isFinite(a.usd) ? a.usd : null;
+        const bu = Number.isFinite(b.usd) ? b.usd : null;
+        if (au !== null && bu !== null && au !== bu) return bu - au;
+        // A priced alert is of known size; an unpriced one is not. Known first.
+        if (au !== null && bu === null) return -1;
+        if (au === null && bu !== null) return 1;
+        const av = units(a), bv = units(b);
+        if (av !== bv) return av > bv ? -1 : 1;
+        return String(a.hash || '').localeCompare(String(b.hash || ''));
     });
     if (sorted.length <= maxSpoken) return { speak: sorted, summary: null };
     const speak = sorted.slice(0, maxSpoken);

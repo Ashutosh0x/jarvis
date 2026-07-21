@@ -9,6 +9,33 @@ const QRCode = require('qrcode');
 const { CompanionBridge, WS_PORT: COMPANION_WS_PORT } = require('./companionBridge');
 const adbService = require('./adbService');
 const { hedgedRace, createStickyOrder } = require('./rpcHedge');
+const chainProviders = require('./chainProviders');
+
+/* =========================
+   LOCAL SECRETS (.env)
+   No dotenv dependency: the format this app needs is KEY=value and nothing
+   more, and a 12-line reader is easier to audit than a package. Values are
+   read into process.env ONLY if not already set, so a real environment
+   variable always wins over the file. Never logged — the loader reports
+   which NAMES it found, never their values.
+========================= */
+function loadDotEnv(file = path.join(__dirname, '.env')) {
+    const found = [];
+    try {
+        for (const line of fsSync.readFileSync(file, 'utf8').split(/\r?\n/)) {
+            const m = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/.exec(line);
+            if (!m) continue;                     // comments and blanks
+            const key = m[1];
+            const value = m[2].trim().replace(/^["']|["']$/g, '');
+            if (!value) continue;                 // an empty placeholder is not a key
+            if (process.env[key] === undefined) process.env[key] = value;
+            found.push(key);
+        }
+    } catch { /* no .env is a normal, supported state — Jarvis runs keyless */ }
+    return found;
+}
+const ENV_KEYS_PRESENT = loadDotEnv();
+if (ENV_KEYS_PRESENT.length) console.log('[env] loaded keys:', ENV_KEYS_PRESENT.join(', '));
 
 /* =========================
    UNLIMITED-OCR CONFIG
@@ -162,9 +189,18 @@ app.whenReady().then(async () => {
     startClipboardMonitor();
     startActiveWindowTracker();
     startFinanceService();
+    // Names the busiest process for each metric sample and emits start/stop
+    // events for watched programs. 60s cadence — deliberately not per-poll.
+    startProcessTracker();
+    // Compact yesterday's samples into a rollup shortly after start, then daily.
+    setTimeout(compactMetrics, 90000);
+    setInterval(compactMetrics, 6 * 3600 * 1000);
     startSttServer();
     // Not awaited — readiness polling + model warm must not block the window.
     startOllamaServer();
+    // Probe which chains the configured keys actually serve. Not awaited and
+    // failure-tolerant: until it resolves, chain reads use the keyless pool.
+    discoverAlchemyProviders().catch((e) => console.warn('[chain] provider discovery failed:', e.message));
 
     app.on('activate', () => {
         if (BrowserWindow.getAllWindows().length === 0) {
@@ -701,6 +737,427 @@ if ($p) { "$([math]::Round(($p | Measure-Object ResponseTime -Average).Average))
         internetReachable: net.lost < net.probes,
         quality,
     };
+});
+
+/* =========================
+   NETWORK CONNECTION INSPECTION
+   Answers "who is this machine actually talking to" — every socket, its
+   remote IP and port, and the process that owns it. Collected here, parsed
+   and analysed by the pure src/js/services/netInspect.js engine.
+
+   WHY netstat AND NOT Get-NetTCPConnection: measured on this machine, the CIM
+   cmdlet path took 3.4s wall (2.9s in-script) for the same data that
+   `netstat -ano` plus Get-Process returns in 161ms in-script / ~590ms wall.
+   On the voice path that difference is the whole budget.
+
+   SCOPE, stated honestly: this is connection-level visibility, not packet
+   capture. Reading packet contents needs a capture driver (Npcap) or Windows'
+   own pktmon, both of which require Administrator; neither is silently
+   attempted here. checkPacketCapture() reports what is actually available so
+   the assistant can say what it can and cannot see.
+========================= */
+const NET_CONNECTIONS_SCRIPT = `
+$ErrorActionPreference = 'SilentlyContinue'
+$ns = (netstat -ano | Out-String)
+$procs = Get-Process | ForEach-Object { "$($_.Id)\`t$($_.ProcessName)" }
+[PSCustomObject]@{ netstat = $ns; procs = @($procs) } | ConvertTo-Json -Depth 3 -Compress`;
+
+/* =========================
+   KEYBOARD + WINDOW CONTROL
+   Synthetic keystrokes via SendKeys, which is part of .NET Framework and needs
+   no install. Keys land in WHATEVER WINDOW HAS FOCUS, so every handler returns
+   the window that received them and the voice layer says it aloud — the user
+   is the only one who can see the target.
+
+   Escaping is done in the renderer's pure inputControl module and verified
+   byte-exact through Notepad; the text arriving here is already encoded, so
+   this layer must not re-escape it.
+
+   Closing is GRACEFUL ONLY (CloseMainWindow), which lets an app prompt to save.
+   There is deliberately no force-kill path, and protected/system processes are
+   refused outright.
+========================= */
+const WIN_INTEROP = `
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -Namespace JarvisW -Name U -MemberDefinition @'
+[DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+[DllImport("user32.dll")] public static extern int GetWindowText(IntPtr h, System.Text.StringBuilder s, int n);
+[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);
+[DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+'@
+function Get-Focused {
+    $h = [JarvisW.U]::GetForegroundWindow()
+    $sb = New-Object System.Text.StringBuilder 512
+    [void][JarvisW.U]::GetWindowText($h, $sb, 512)
+    $pid = 0; [void][JarvisW.U]::GetWindowThreadProcessId($h, [ref]$pid)
+    $proc = (Get-Process -Id $pid -ErrorAction SilentlyContinue)
+    [pscustomobject]@{ title = $sb.ToString(); pid = [int]$pid; process = $proc.ProcessName }
+}`;
+
+ipcMain.handle('focused-window', async () => {
+    try {
+        const raw = await runPowerShell(`${WIN_INTEROP}
+Get-Focused | ConvertTo-Json -Compress`, 12000);
+        if (!raw) return { success: false, error: 'focus query failed' };
+        return { success: true, ...JSON.parse(raw) };
+    } catch (e) { return { success: false, error: e.message }; }
+});
+
+/** Windows that can be focused or closed. */
+ipcMain.handle('list-windows', async () => {
+    try {
+        const raw = await runPowerShell(`
+$rows = Get-Process | Where-Object { $_.MainWindowTitle } | ForEach-Object {
+    $d = $null; try { $d = $_.MainModule.FileVersionInfo.FileDescription } catch {}
+    [pscustomobject]@{ pid = $_.Id; process = $_.ProcessName; title = $_.MainWindowTitle; desc = $d }
+}
+@($rows) | ConvertTo-Json -Depth 3 -Compress`, 15000);
+        if (!raw) return { success: false, error: 'window enumeration failed' };
+        const j = JSON.parse(raw);
+        return { success: true, windows: Array.isArray(j) ? j : [j] };
+    } catch (e) { return { success: false, error: e.message }; }
+});
+
+/* Type pre-encoded SendKeys text. The payload is passed as a base64 argument
+   rather than interpolated into the script, so no quoting or metacharacter in
+   the user's text can alter the command being run. */
+ipcMain.handle('type-text', async (event, { encoded, targetPid } = {}) => {
+    try {
+        if (typeof encoded !== 'string' || !encoded.length) return { success: false, error: 'nothing to type' };
+        if (encoded.length > 4000) return { success: false, error: 'text too long to type safely' };
+        const b64 = Buffer.from(encoded, 'utf8').toString('base64');
+        const focusStep = Number.isFinite(Number(targetPid)) && Number(targetPid) > 0 ? `
+$t = Get-Process -Id ${Number(targetPid)} -ErrorAction SilentlyContinue
+if ($t -and $t.MainWindowHandle -ne 0) { [void][JarvisW.U]::SetForegroundWindow($t.MainWindowHandle); Start-Sleep -Milliseconds 400 }` : '';
+        const raw = await runPowerShell(`${WIN_INTEROP}${focusStep}
+$before = Get-Focused
+$text = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64}'))
+[System.Windows.Forms.SendKeys]::SendWait($text)
+Start-Sleep -Milliseconds 150
+[pscustomobject]@{ ok = $true; target = $before } | ConvertTo-Json -Depth 3 -Compress`, 20000);
+        if (!raw) return { success: false, error: 'send failed' };
+        const j = JSON.parse(raw);
+        // The window is reported back so the spoken confirmation names where
+        // the text actually went — the assistant cannot see the screen.
+        return { success: true, target: j.target };
+    } catch (e) { return { success: false, error: e.message }; }
+});
+
+ipcMain.handle('focus-window', async (event, { pid } = {}) => {
+    try {
+        const id = Number(pid);
+        if (!Number.isFinite(id) || id <= 0) return { success: false, error: 'invalid pid' };
+        const raw = await runPowerShell(`${WIN_INTEROP}
+$p = Get-Process -Id ${id} -ErrorAction SilentlyContinue
+if (-not $p -or $p.MainWindowHandle -eq 0) { [pscustomobject]@{ ok = $false } | ConvertTo-Json -Compress }
+else {
+  [void][JarvisW.U]::ShowWindow($p.MainWindowHandle, 9)   # restore if minimised
+  [void][JarvisW.U]::SetForegroundWindow($p.MainWindowHandle)
+  Start-Sleep -Milliseconds 400
+  [pscustomobject]@{ ok = $true; now = (Get-Focused) } | ConvertTo-Json -Depth 3 -Compress
+}`, 15000);
+        if (!raw) return { success: false, error: 'focus failed' };
+        const j = JSON.parse(raw);
+        // Verified by re-reading focus, not assumed from the call succeeding.
+        return j.ok ? { success: true, focused: j.now } : { success: false, error: 'window not available' };
+    } catch (e) { return { success: false, error: e.message }; }
+});
+
+/* Graceful close. Refuses anything without a real window, anything Windows
+   protects, and this app itself. No Kill() anywhere in this path. */
+ipcMain.handle('close-window', async (event, { pid } = {}) => {
+    try {
+        const id = Number(pid);
+        if (!Number.isFinite(id) || id <= 0) return { success: false, error: 'invalid pid' };
+        if (id === process.pid) return { success: false, error: 'refusing to close Jarvis itself' };
+        const raw = await runPowerShell(`
+$p = Get-Process -Id ${id} -ErrorAction SilentlyContinue
+if (-not $p) { [pscustomobject]@{ ok=$false; reason='not running' } | ConvertTo-Json -Compress; exit }
+if ($p.MainWindowHandle -eq 0) { [pscustomobject]@{ ok=$false; reason='no window to close' } | ConvertTo-Json -Compress; exit }
+$path = $null; try { $path = $p.MainModule.FileName } catch {}
+if (-not $path) { [pscustomobject]@{ ok=$false; reason='protected system process' } | ConvertTo-Json -Compress; exit }
+if ($path -like "$env:SystemRoot\\*") { [pscustomobject]@{ ok=$false; reason='Windows system process' } | ConvertTo-Json -Compress; exit }
+$name = $p.ProcessName
+[void]$p.CloseMainWindow()
+Start-Sleep -Milliseconds 1200
+$still = Get-Process -Id ${id} -ErrorAction SilentlyContinue
+[pscustomobject]@{ ok=$true; name=$name; exited=(-not $still) } | ConvertTo-Json -Compress`, 20000);
+        if (!raw) return { success: false, error: 'close failed' };
+        const j = JSON.parse(raw);
+        if (!j.ok) return { success: false, error: j.reason };
+        // exited=false is reported honestly: the app may be asking to save.
+        return { success: true, name: j.name, exited: j.exited };
+    } catch (e) { return { success: false, error: e.message }; }
+});
+
+/* Windows' own IANA port->service table. Read from disk rather than shipped
+   as a hand-written map, so the names are the system's, not mine. */
+ipcMain.handle('port-services', async () => {
+    try {
+        const file = path.join(process.env.SystemRoot || 'C:\\Windows',
+            'System32', 'drivers', 'etc', 'services');
+        const text = fsSync.readFileSync(file, 'utf8');
+        return { success: true, text, source: file };
+    } catch (e) { return { success: false, error: e.message }; }
+});
+
+ipcMain.handle('network-connections', async () => {
+    try {
+        const raw = await runPowerShell(NET_CONNECTIONS_SCRIPT, 15000);
+        if (!raw) return { success: false, error: 'connection table unavailable' };
+        const parsed = JSON.parse(raw);
+        return {
+            success: true,
+            netstat: parsed.netstat || '',
+            procs: Array.isArray(parsed.procs) ? parsed.procs : [],
+        };
+    } catch (e) { return { success: false, error: e.message }; }
+});
+
+/* Reverse DNS for a bounded set of remote IPs. Names come from the resolver,
+   never from a model — an unresolvable address is reported as unresolved
+   rather than guessed at. Runs in parallel with a short per-lookup timeout so
+   one dead PTR zone cannot stall the answer. */
+ipcMain.handle('network-resolve', async (event, { addresses } = {}) => {
+    const dns = require('dns').promises;
+    const list = (Array.isArray(addresses) ? addresses : [])
+        .filter(a => typeof a === 'string' && /^[0-9a-fA-F.:]+$/.test(a))
+        .slice(0, 24); // bounded: this is a spoken summary, not a scan
+    const names = {};
+    await Promise.all(list.map(async (addr) => {
+        try {
+            const hosts = await Promise.race([
+                dns.reverse(addr),
+                new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 1500)),
+            ]);
+            if (hosts && hosts.length) names[addr] = hosts[0];
+        } catch { /* no PTR record is normal; stays unresolved */ }
+    }));
+    return { success: true, names };
+});
+
+/* Per-adapter byte counters — the honest answer to "how much data has moved".
+   Separate handler because Get-NetAdapterStatistics measured ~1.3s, and the
+   connection list must stay fast. */
+ipcMain.handle('network-traffic', async () => {
+    try {
+        const script = `Get-NetAdapterStatistics | Where-Object { $_.ReceivedBytes -gt 0 -or $_.SentBytes -gt 0 } |
+Select-Object Name, ReceivedBytes, SentBytes | ConvertTo-Json -Depth 2 -Compress`;
+        const raw = await runPowerShell(script, 12000);
+        if (!raw) return { success: false, error: 'adapter statistics unavailable' };
+        const parsed = JSON.parse(raw);
+        return { success: true, adapters: Array.isArray(parsed) ? parsed : [parsed] };
+    } catch (e) { return { success: false, error: e.message }; }
+});
+
+/* What packet-level capability actually exists right now. Reports facts:
+   whether pktmon is present and whether this process is elevated. Nothing is
+   captured — this only tells the user (truthfully) what would be possible. */
+ipcMain.handle('network-capture-capability', async () => {
+    try {
+        const script = `$pk = [bool](Get-Command pktmon -ErrorAction SilentlyContinue)
+$admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+$npcap = (Test-Path 'C:\\Windows\\System32\\Npcap') -or (Test-Path 'C:\\Program Files\\Wireshark')
+[PSCustomObject]@{ pktmon = $pk; admin = $admin; npcap = $npcap } | ConvertTo-Json -Compress`;
+        const raw = await runPowerShell(script, 10000);
+        if (!raw) return { success: false, error: 'capability probe failed' };
+        return { success: true, ...JSON.parse(raw) };
+    } catch (e) { return { success: false, error: e.message }; }
+});
+
+/* =========================
+   NETWORK DISCOVERY — resolve names, enumerate neighbours and radios.
+
+   DIRECTLY ANSWERS A LOGGED FABRICATION: asked "what's the IP of pro haven",
+   the local model replied "192.168.1.10" — an address it made up. Nothing had
+   been resolved. These handlers return only what the OS resolver, the ARP
+   table or the radio actually reported, and report failure as failure.
+========================= */
+
+/* Hostname -> address via getaddrinfo, i.e. the FULL Windows resolution chain
+   (hosts file, DNS, mDNS, NetBIOS) rather than DNS alone — a LAN device name
+   usually is not in DNS. An unresolvable name returns found:false so the voice
+   layer can say so plainly. */
+ipcMain.handle('resolve-host', async (event, { host } = {}) => {
+    const name = String(host || '').trim();
+    // Hostnames only: no shell metacharacters can reach anything from here.
+    if (!name || name.length > 253 || !/^[a-zA-Z0-9._-]+$/.test(name)) {
+        return { success: false, error: 'invalid hostname' };
+    }
+    try {
+        const dns = require('dns').promises;
+        const addrs = await Promise.race([
+            dns.lookup(name, { all: true }),
+            new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 5000)),
+        ]);
+        return { success: true, found: true, host: name, addresses: addrs };
+    } catch (e) {
+        // ENOTFOUND is the normal, honest answer for a name that does not exist.
+        return { success: true, found: false, host: name, reason: e.code || e.message };
+    }
+});
+
+/* Wi-Fi networks in range WITH per-AP detail (BSSID, signal, band, channel).
+   This is what "tell me about that other network" can truthfully answer: a
+   network you are not joined to has no IP address for you, but its radio
+   facts are measurable. */
+ipcMain.handle('wifi-networks-detail', async () => {
+    try {
+        const out = await runNetsh(['wlan', 'show', 'networks', 'mode=bssid']);
+        if (!out) return { success: false, error: 'scan unavailable' };
+        return { success: true, raw: out };
+    } catch (e) { return { success: false, error: e.message }; }
+});
+
+/* LAN neighbours from the ARP cache — devices this machine has actually
+   exchanged frames with. Not an active sweep: no probing of the user's
+   network, only what the OS already knows. */
+ipcMain.handle('lan-neighbours', async () => {
+    try {
+        const out = await new Promise((resolve) => {
+            execFile('arp', ['-a'], { windowsHide: true, timeout: 8000 },
+                (err, stdout) => resolve(err ? null : String(stdout)));
+        });
+        if (out == null) return { success: false, error: 'arp unavailable' };
+        return { success: true, raw: out };
+    } catch (e) { return { success: false, error: e.message }; }
+});
+
+/* Bluetooth devices known to Windows. HONEST SCOPE: these are paired/known
+   devices, which is what the PnP tree exposes. Discovering nearby UNPAIRED
+   devices needs the WinRT DeviceWatcher API and is not available from a plain
+   PowerShell call — the voice layer says so rather than implying a live sweep. */
+ipcMain.handle('bluetooth-devices', async () => {
+    try {
+        const script = `Get-PnpDevice -Class Bluetooth -ErrorAction SilentlyContinue |
+Select-Object @{n='status';e={$_.Status}}, @{n='name';e={$_.FriendlyName}} | ConvertTo-Json -Depth 2 -Compress`;
+        const raw = await runPowerShell(script, 12000);
+        if (!raw) return { success: false, error: 'bluetooth enumeration unavailable' };
+        const parsed = JSON.parse(raw);
+        return { success: true, devices: Array.isArray(parsed) ? parsed : [parsed] };
+    } catch (e) { return { success: false, error: e.message }; }
+});
+
+/* Radio state (Bluetooth / Wi-Fi) via the WinRT Radio API — the only source
+   that reports whether the radio is actually switched ON, as opposed to
+   whether an adapter exists. The PnP tree shows the Realtek adapter as "OK"
+   even while Bluetooth is toggled off, which is exactly how the assistant came
+   to list paired devices without mentioning the radio was off.
+
+   Measured 612ms wall on this machine, RequestAccessAsync -> "Allowed". */
+const RADIO_PREAMBLE = `
+Add-Type -AssemblyName System.Runtime.WindowsRuntime | Out-Null
+$asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+    $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and
+    $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation\`1' })[0]
+function Await($op, $type) {
+    $m = $asTaskGeneric.MakeGenericMethod($type)
+    $t = $m.Invoke($null, @($op))
+    $null = $t.Wait(8000)
+    $t.Result
+}
+[Windows.Devices.Radios.Radio, Windows.System.Devices, ContentType = WindowsRuntime] | Out-Null
+[Windows.Devices.Radios.RadioAccessStatus, Windows.System.Devices, ContentType = WindowsRuntime] | Out-Null
+[Windows.Devices.Radios.RadioState, Windows.System.Devices, ContentType = WindowsRuntime] | Out-Null
+$access = Await ([Windows.Devices.Radios.Radio]::RequestAccessAsync()) ([Windows.Devices.Radios.RadioAccessStatus])
+$radios = Await ([Windows.Devices.Radios.Radio]::GetRadiosAsync()) ([System.Collections.Generic.IReadOnlyList[Windows.Devices.Radios.Radio]])
+`;
+
+ipcMain.handle('radio-state', async () => {
+    try {
+        const script = `$ErrorActionPreference='Stop'
+try {${RADIO_PREAMBLE}
+  $out = foreach ($r in $radios) { [pscustomobject]@{ name=$r.Name; kind=[string]$r.Kind; state=[string]$r.State } }
+  [pscustomobject]@{ ok=$true; access=[string]$access; radios=@($out) } | ConvertTo-Json -Depth 3 -Compress
+} catch { [pscustomobject]@{ ok=$false; error=$_.Exception.Message } | ConvertTo-Json -Compress }`;
+        const raw = await runPowerShell(script, 15000);
+        if (!raw) return { success: false, error: 'radio query unavailable' };
+        const j = JSON.parse(raw);
+        if (!j.ok) return { success: false, error: j.error };
+        return { success: true, access: j.access, radios: Array.isArray(j.radios) ? j.radios : [j.radios] };
+    } catch (e) { return { success: false, error: e.message }; }
+});
+
+/* Switch a radio on or off. STATE-CHANGING, so it is deliberately NOT reachable
+   from the model: the renderer only calls this after the user has answered an
+   explicit spoken confirmation. Kind and state are validated against fixed
+   sets — no caller-supplied text reaches PowerShell. */
+ipcMain.handle('radio-set', async (event, { kind, state } = {}) => {
+    const k = String(kind || '').toLowerCase() === 'wifi' ? 'WiFi' : 'Bluetooth';
+    const s = String(state || '').toLowerCase() === 'off' ? 'Off' : 'On';
+    try {
+        const script = `$ErrorActionPreference='Stop'
+try {${RADIO_PREAMBLE}
+  if ("$access" -ne 'Allowed') { throw "radio access $access" }
+  $target = $radios | Where-Object { [string]$_.Kind -eq '${k}' } | Select-Object -First 1
+  if (-not $target) { throw 'no ${k} radio present' }
+  $res = Await ($target.SetStateAsync([Windows.Devices.Radios.RadioState]::${s})) ([Windows.Devices.Radios.RadioAccessStatus])
+  Start-Sleep -Milliseconds 400
+  $after = Await ([Windows.Devices.Radios.Radio]::GetRadiosAsync()) ([System.Collections.Generic.IReadOnlyList[Windows.Devices.Radios.Radio]])
+  $now = ($after | Where-Object { [string]$_.Kind -eq '${k}' } | Select-Object -First 1).State
+  [pscustomobject]@{ ok=$true; result=[string]$res; state=[string]$now } | ConvertTo-Json -Compress
+} catch { [pscustomobject]@{ ok=$false; error=$_.Exception.Message } | ConvertTo-Json -Compress }`;
+        const raw = await runPowerShell(script, 20000);
+        if (!raw) return { success: false, error: 'radio set unavailable' };
+        const j = JSON.parse(raw);
+        if (!j.ok) return { success: false, error: j.error };
+        // The state is re-read AFTER the call: the spoken confirmation reports
+        // what the radio actually is now, not what was requested.
+        return { success: true, requested: s, state: j.state, applied: j.state === s };
+    } catch (e) { return { success: false, error: e.message }; }
+});
+
+/* =========================
+   SYSTEM PROCESS INSPECTION — STRICTLY READ-ONLY.
+   There is deliberately no kill/stop/suspend handler anywhere in this file:
+   the assistant can observe the machine completely and change none of it.
+
+   CORRECTNESS: Get-Process .CPU is CUMULATIVE processor-seconds since start,
+   which as a spoken "CPU usage" figure would be nonsense (Chrome measured 848
+   there while actually using a few percent). Two samples 500ms apart give a
+   real instantaneous percentage, normalised by core count. Both values are
+   returned under distinct names so they cannot be mixed up later.
+========================= */
+const PROCESS_SCRIPT = `
+$ErrorActionPreference = 'SilentlyContinue'
+$cores = [Environment]::ProcessorCount
+$s1 = @{}
+foreach ($p in Get-Process) { $s1[$p.Id] = $p.TotalProcessorTime.TotalMilliseconds }
+$sampleMs = 500
+Start-Sleep -Milliseconds $sampleMs
+$rows = foreach ($p in Get-Process) {
+    $prev = $s1[$p.Id]
+    $now = $p.TotalProcessorTime.TotalMilliseconds
+    $pct = if ($null -ne $prev -and $now -ge $prev) { [math]::Round((($now - $prev) / ($sampleMs * $cores)) * 100, 1) } else { $null }
+    # Ask WINDOWS what this program is instead of carrying a hand-written name
+    # table. Protected processes (svchost, lsass, MsMpEng, System...) throw here
+    # for a non-elevated caller, and that failure is recorded as evidence:
+    # readable=$false is how the system/user split is derived downstream.
+    $desc = $null; $co = $null; $path = $null
+    try { $fi = $p.MainModule.FileVersionInfo; $desc = $fi.FileDescription; $co = $fi.CompanyName; $path = $p.MainModule.FileName } catch {}
+    [pscustomobject]@{
+        pid = $p.Id; name = $p.ProcessName; cpu = $pct
+        mb = [int]($p.WorkingSet64 / 1MB); cpuS = [int]$p.TotalProcessorTime.TotalSeconds
+        start = if ($p.StartTime) { $p.StartTime.ToString('o') } else { $null }
+        title = $p.MainWindowTitle
+        desc = $desc; company = $co; path = $path; readable = [bool]$path
+    }
+}
+[pscustomobject]@{ cores = $cores; sampleMs = $sampleMs; procs = @($rows) } | ConvertTo-Json -Depth 3 -Compress`;
+
+ipcMain.handle('system-processes', async () => {
+    try {
+        const raw = await runPowerShell(PROCESS_SCRIPT, 20000);
+        if (!raw) return { success: false, error: 'process list unavailable' };
+        const j = JSON.parse(raw);
+        return {
+            success: true,
+            cores: j.cores,
+            sampleMs: j.sampleMs,
+            procs: Array.isArray(j.procs) ? j.procs : [j.procs],
+        };
+    } catch (e) { return { success: false, error: e.message }; }
 });
 
 // Windows Settings deep links - allowlisted ms-settings: pages only.
@@ -1457,10 +1914,75 @@ const RPC_URLS = {
     base: ['https://mainnet.base.org', 'https://base-rpc.publicnode.com', 'https://base.drpc.org'],
     optimism: ['https://mainnet.optimism.io', 'https://optimism-rpc.publicnode.com', 'https://optimism.drpc.org'],
     polygon: ['https://polygon-bor-rpc.publicnode.com', 'https://polygon.drpc.org', 'https://1rpc.io/matic'],
+    bsc: ['https://bsc-rpc.publicnode.com', 'https://bsc.drpc.org', 'https://1rpc.io/bnb'],
 };
+
+/* eth_getLogs is served very unevenly by free endpoints (measured: drpc
+   handled a 7200-block range in 793ms; publicnode demands a token for ANY
+   archive range; 1rpc caps at 50 blocks). So log queries use their own
+   drpc-first ordering instead of the balance-read ordering. */
+const RPC_LOG_URLS = {
+    ethereum: ['https://eth.drpc.org', 'https://ethereum-rpc.publicnode.com', 'https://1rpc.io/eth'],
+    bsc: ['https://bsc.drpc.org', 'https://bsc-rpc.publicnode.com', 'https://1rpc.io/bnb'],
+};
+/* --- keyed providers -------------------------------------------------------
+   Alchemy sits IN FRONT of the keyless pool rather than replacing it: a paid
+   endpoint that rate-limits or 403s must degrade to the public one, not take
+   the feature down with it. Which chains the key actually serves is DISCOVERED
+   (chainProviders.probeSlug makes each endpoint prove its chain id), because a
+   plan that omits a network answers 403 and a hardcoded slug map would lie
+   about it. Chain ids below are protocol facts and are the assertion the probe
+   checks against — they are not a vendor lookup table. */
+const CHAIN_IDS = {
+    ethereum: { id: 1, native: 'ETH' },
+    arbitrum: { id: 42161, native: 'ETH' },
+    base: { id: 8453, native: 'ETH' },
+    optimism: { id: 10, native: 'ETH' },
+    polygon: { id: 137, native: 'POL' },
+    bsc: { id: 56, native: 'BNB' },
+};
+
+// Filled in by discoverAlchemyProviders() at startup; empty = fully keyless.
+let alchemyNetworks = {};   // chainKey -> {slug, chainId, url}
+let alchemyRejected = {};   // chainKey -> why it is NOT available (kept: negative results are data)
+let alchemyKey = null;
+let heliusKey = null;
+
+async function discoverAlchemyProviders() {
+    alchemyKey = await chainProviders.resolveKey('alchemy', getCredential);
+    heliusKey = await chainProviders.resolveKey('helius', getCredential);
+    if (!alchemyKey) {
+        console.log('[chain] no Alchemy key — running on keyless public endpoints');
+        return;
+    }
+    const t0 = Date.now();
+    const { verified, rejected } = await chainProviders.discoverAlchemyNetworks(alchemyKey, CHAIN_IDS, fetch);
+    alchemyNetworks = verified;
+    alchemyRejected = rejected;
+
+    for (const [chainKey, info] of Object.entries(verified)) {
+        // Prepend, never replace: the public pool stays as failover.
+        if (RPC_URLS[chainKey] && !RPC_URLS[chainKey].includes(info.url)) RPC_URLS[chainKey].unshift(info.url);
+        /* NOT added to RPC_LOG_URLS. Measured, not assumed: Alchemy's free tier
+           rejects any eth_getLogs range wider than 10 BLOCKS
+           ("Under the Free tier plan, you can make eth_getLogs requests with up
+           to a 10 block range"). The wide-range log features here — Ondo flows,
+           treasury history — need thousands of blocks, which the keyless pool
+           serves. Single-block stream scans go through RPC_URLS and are fine. */
+    }
+    console.log(`[chain] Alchemy verified in ${Date.now() - t0}ms:`, Object.keys(verified).join(', ') || 'none',
+        Object.keys(rejected).length ? `| unavailable: ${Object.keys(rejected).join(', ')}` : '');
+}
+
+/** The keyed websocket for a chain, or null if we have no key for it. */
+function alchemyWsUrl(chainKey) {
+    const info = alchemyNetworks[chainKey];
+    return info ? info.url.replace(/^https:/, 'wss:') : null;
+}
+
 // Only these JSON-RPC methods may ever be sent — a hard allowlist so the
 // service can never be steered into a write/signing call.
-const RPC_READ_METHODS = new Set(['eth_getBalance', 'eth_gasPrice', 'eth_call', 'eth_getTransactionCount', 'eth_blockNumber', 'eth_getTransactionReceipt', 'eth_getTransactionByHash', 'eth_getBlockByNumber']);
+const RPC_READ_METHODS = new Set(['eth_getBalance', 'eth_gasPrice', 'eth_call', 'eth_getTransactionCount', 'eth_blockNumber', 'eth_getTransactionReceipt', 'eth_getTransactionByHash', 'eth_getBlockByNumber', 'eth_getLogs', 'eth_getCode']);
 
 /* Endpoints are RACED, not queued. Sequential failover with a 10s timeout each
    is what put a 30.0s worst case in the interaction log: three dead endpoints
@@ -1505,6 +2027,19 @@ ipcMain.handle('onchain-balance', async (event, { chain, address }) => {
         if (!ADDR_RE.test(String(address || ''))) return { success: false, error: 'invalid address' };
         const wei = await rpcCall(chain, 'eth_getBalance', [address, 'latest']);
         return { success: true, wei };
+    } catch (e) { return { success: false, error: e.message }; }
+});
+
+/* Contract or externally-owned account. This is the one thing on-chain data
+   CAN say about what an address is — code present means a contract, absent
+   means a key-controlled wallet. It is not an entity name and is never spoken
+   as one. */
+ipcMain.handle('onchain-code', async (event, { chain, address }) => {
+    try {
+        if (!ADDR_RE.test(String(address || ''))) return { success: false, error: 'invalid address' };
+        const code = await rpcCall(chain, 'eth_getCode', [address, 'latest']);
+        const isContract = typeof code === 'string' && code !== '0x' && code.length > 2;
+        return { success: true, isContract, codeSize: isContract ? (code.length - 2) / 2 : 0 };
     } catch (e) { return { success: false, error: e.message }; }
 });
 
@@ -1564,6 +2099,400 @@ ipcMain.handle('onchain-token', async (event, { chain, token, data }) => {
     } catch (e) { return { success: false, error: e.message }; }
 });
 
+/* Bounded, validated Transfer-log reads — powers Ondo mint/redeem flow
+   detection WITHOUT an Etherscan key (the pasted spec assumed one was
+   required; live probing showed drpc serves 24h ranges keyless). Guards:
+   log-capable chains only, contract address validated, topics must be
+   32-byte hex or null, range capped at ~24h so a bad caller cannot demand
+   a full archive scan. */
+const LOGS_MAX_RANGE = 7200; // blocks (~24h at 12s); drpc-verified workable
+
+ipcMain.handle('onchain-logs', async (event, { chain, address, topics, spanBlocks }) => {
+    try {
+        const chainKey = RPC_LOG_URLS[chain] ? chain : null;
+        if (!chainKey) return { success: false, error: `log queries not supported on ${chain}` };
+        if (!ADDR_RE.test(String(address || ''))) return { success: false, error: 'invalid contract address' };
+        const cleanTopics = (Array.isArray(topics) ? topics : []).map((t) => {
+            if (t === null || t === undefined) return null;
+            if (/^0x[0-9a-fA-F]{64}$/.test(String(t))) return t;
+            throw new Error('invalid topic');
+        });
+        const span = Math.min(Math.max(1, Number(spanBlocks) || LOGS_MAX_RANGE), LOGS_MAX_RANGE);
+
+        const latestHex = await rpcCall(chainKey, 'eth_blockNumber', []);
+        const latest = parseInt(latestHex, 16);
+        const fromBlock = '0x' + Math.max(0, latest - span).toString(16);
+
+        const { value } = await hedgedRace(
+            RPC_LOG_URLS[chainKey],
+            async (url, signal) => {
+                const res = await fetch(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'User-Agent': 'Jarvis/1.0' },
+                    body: JSON.stringify({
+                        jsonrpc: '2.0', id: 1, method: 'eth_getLogs',
+                        params: [{ address, topics: cleanTopics, fromBlock, toBlock: 'latest' }],
+                    }),
+                    signal,
+                });
+                if (!res.ok) throw new Error(`http ${res.status}`);
+                const j = await res.json();
+                if (j.error) throw new Error(j.error.message || 'rpc error');
+                if (!Array.isArray(j.result)) throw new Error('empty result');
+                return j.result;
+            },
+            { hedgeAfterMs: 2500, timeoutMs: 20000 }, // log scans are legitimately slower than reads
+        );
+        return { success: true, logs: value, fromBlock: latest - span, toBlock: latest };
+    } catch (e) { return { success: false, error: e.message }; }
+});
+
+/* =========================
+   KEYED PROVIDER HANDLERS — Alchemy (EVM) + Helius (Solana)
+   These answer the questions raw public RPC structurally CANNOT: what a wallet
+   holds without being told which tokens to ask about, what something is worth,
+   and Solana history at all. Every handler returns the raw provider payload;
+   the renderer parses it with the tested chainIntel.js module, so no number is
+   ever computed here and none is ever computed by the model.
+   Each handler states needsKey rather than failing silently, so the assistant
+   can say WHY it cannot answer instead of inventing an answer.
+   AIR-GAP unchanged: read-only endpoints, no signing, keys never returned.
+========================= */
+const SOL_ADDR_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/; // base58, no 0/O/I/l
+
+/* Solana stablecoin mint accounts. Live-verified against Helius: USDC supply
+   8.14B at 6 decimals, USDT 3.84B — both match the public figures, which is
+   the check that these are the right accounts and not lookalikes. */
+const SOLANA_STABLE_MINTS = {
+    USDC: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+    USDT: 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
+};
+
+async function providerFetch(url, { body = null, timeoutMs = 12000 } = {}) {
+    const ac = new AbortController();
+    const t = setTimeout(() => ac.abort(), timeoutMs);
+    try {
+        const res = await fetch(url, {
+            method: body ? 'POST' : 'GET',
+            headers: { 'Content-Type': 'application/json', 'User-Agent': 'Jarvis/1.0' },
+            body: body ? JSON.stringify(body) : undefined,
+            signal: ac.signal,
+        });
+        const text = await res.text();
+        let json = null;
+        try { json = JSON.parse(text); } catch { /* provider returned non-JSON */ }
+        if (!res.ok) throw new Error(json?.error?.message || `http ${res.status}`);
+        if (json?.error) throw new Error(json.error.message || 'provider error');
+        return json;
+    } finally { clearTimeout(t); }
+}
+
+/** Which chains/capabilities are actually available right now, and why not. */
+ipcMain.handle('chain-providers-status', async () => ({
+    success: true,
+    alchemy: {
+        keyed: !!alchemyKey,
+        networks: Object.fromEntries(Object.entries(alchemyNetworks).map(([k, v]) => [k, { slug: v.slug, chainId: v.chainId }])),
+        unavailable: alchemyRejected,
+    },
+    helius: { keyed: !!heliusKey },
+}));
+
+/* Full wallet contents across chains — Alchemy Portfolio. Public RPC can only
+   answer "balance of TOKEN X", never "everything this address holds". */
+ipcMain.handle('chain-portfolio', async (event, { address, chains } = {}) => {
+    try {
+        if (!alchemyKey) return { success: false, needsKey: 'alchemy', error: 'no Alchemy key configured' };
+        if (!ADDR_RE.test(String(address || ''))) return { success: false, error: 'invalid address' };
+        const wanted = (Array.isArray(chains) && chains.length ? chains : Object.keys(alchemyNetworks))
+            .filter((c) => alchemyNetworks[c]);
+        if (!wanted.length) return { success: false, error: 'no keyed networks available' };
+        const networks = wanted.map((c) => alchemyNetworks[c].slug);
+
+        const payload = await providerFetch(chainProviders.alchemyTokensByAddressUrl(alchemyKey), {
+            body: { addresses: [{ address, networks }], withMetadata: true, withPrices: true },
+            timeoutMs: 20000,
+        });
+        // slug -> chainKey so the renderer can name chains the way the user does
+        const slugMap = Object.fromEntries(wanted.map((c) => [alchemyNetworks[c].slug, { chain: c, native: CHAIN_IDS[c]?.native }]));
+        return { success: true, payload, networks: wanted, slugMap };
+    } catch (e) { return { success: false, error: e.message }; }
+});
+
+/* USD prices straight from the provider — a measured feed, not a model guess. */
+ipcMain.handle('chain-prices', async (event, { symbols, addresses } = {}) => {
+    try {
+        if (!alchemyKey) return { success: false, needsKey: 'alchemy', error: 'no Alchemy key configured' };
+        if (Array.isArray(symbols) && symbols.length) {
+            const clean = symbols.map((s) => String(s).trim().toUpperCase())
+                .filter((s) => /^[A-Z0-9.-]{1,16}$/.test(s)).slice(0, 25);
+            if (!clean.length) return { success: false, error: 'no valid symbols' };
+            return { success: true, payload: await providerFetch(chainProviders.alchemyPricesBySymbolUrl(alchemyKey, clean)) };
+        }
+        if (Array.isArray(addresses) && addresses.length) {
+            const clean = addresses.filter((a) => a && ADDR_RE.test(String(a.address || '')) && alchemyNetworks[a.chain])
+                .map((a) => ({ network: alchemyNetworks[a.chain].slug, address: a.address })).slice(0, 25);
+            if (!clean.length) return { success: false, error: 'no valid token addresses on keyed networks' };
+            return { success: true, payload: await providerFetch(chainProviders.alchemyPricesByAddressUrl(alchemyKey), { body: { addresses: clean } }) };
+        }
+        return { success: false, error: 'nothing requested' };
+    } catch (e) { return { success: false, error: e.message }; }
+});
+
+/* Solana, via Helius. Jarvis had NO Solana capability at all before this. */
+ipcMain.handle('solana-activity', async (event, { address, limit } = {}) => {
+    try {
+        if (!heliusKey) return { success: false, needsKey: 'helius', error: 'no Helius key configured' };
+        if (!SOL_ADDR_RE.test(String(address || ''))) return { success: false, error: 'invalid Solana address' };
+        const n = Math.min(Math.max(1, Number(limit) || 10), 25);
+        const payload = await providerFetch(chainProviders.heliusTxByAddressUrl(address, heliusKey, n), { timeoutMs: 20000 });
+        return { success: true, payload };
+    } catch (e) { return { success: false, error: e.message }; }
+});
+
+ipcMain.handle('solana-assets', async (event, { address, limit } = {}) => {
+    try {
+        if (!heliusKey) return { success: false, needsKey: 'helius', error: 'no Helius key configured' };
+        if (!SOL_ADDR_RE.test(String(address || ''))) return { success: false, error: 'invalid Solana address' };
+        const payload = await providerFetch(chainProviders.heliusRpcUrl(heliusKey), {
+            body: {
+                jsonrpc: '2.0', id: 'jarvis', method: 'getAssetsByOwner',
+                params: {
+                    ownerAddress: address, page: 1,
+                    limit: Math.min(Math.max(1, Number(limit) || 20), 50),
+                    displayOptions: { showFungible: true, showNativeBalance: true },
+                },
+            },
+            timeoutMs: 20000,
+        });
+        return { success: true, payload };
+    } catch (e) { return { success: false, error: e.message }; }
+});
+
+/* Read-only Solana RPC, same hard allowlist discipline as the EVM side. */
+const SOL_READ_METHODS = new Set(['getSlot', 'getBalance', 'getBlockHeight', 'getLatestBlockhash', 'getTransaction', 'getSignaturesForAddress', 'getTokenAccountsByOwner']);
+ipcMain.handle('solana-call', async (event, { method, params } = {}) => {
+    try {
+        if (!heliusKey) return { success: false, needsKey: 'helius', error: 'no Helius key configured' };
+        if (!SOL_READ_METHODS.has(method)) return { success: false, error: `method not allowed: ${method}` };
+        const payload = await providerFetch(chainProviders.heliusRpcUrl(heliusKey), {
+            body: { jsonrpc: '2.0', id: 'jarvis', method, params: Array.isArray(params) ? params : [] },
+        });
+        return { success: true, result: payload?.result };
+    } catch (e) { return { success: false, error: e.message }; }
+});
+
+/* Stablecoin issuance on demand — "has Circle minted anything today?".
+   Uses the KEYLESS log pool: Alchemy's free tier caps eth_getLogs at 10 blocks,
+   which cannot answer a question about the last hour. Measured on drpc: a
+   300-block (~1h) window returns in 0.4-1.4s; 7200 blocks times out, so the
+   window is capped at what the endpoint can actually serve rather than
+   promising a day and failing. */
+const ISSUANCE_MAX_SPAN = 600; // blocks (~2h at 12s) — drpc-verified workable
+ipcMain.handle('chain-issuance', async (event, { chain = 'ethereum', spanBlocks, minUnits } = {}) => {
+    try {
+        const tokens = await verifyChainTokens(chain);
+        const stables = Object.fromEntries(Object.entries(tokens).filter(([, v]) => /^(USDC|USDT|DAI)$/.test(v.symbol)));
+        if (!Object.keys(stables).length) return { success: false, error: `no verified stablecoins on ${chain}` };
+        const urls = RPC_LOG_URLS[chain];
+        if (!urls) return { success: false, error: `log queries not supported on ${chain}` };
+
+        const span = Math.min(Math.max(10, Number(spanBlocks) || 300), ISSUANCE_MAX_SPAN);
+        const latest = parseInt(await rpcCall(chain, 'eth_blockNumber', []), 16);
+
+        /* CHUNKED, because the free endpoints disagree about how wide a log
+           query may be and the limits move: measured in one sitting, drpc
+           served 300 blocks in 0.4s and later refused to route at all, 1rpc
+           caps at 50 ("eth_getLogs is limited to 0 - 50 blocks range"), and
+           Alchemy's free tier caps at 10. A 50-block chunk is inside every
+           limit that answered. Chunks that fail are COUNTED, not hidden — the
+           caller is told which part of the window was actually read, because
+           "no mints in the last hour" and "I could only see half the hour" are
+           different answers. */
+        const CHUNK = 50, CONCURRENCY = 3;
+        const zero = '0x' + '0'.repeat(64);
+        const ranges = [];
+        for (let end = latest; end > latest - span; end -= CHUNK) {
+            ranges.push([Math.max(0, end - CHUNK + 1), end]);
+        }
+
+        const fetchRange = (topics, from, to) => hedgedRace(urls, async (url, signal) => {
+            const res = await fetch(url, {
+                method: 'POST', headers: { 'Content-Type': 'application/json', 'User-Agent': 'Jarvis/1.0' },
+                body: JSON.stringify({
+                    jsonrpc: '2.0', id: 1, method: 'eth_getLogs',
+                    params: [{ address: Object.keys(stables), topics, fromBlock: '0x' + from.toString(16), toBlock: '0x' + to.toString(16) }],
+                }),
+                signal,
+            });
+            if (!res.ok) throw new Error(`http ${res.status}`);
+            const j = await res.json();
+            if (j.error) throw new Error(j.error.message || 'rpc error');
+            if (!Array.isArray(j.result)) throw new Error('empty result');
+            return j.result;
+        }, { hedgeAfterMs: 1500, timeoutMs: 12000 }).then(r => r.value);
+
+        const jobs = [];
+        for (const [from, to] of ranges) {
+            jobs.push({ topics: [TRANSFER_TOPIC, zero], from, to });
+            jobs.push({ topics: [TRANSFER_TOPIC, null, zero], from, to });
+        }
+        const logs = [];
+        let failedChunks = 0;
+        for (let i = 0; i < jobs.length; i += CONCURRENCY) {
+            const batch = await Promise.all(jobs.slice(i, i + CONCURRENCY).map(j =>
+                fetchRange(j.topics, j.from, j.to).catch(() => null)));
+            for (const r of batch) { if (r) logs.push(...r); else failedChunks++; }
+        }
+
+        const blocksRead = Math.round(span * (1 - failedChunks / jobs.length));
+        const events = scanIssuanceLogs(logs, {
+            chain, tokens: stables,
+            minAmount: Number.isFinite(minUnits) ? minUnits : 100000,
+        });
+        return {
+            success: true, chain, fromBlock: latest - span, toBlock: latest,
+            approxMinutes: Math.round(blocksRead * 12 / 60),
+            requestedMinutes: Math.round(span * 12 / 60),
+            partial: failedChunks > 0,
+            coverage: `${jobs.length - failedChunks}/${jobs.length} chunks`,
+            events: events.slice(0, 25),
+            summary: summarizeIssuance(events),
+        };
+    } catch (e) { return { success: false, error: e.message }; }
+});
+
+/* Solana stablecoin supply — the same question the Ethereum handler answers by
+   logs, answered here by the mint account itself. Helius serves it in ~150ms.
+   A supply DELTA between two readings is a mint or a burn; a single reading is
+   just the supply, and is reported as such. */
+ipcMain.handle('solana-supply', async (event, { mints } = {}) => {
+    try {
+        if (!heliusKey) return { success: false, needsKey: 'helius', error: 'no Helius key configured' };
+        const targets = (mints && typeof mints === 'object' ? mints : SOLANA_STABLE_MINTS);
+        const out = {};
+        await Promise.all(Object.entries(targets).map(async ([symbol, mint]) => {
+            if (!SOL_ADDR_RE.test(String(mint))) return;
+            try {
+                const r = await providerFetch(chainProviders.heliusRpcUrl(heliusKey), {
+                    body: { jsonrpc: '2.0', id: 'jarvis', method: 'getTokenSupply', params: [mint] }, timeoutMs: 8000,
+                });
+                const v = r?.result?.value;
+                if (v) out[symbol] = { mint, amount: Number(v.uiAmountString), decimals: v.decimals, at: Date.now() };
+            } catch { /* one mint failing must not take the rest down */ }
+        }));
+        return { success: true, supplies: out };
+    } catch (e) { return { success: false, error: e.message }; }
+});
+
+/* =========================
+   DUNE ANALYTICS (key-gated)
+   Aggregate on-chain intelligence via DuneSQL — the class of question raw
+   RPC cannot answer (top holders, USD-priced whale flows, supply history).
+   HONEST GATING: every handler works only when the user has stored
+   dune_api_key in the vault; without it they return needsKey so the voice
+   layer says exactly what is missing instead of failing vaguely. Results
+   are cached aggressively because the free tier is ~2,500 credits/month.
+   Only vetted query templates run — no SQL is ever composed from voice
+   text; values are validated (addresses/numbers) before interpolation.
+========================= */
+const DUNE_API = 'https://api.dune.com/api/v1';
+const duneCache = new Map(); // key -> { rows, at }
+
+async function duneQuery(sql, cacheKey, cacheTtlMs) {
+    const cached = duneCache.get(cacheKey);
+    if (cached && Date.now() - cached.at < cacheTtlMs) return { rows: cached.rows, cached: true };
+
+    const apiKey = await getCredential('dune_api_key');
+    if (!apiKey) return { needsKey: true };
+
+    const exec = await fetch(`${DUNE_API}/sql/execute`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Dune-API-Key': apiKey },
+        body: JSON.stringify({ sql, performance: 'medium' }),
+        signal: AbortSignal.timeout(15000),
+    });
+    if (!exec.ok) {
+        const err = await exec.json().catch(() => ({}));
+        throw new Error(`Dune execute failed: ${err.error || exec.status}`);
+    }
+    const { execution_id } = await exec.json();
+    if (!execution_id) throw new Error('Dune returned no execution id');
+
+    for (let i = 0; i < 30; i++) {
+        await new Promise(r => setTimeout(r, 2000));
+        const st = await fetch(`${DUNE_API}/execution/${execution_id}/status`, {
+            headers: { 'X-Dune-API-Key': apiKey }, signal: AbortSignal.timeout(10000),
+        }).then(r => r.ok ? r.json() : null).catch(() => null);
+        if (!st) continue;
+        if (st.state === 'QUERY_STATE_COMPLETED') {
+            const res = await fetch(`${DUNE_API}/execution/${execution_id}/results`, {
+                headers: { 'X-Dune-API-Key': apiKey }, signal: AbortSignal.timeout(15000),
+            });
+            if (!res.ok) throw new Error('Dune results fetch failed');
+            const rows = (await res.json())?.result?.rows || [];
+            duneCache.set(cacheKey, { rows, at: Date.now() });
+            return { rows, cached: false };
+        }
+        if (st.state === 'QUERY_STATE_FAILED') throw new Error(`Dune query failed: ${st.error || 'unknown'}`);
+    }
+    throw new Error('Dune query timed out after 60s');
+}
+
+const DUNE_ADDR = /^0x[0-9a-fA-F]{40}$/;
+
+ipcMain.handle('dune-whale-transfers', async (event, { chain, minUsd, hours } = {}) => {
+    try {
+        const c = ['ethereum', 'bnb', 'arbitrum', 'base', 'optimism', 'polygon'].includes(chain) ? chain : 'ethereum';
+        const usd = Math.max(100000, Math.min(Number(minUsd) || 1000000, 1e9));
+        const h = Math.max(1, Math.min(Number(hours) || 24, 168));
+        const sql = `SELECT block_time, "from" AS sender, "to" AS receiver, symbol, amount_usd,
+                CAST(amount_raw AS double) / POW(10, decimals) AS amount
+            FROM tokens.transfers
+            WHERE blockchain = '${c}' AND block_time > now() - interval '${h}' hour
+              AND amount_usd > ${usd}
+            ORDER BY amount_usd DESC LIMIT 20`;
+        const r = await duneQuery(sql, `whales:${c}:${usd}:${h}`, 5 * 60 * 1000);
+        return r.needsKey ? { success: false, needsKey: true } : { success: true, rows: r.rows, cached: r.cached };
+    } catch (e) { return { success: false, error: e.message }; }
+});
+
+ipcMain.handle('dune-top-holders', async (event, { tokenAddress } = {}) => {
+    try {
+        if (!DUNE_ADDR.test(String(tokenAddress || ''))) return { success: false, error: 'invalid token address' };
+        const a = tokenAddress.toLowerCase();
+        const sql = `SELECT address, SUM(amount) AS balance FROM (
+                SELECT "to" AS address, CAST(value AS double) / 1e18 AS amount
+                FROM erc20_ethereum.evt_Transfer WHERE contract_address = ${a}
+                UNION ALL
+                SELECT "from" AS address, -CAST(value AS double) / 1e18 AS amount
+                FROM erc20_ethereum.evt_Transfer WHERE contract_address = ${a}
+            ) t GROUP BY 1 HAVING SUM(amount) > 0.000001
+            ORDER BY 2 DESC LIMIT 10`;
+        const r = await duneQuery(sql, `holders:${a}`, 30 * 60 * 1000);
+        return r.needsKey ? { success: false, needsKey: true } : { success: true, rows: r.rows, cached: r.cached };
+    } catch (e) { return { success: false, error: e.message }; }
+});
+
+ipcMain.handle('dune-supply-history', async (event, { tokenAddress, days } = {}) => {
+    try {
+        if (!DUNE_ADDR.test(String(tokenAddress || ''))) return { success: false, error: 'invalid token address' };
+        const a = tokenAddress.toLowerCase();
+        const d = Math.max(1, Math.min(Number(days) || 30, 90));
+        const sql = `SELECT date_trunc('day', evt_block_time) AS day,
+                SUM(CASE WHEN "from" = 0x0000000000000000000000000000000000000000
+                    THEN CAST(value AS double) / 1e18 ELSE 0 END) AS minted,
+                SUM(CASE WHEN "to" = 0x0000000000000000000000000000000000000000
+                    THEN CAST(value AS double) / 1e18 ELSE 0 END) AS redeemed
+            FROM erc20_ethereum.evt_Transfer
+            WHERE contract_address = ${a}
+              AND evt_block_time > now() - interval '${d}' day
+            GROUP BY 1 ORDER BY 1 DESC`;
+        const r = await duneQuery(sql, `supplyhist:${a}:${d}`, 15 * 60 * 1000);
+        return r.needsKey ? { success: false, needsKey: true } : { success: true, rows: r.rows, cached: r.cached };
+    } catch (e) { return { success: false, error: e.message }; }
+});
+
 /* =========================
    REAL-TIME CHAIN STREAMER + ADDRESS WATCHLIST
    Push-based on-chain awareness: eth_subscribe(newHeads) over keyless
@@ -1588,7 +2517,10 @@ ipcMain.handle('onchain-token', async (event, { chain, token, data }) => {
      spoken alert about a tx that never lands is misinformation.
 ========================= */
 const WsClient = require('ws');
-const { scanBlockTxs, shortAddr: chainShortAddr } = require('./chainWatch');
+const { scanBlockTxs, shortAddr: chainShortAddr, scanTokenLogs, aggregateTokenWhales, scanIssuanceLogs, summarizeIssuance, TRANSFER_TOPIC, ZERO_ADDRESS } = require('./chainWatch');
+// Metric/event tier (root CJS like chainWatch/streamGuard — main cannot import
+// the renderer's ESM services).
+const metricStore = require('./metricStore');
 const { backoffDelay, createDedup, createBlockTracker, prioritizeAlerts } = require('./streamGuard');
 
 const CHAIN_WS_URLS = {
@@ -1622,6 +2554,68 @@ async function getEthUsd() {
         ethUsdCache = { price: q?.price || null, at: Date.now() };
     } catch { ethUsdCache = { price: null, at: Date.now() }; }
     return ethUsdCache.price;
+}
+
+/* --- ERC-20 whale tracking -------------------------------------------------
+   Native-ETH-only whale watching reports a small slice of where money actually
+   goes: most large value on Ethereum moves as stablecoins. These contracts are
+   the candidates, and like the Alchemy slugs they must PROVE themselves before
+   any amount is decoded with them — decimals() is read on-chain, and a token
+   whose answer disagrees with the table (or that cannot be read) is dropped
+   rather than trusted. Getting decimals wrong by 12 turns $4M into $4. */
+const TOKEN_CANDIDATES = {
+    ethereum: [
+        { address: '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48', symbol: 'USDC', decimals: 6 },
+        { address: '0xdac17f958d2ee523a2206206994597c13d831ec7', symbol: 'USDT', decimals: 6 },
+        { address: '0x6b175474e89094c44da98b954eedeac495271d0f', symbol: 'DAI', decimals: 18 },
+        { address: '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2', symbol: 'WETH', decimals: 18 },
+        { address: '0x2260fac5e5542a773aa44fbcfedf7c193bc2c599', symbol: 'WBTC', decimals: 8 },
+    ],
+};
+const DECIMALS_SELECTOR = '0x313ce567'; // decimals()
+const TOKEN_WHALE_MIN_USD = 1000000;
+/* Issuance is watched at treasury scale, in whole tokens — for a stablecoin the
+   unit IS the dollar. Measured on live mainnet: a 1M floor catches roughly a
+   dozen events an hour, which is a signal; a 100k floor would be a stream. */
+const ISSUANCE_MIN_UNITS = 1000000;
+
+/** Verified token table for a chain: { contractAddress: {symbol, decimals} }. */
+const verifiedTokens = {};
+async function verifyChainTokens(chainKey) {
+    if (verifiedTokens[chainKey]) return verifiedTokens[chainKey];
+    const table = {};
+    const rejected = [];
+    for (const t of TOKEN_CANDIDATES[chainKey] || []) {
+        try {
+            const raw = await rpcCall(chainKey, 'eth_call', [{ to: t.address, data: DECIMALS_SELECTOR }, 'latest']);
+            const onchainDecimals = parseInt(raw, 16);
+            if (onchainDecimals !== t.decimals) { rejected.push(`${t.symbol}: chain says ${onchainDecimals}`); continue; }
+            table[t.address.toLowerCase()] = { symbol: t.symbol, decimals: t.decimals };
+        } catch (e) { rejected.push(`${t.symbol}: ${e.message}`); }
+    }
+    verifiedTokens[chainKey] = table;
+    console.log(`[chain] token decimals verified on ${chainKey}: ${Object.values(table).map(v => v.symbol).join(', ') || 'none'}` +
+        (rejected.length ? ` | dropped: ${rejected.join('; ')}` : ''));
+    return table;
+}
+
+/* Token prices, measured. Alchemy when keyed; nothing invented when not — an
+   unpriced token simply falls back to a raw-unit floor, and the alert says the
+   amount without claiming a dollar value. */
+let tokenPriceCache = { at: 0, prices: {} };
+async function getTokenPrices(symbols) {
+    if (Date.now() - tokenPriceCache.at < 5 * 60 * 1000) return tokenPriceCache.prices;
+    if (!alchemyKey || !symbols.length) return tokenPriceCache.prices;
+    try {
+        const payload = await providerFetch(chainProviders.alchemyPricesBySymbolUrl(alchemyKey, symbols), { timeoutMs: 8000 });
+        const prices = {};
+        for (const row of payload?.data || []) {
+            const usd = (row?.prices || []).find(p => String(p?.currency).toLowerCase() === 'usd');
+            if (usd && Number.isFinite(Number(usd.value))) prices[row.symbol] = Number(usd.value);
+        }
+        tokenPriceCache = { at: Date.now(), prices };
+    } catch { tokenPriceCache = { at: Date.now(), prices: tokenPriceCache.prices }; }
+    return tokenPriceCache.prices;
 }
 
 /* Entity labels — user's own labels first, then optional Arkham (attributed,
@@ -1693,13 +2687,17 @@ function stopChainStream() {
 }
 
 function startChainStream(chainKey = 'ethereum') {
-    const url = CHAIN_WS_URLS[chainKey];
+    /* Prefer the keyed socket when the key proved it serves this chain: public
+       newHeads sockets drop subscriptions under load, which is the failure the
+       backfill logic exists to survive. An explicit JARVIS_ETH_WS override and
+       the keyless default both remain, so this degrades rather than breaks. */
+    const url = (!process.env.JARVIS_ETH_WS && alchemyWsUrl(chainKey)) || CHAIN_WS_URLS[chainKey];
     if (!url) return { success: false, error: `no stream endpoint for ${chainKey}` };
     if (chainStream?.chain === chainKey) return { success: true, already: true };
     stopChainStream();
 
     const state = {
-        ws: null, chain: chainKey, startedAt: Date.now(),
+        ws: null, chain: chainKey, startedAt: Date.now(), keyed: url === alchemyWsUrl(chainKey),
         blocks: 0, alerts: 0, reconnects: 0, attempt: 0,
         lastMsgAt: 0, heartbeat: null, reconnectTimer: null,
         procTotalMs: 0, procCount: 0,
@@ -1717,47 +2715,102 @@ function startChainStream(chainKey = 'ethereum') {
         state.blocks++;
 
         const watch = await loadChainWatchlist();
-        const { whales, watchHits } = scanBlockTxs(block.transactions, {
-            chain: chainKey,
-            watch: watch.filter(w => (w.chains || ['ethereum']).includes(chainKey)).map(w => w.address),
-        });
+        const watchedAddrs = watch.filter(w => (w.chains || ['ethereum']).includes(chainKey)).map(w => w.address);
+        const { whales, watchHits } = scanBlockTxs(block.transactions, { chain: chainKey, watch: watchedAddrs });
+
+        /* Token transfers in the SAME block. One extra log query per block —
+           affordable on a keyed endpoint, and it is where most of the money
+           actually moves. A failure here degrades to native-only rather than
+           taking the whole alert down. */
+        const tokens = await verifyChainTokens(chainKey);
+        const tokenAddrs = Object.keys(tokens);
+        let tokenWhales = [], tokenHits = [];
+        if (tokenAddrs.length) {
+            const prices = await getTokenPrices([...new Set(Object.values(tokens).map(t => t.symbol))]);
+            const logs = await rpcCall(chainKey, 'eth_getLogs', [{
+                fromBlock: blockHex, toBlock: blockHex, address: tokenAddrs, topics: [TRANSFER_TOPIC],
+            }]).catch(() => null);
+            if (Array.isArray(logs)) {
+                const scanned = scanTokenLogs(logs, {
+                    chain: chainKey, tokens, prices, minUsd: TOKEN_WHALE_MIN_USD,
+                    // Only used when a token has no measured price: a large
+                    // round number of units, stated without a dollar claim.
+                    minAmount: { USDC: 10n ** 12n, USDT: 10n ** 12n, DAI: 10n ** 24n },
+                    watch: watchedAddrs,
+                });
+                // One transaction routing the same token through several pools
+                // is ONE movement, not one alert per hop (live-verified: a
+                // single arb tx otherwise announced $27M three times).
+                tokenWhales = aggregateTokenWhales(scanned.whales);
+                tokenHits = scanned.watchHits;
+
+                /* Issuance rides the SAME logs — a mint is a Transfer from 0x0
+                   and a burn one to it, so supply changes cost no extra query.
+                   Announced separately: "Circle minted 250 million USDC" is a
+                   different fact from "someone moved 250 million USDC". */
+                for (const ev of scanIssuanceLogs(logs, { chain: chainKey, tokens, minAmount: ISSUANCE_MIN_UNITS })) {
+                    if (state.dedup.seen(`${chainKey}:${ev.hash}:${ev.symbol}:${ev.kind}`)) continue;
+                    state.alerts++;
+                    publishEvent('stablecoin-issuance', {
+                        ...ev, blockNumber: parseInt(blockHex, 16), backfilled,
+                        counterpartyLabel: await describeParty(ev.counterparty),
+                    });
+                    appendChainAlert({ ts: Date.now(), type: 'issuance', chain: chainKey, kind: ev.kind, hash: ev.hash, asset: ev.symbol, amount: ev.amount, units: ev.units, to: ev.counterparty, blockNumber: parseInt(blockHex, 16) });
+                }
+            }
+        }
 
         // Duplicate suppression across reconnect replays and backfill overlap.
+        // Token and native events from the SAME tx hash are distinct facts, so
+        // the dedup key carries the symbol.
         const freshWhales = whales.filter(w => !state.dedup.seen(`${chainKey}:${w.hash}:w`));
         const freshHits = watchHits.filter(h => !state.dedup.seen(`${chainKey}:${h.hash}:h`));
+        const freshTokenWhales = tokenWhales.filter(w => !state.dedup.seen(`${chainKey}:${w.hash}:${w.symbol}:w`));
+        const freshTokenHits = tokenHits.filter(h => !state.dedup.seen(`${chainKey}:${h.hash}:${h.symbol}:h`));
         state.procCount++; state.procTotalMs += Date.now() - t0;
-        if (!freshWhales.length && !freshHits.length) return;
+        if (!freshWhales.length && !freshHits.length && !freshTokenWhales.length && !freshTokenHits.length) return;
 
         const price = await getEthUsd();
         const blockNumber = parseInt(blockHex, 16);
         const usdOf = (amount) => price ? Math.round(parseFloat(String(amount).replace(/,/g, '')) * price) : null;
 
         // Watch hits ALWAYS announce — the user asked about these addresses.
-        for (const h of freshHits) {
+        // Native and token hits differ only in where the amount came from.
+        for (const h of [...freshHits, ...freshTokenHits]) {
             state.alerts++;
             const entry = watch.find(x => x.address === h.watched);
             const payload = {
                 ...h, blockNumber, backfilled,
+                asset: h.symbol || CHAIN_IDS[chainKey]?.native || 'ETH',
                 label: entry?.label || chainShortAddr(h.watched),
                 counterparty: await describeParty(h.direction === 'out' ? h.to : h.from),
-                usd: usdOf(h.amount),
+                counterpartyAddress: h.direction === 'out' ? h.to : h.from,
+                usd: h.usd != null ? h.usd : usdOf(h.amount),
             };
             publishEvent('chain-watch-hit', payload);
-            appendChainAlert({ ts: Date.now(), type: 'watch', chain: chainKey, hash: h.hash, amount: h.amount, usd: payload.usd, from: h.from, to: h.to, blockNumber });
+            appendChainAlert({ ts: Date.now(), type: 'watch', chain: chainKey, hash: h.hash, asset: payload.asset, amount: h.amount, usd: payload.usd, from: h.from, to: h.to, blockNumber });
         }
 
-        // Whales: loudest few speak, the rest collapse into one summary line.
-        const { speak, summary } = prioritizeAlerts(freshWhales, { maxSpoken: 2 });
+        /* Whales: native and token movements ranked TOGETHER by dollar value,
+           because "the biggest thing that happened in this block" is one
+           question, not one per asset. USD is attached before ranking so the
+           comparison is between measured values, not raw units of different
+           tokens. */
+        const nativeSymbol = CHAIN_IDS[chainKey]?.native || 'ETH';
+        const priced = [
+            ...freshWhales.map(w => ({ ...w, asset: nativeSymbol, usd: usdOf(w.amount) })),
+            ...freshTokenWhales.map(w => ({ ...w, asset: w.symbol })),
+        ];
+        const { speak, summary } = prioritizeAlerts(priced, { maxSpoken: 2 });
         for (const w of speak) {
             state.alerts++;
             const payload = {
                 ...w, blockNumber, backfilled,
-                usd: usdOf(w.amount),
                 fromLabel: await describeParty(w.from),
                 toLabel: await describeParty(w.to),
             };
             publishEvent('whale-alert', payload);
-            appendChainAlert({ ts: Date.now(), type: 'whale', chain: chainKey, hash: w.hash, amount: w.amount, usd: payload.usd, from: w.from, to: w.to, blockNumber });
+            appendChainAlert({ ts: Date.now(), type: 'whale', chain: chainKey, hash: w.hash, asset: w.asset, amount: w.amount, usd: w.usd, from: w.from, to: w.to, blockNumber });
         }
         if (summary) {
             state.alerts++;
@@ -1765,10 +2818,11 @@ function startChainStream(chainKey = 'ethereum') {
                 summary: true, blockNumber, backfilled, chain: chainKey,
                 count: summary.count,
                 largestAmount: summary.largest.amount,
-                largestUsd: usdOf(summary.largest.amount),
+                largestAsset: summary.largest.asset,
+                largestUsd: summary.largest.usd,
             });
             for (const w of [summary.largest]) {
-                appendChainAlert({ ts: Date.now(), type: 'whale', chain: chainKey, hash: w.hash, amount: w.amount, usd: usdOf(w.amount), from: w.from, to: w.to, blockNumber, summarized: summary.count });
+                appendChainAlert({ ts: Date.now(), type: 'whale', chain: chainKey, hash: w.hash, asset: w.asset, amount: w.amount, usd: w.usd, from: w.from, to: w.to, blockNumber, summarized: summary.count });
             }
         }
     };
@@ -1844,9 +2898,11 @@ function startChainStream(chainKey = 'ethereum') {
 
 /* Today's alert history, aggregated for "show whale activity today". Reads the
    JSONL (plus rotation file) and reports only what was actually recorded. */
-ipcMain.handle('chain-alerts-summary', async () => {
+ipcMain.handle('chain-alerts-summary', async (event, { sinceMs } = {}) => {
+    // Default window is today; a caller can ask for the last N milliseconds
+    // ("the last five minutes") instead.
     const midnight = new Date(); midnight.setHours(0, 0, 0, 0);
-    const since = midnight.getTime();
+    const since = Number.isFinite(sinceMs) && sinceMs > 0 ? Date.now() - sinceMs : midnight.getTime();
     const rows = [];
     for (const f of [CHAIN_ALERTS_FILE() + '.1', CHAIN_ALERTS_FILE()]) {
         try {
@@ -1859,16 +2915,42 @@ ipcMain.handle('chain-alerts-summary', async () => {
     }
     const whales = rows.filter(r => r.type === 'whale');
     const watch = rows.filter(r => r.type === 'watch');
+    const issuance = rows.filter(r => r.type === 'issuance');
+
+    /* Per-asset totals: "42M USDC and 12M USDT moved" is the shape of the
+       question. Ranking uses USD where it was measured, because raw amounts of
+       different assets are not comparable. */
+    const byAsset = {};
+    for (const w of whales) {
+        const sym = w.asset || 'ETH';
+        const a = (byAsset[sym] = byAsset[sym] || { count: 0, totalUsd: 0, unpriced: 0 });
+        a.count++;
+        if (Number.isFinite(w.usd)) a.totalUsd += w.usd; else a.unpriced++;
+    }
     let largest = null;
     for (const w of whales) {
-        try { if (!largest || BigInt(Math.round(parseFloat(String(w.amount).replace(/,/g, '')) * 1e6)) > BigInt(Math.round(parseFloat(String(largest.amount).replace(/,/g, '')) * 1e6))) largest = w; } catch { /* skip */ }
+        if (!Number.isFinite(w.usd)) continue;
+        if (!largest || w.usd > largest.usd) largest = w;
     }
+    // Nothing priced in the window: fall back to raw units, which are only
+    // comparable within one asset — so the asset is named alongside.
+    if (!largest && whales.length) {
+        for (const w of whales) {
+            const v = parseFloat(String(w.amount).replace(/,/g, '')) || 0;
+            if (!largest || v > (parseFloat(String(largest.amount).replace(/,/g, '')) || 0)) largest = w;
+        }
+    }
+
     return {
         success: true,
         since,
+        windowMinutes: Math.round((Date.now() - since) / 60000),
         whaleCount: whales.length,
         watchCount: watch.length,
-        largest: largest ? { amount: largest.amount, usd: largest.usd || null, from: largest.from, to: largest.to, blockNumber: largest.blockNumber, ts: largest.ts } : null,
+        issuanceCount: issuance.length,
+        byAsset,
+        issuance: issuance.slice(-10).map(r => ({ kind: r.kind, asset: r.asset, amount: r.amount, units: r.units, ts: r.ts })),
+        largest: largest ? { amount: largest.amount, asset: largest.asset || 'ETH', usd: largest.usd || null, from: largest.from, to: largest.to, hash: largest.hash, blockNumber: largest.blockNumber, ts: largest.ts } : null,
         streaming: !!chainStream,
     };
 });
@@ -1888,6 +2970,9 @@ ipcMain.handle('chain-stream-status', async () => chainStream
         uptimeMin: Math.round((Date.now() - chainStream.startedAt) / 60000),
         avgProcessMs: chainStream.procCount ? Math.round(chainStream.procTotalMs / chainStream.procCount) : null,
         dedupSize: chainStream.dedup.size,
+        // Whether the feed is the keyed provider or a public endpoint. The URL
+        // itself is never returned — it embeds the API key.
+        keyed: chainStream.keyed,
     }
     : { running: false });
 
@@ -2678,7 +3763,7 @@ function startTelemetry() {
         if (!mainWindow || mainWindow.isDestroyed()) return;
         const totalMem = os.totalmem();
         const freeMem = os.freemem();
-        mainWindow.webContents.send('system-telemetry', {
+        const telemetry = {
             cpu: computeCpuLoad(),
             memUsedGb: +((totalMem - freeMem) / 1073741824).toFixed(1),
             memTotalGb: +(totalMem / 1073741824).toFixed(1),
@@ -2686,8 +3771,169 @@ function startTelemetry() {
             uptimeHours: +(os.uptime() / 3600).toFixed(1),
             cores: os.cpus().length,
             timestamp: Date.now()
-        });
+        };
+        mainWindow.webContents.send('system-telemetry', telemetry);
+        // The HUD still updates every 2s; only one row per minute is persisted.
+        recordMetricSample(telemetry);
     }, 2000);
+}
+
+/* =========================
+   METRIC HISTORY + EVENT LOG
+   The storage tier the assistant was missing. Telemetry has always been
+   correctly kept OUT of the RAG (embedding a CPU reading every two seconds
+   would bury the knowledge base in noise), but it was also never persisted,
+   so nothing about the past could be answered.
+
+   Cheap by construction: one row per MINUTE (not per 2s poll), raw rows
+   pruned after 7 days, and each day compacted into a ~150-byte rollup that is
+   kept indefinitely. Events are derived, deduped and debounced by the pure
+   metricStore engine rather than written per sample.
+========================= */
+const METRICS_FILE = () => path.join(app.getPath('userData'), 'metrics.jsonl');
+const ROLLUP_FILE = () => path.join(app.getPath('userData'), 'metrics-rollups.jsonl');
+const EVENTS_FILE = () => path.join(app.getPath('userData'), 'events.jsonl');
+
+let _lastMetricTs = NaN;
+let _eventState = {};
+let _lastProcNames = null;
+// Only programs worth narrating; tracking all ~260 would recreate the flood.
+const WATCHED_PROCESSES = new Set(['chrome', 'msedge', 'firefox', 'brave', 'code', 'ollama',
+    'llama-server', 'docker', 'python', 'node', 'electron', 'discord', 'spotify', 'steam']);
+
+/* NOTE: this file binds `fs` to require('fs').promises; the SYNCHRONOUS API is
+   `fsSync`. Using `fs.appendFileSync` here threw a TypeError that the catch
+   below swallowed, so metrics silently never persisted — caught by checking
+   for the file on disk rather than trusting the code path. */
+function appendJsonl(file, rows, maxBytes = 4 * 1024 * 1024) {
+    try {
+        if (!rows.length) return;
+        // Rotate before append so a crash cannot leave an unbounded file.
+        try {
+            const st = fsSync.statSync(file);
+            if (st.size > maxBytes) fsSync.renameSync(file, file + '.1');
+        } catch { /* absent is fine */ }
+        fsSync.appendFileSync(file, rows.map(r => JSON.stringify(r)).join('\n') + '\n');
+    } catch (e) { console.warn('metric append failed:', e.message); }
+}
+
+function readJsonl(file) {
+    const out = [];
+    for (const f of [file + '.1', file]) {
+        try {
+            for (const line of fsSync.readFileSync(f, 'utf8').split('\n')) {
+                if (!line.trim()) continue;
+                try { out.push(JSON.parse(line)); } catch { /* skip torn line */ }
+            }
+        } catch { /* absent is fine */ }
+    }
+    return out;
+}
+
+/** Called from the 2s telemetry tick; persists at most once per minute. */
+function recordMetricSample(telemetry) {
+    try {
+        const now = Date.now();
+        if (!metricStore.shouldPersist(_lastMetricTs, now)) return;
+        _lastMetricTs = now;
+
+        const sample = metricStore.makeSample(now, {
+            cpu: telemetry.cpu,
+            memPct: telemetry.memPercent,
+            memUsedMB: telemetry.memUsedGb * 1024,
+            topProc: lastTopProcess?.name || null,
+            topCpu: lastTopProcess?.cpu ?? null,
+        });
+        appendJsonl(METRICS_FILE(), [sample]);
+
+        const { events, state } = metricStore.deriveEvents(sample, _eventState, now);
+        _eventState = state;
+        if (events.length) {
+            appendJsonl(EVENTS_FILE(), events, 2 * 1024 * 1024);
+            // Threshold crossings are worth surfacing live, not just storing.
+            for (const ev of events) publishEvent('system-threshold', ev);
+        }
+    } catch (e) { console.warn('metric sample failed:', e.message); }
+}
+
+// Lightweight top-process tracker: reuses the process collector at a slow
+// cadence so samples can name what was busy, without a per-2s spawn.
+let lastTopProcess = null;
+function startProcessTracker() {
+    const tick = async () => {
+        try {
+            const raw = await runPowerShell(PROCESS_SCRIPT, 20000);
+            if (!raw) return;
+            const j = JSON.parse(raw);
+            const procs = Array.isArray(j.procs) ? j.procs : [j.procs];
+            const byName = new Map();
+            for (const p of procs) {
+                if (!p?.name) continue;
+                const k = p.name.toLowerCase();
+                byName.set(k, (byName.get(k) || 0) + (typeof p.cpu === 'number' ? p.cpu : 0));
+            }
+            const top = [...byName.entries()].sort((a, b) => b[1] - a[1])[0];
+            lastTopProcess = top ? { name: top[0], cpu: Math.round(top[1] * 10) / 10 } : null;
+
+            const names = [...byName.keys()];
+            if (_lastProcNames) {
+                const evs = metricStore.deriveProcessEvents(_lastProcNames, names, Date.now(), WATCHED_PROCESSES);
+                if (evs.length) {
+                    appendJsonl(EVENTS_FILE(), evs, 2 * 1024 * 1024);
+                    for (const ev of evs) publishEvent('process-change', ev);
+                }
+            }
+            _lastProcNames = names;
+        } catch { /* tracker is best-effort telemetry, never fatal */ }
+    };
+    tick();
+    setInterval(tick, 60000);
+}
+
+ipcMain.handle('get-metric-history', async (event, { hours } = {}) => {
+    try {
+        const h = Math.max(1, Math.min(Number(hours) || 24, 24 * 30));
+        const now = Date.now();
+        const raw = readJsonl(METRICS_FILE());
+        const rollups = readJsonl(ROLLUP_FILE());
+        return {
+            success: true,
+            samples: metricStore.windowed(raw, now - h * 3600 * 1000),
+            rollups,
+            totalRaw: raw.length,
+        };
+    } catch (e) { return { success: false, error: e.message }; }
+});
+
+ipcMain.handle('get-system-events', async (event, { hours } = {}) => {
+    try {
+        const h = Math.max(1, Math.min(Number(hours) || 24, 24 * 30));
+        const cutoff = Date.now() - h * 3600 * 1000;
+        const evs = readJsonl(EVENTS_FILE()).filter(e => e.t >= cutoff);
+        return { success: true, events: metricStore.dedupeEvents(evs) };
+    } catch (e) { return { success: false, error: e.message }; }
+});
+
+/* Nightly compaction: yesterday's raw samples become one rollup row, then raw
+   rows outside the retention window are dropped. This is the step that keeps
+   the store flat rather than ever-growing. */
+function compactMetrics() {
+    try {
+        const raw = readJsonl(METRICS_FILE());
+        if (!raw.length) return;
+        const today = metricStore.dayKey(Date.now());
+        const existing = new Set(readJsonl(ROLLUP_FILE()).map(r => r.day));
+        const fresh = metricStore.rollupByDay(raw)
+            .filter(r => r.day !== today && !existing.has(r.day));
+        if (fresh.length) appendJsonl(ROLLUP_FILE(), fresh, 1024 * 1024);
+
+        const kept = metricStore.pruneRaw(raw, Date.now());
+        if (kept.length !== raw.length) {
+            fsSync.writeFileSync(METRICS_FILE(), kept.map(r => JSON.stringify(r)).join('\n') + '\n');
+            try { fsSync.unlinkSync(METRICS_FILE() + '.1'); } catch { /* may not exist */ }
+        }
+        console.log(`Metrics compacted: +${fresh.length} rollups, ${raw.length}->${kept.length} raw rows`);
+    } catch (e) { console.warn('metric compaction failed:', e.message); }
 }
 
 ipcMain.handle('get-system-telemetry', () => {

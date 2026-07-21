@@ -24,6 +24,9 @@ export const CHAINS = {
     base: { key: 'base', id: 8453, name: 'Base', native: 'ETH', explorer: 'https://basescan.org' },
     optimism: { key: 'optimism', id: 10, name: 'Optimism', native: 'ETH', explorer: 'https://optimistic.etherscan.io' },
     polygon: { key: 'polygon', id: 137, name: 'Polygon', native: 'POL', explorer: 'https://polygonscan.com' },
+    // Added for Ondo GM tokens (all 440 are deployed on BSC too, verified);
+    // keyless publicnode BSC RPC confirmed live before this entry was made.
+    bsc: { key: 'bsc', id: 56, name: 'BNB Chain', native: 'BNB', explorer: 'https://bscscan.com' },
 };
 
 // Well-known ERC-20s per chain (canonical addresses + decimals). Verified
@@ -133,6 +136,7 @@ export function resolveChain(text, fallback = 'ethereum') {
     if (/\bbase\b/.test(t)) return 'base';
     if (/\b(op|optimism)\b/.test(t)) return 'optimism';
     if (/\b(polygon|matic|pol)\b/.test(t)) return 'polygon';
+    if (/\b(bsc|bnb|binance)\b/.test(t)) return 'bsc';
     if (/\b(eth(ereum)?|mainnet|l1)\b/.test(t)) return 'ethereum';
     return fallback;
 }

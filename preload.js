@@ -71,6 +71,33 @@ contextBridge.exposeInMainWorld('electronAPI', {
     wifiConnect: (name) => ipcRenderer.invoke('wifi-connect', name),
     wifiDisconnect: () => ipcRenderer.invoke('wifi-disconnect'),
     wifiInfo: () => ipcRenderer.invoke('wifi-info'),
+    // Connection-level network visibility (read-only; no capture, no injection)
+    networkConnections: () => ipcRenderer.invoke('network-connections'),
+    portServices: () => ipcRenderer.invoke('port-services'),
+    // Keyboard + window control. Keys go to the FOCUSED window; handlers report
+    // which one received them. Closing is graceful only — no force-kill exists.
+    focusedWindow: () => ipcRenderer.invoke('focused-window'),
+    listWindows: () => ipcRenderer.invoke('list-windows'),
+    typeText: (opts) => ipcRenderer.invoke('type-text', opts),
+    focusWindow: (opts) => ipcRenderer.invoke('focus-window', opts),
+    closeWindow: (opts) => ipcRenderer.invoke('close-window', opts),
+    networkResolve: (opts) => ipcRenderer.invoke('network-resolve', opts),
+    networkTraffic: () => ipcRenderer.invoke('network-traffic'),
+    networkCaptureCapability: () => ipcRenderer.invoke('network-capture-capability'),
+    // Discovery: resolve names, list radios/neighbours (measured, never guessed)
+    resolveHost: (opts) => ipcRenderer.invoke('resolve-host', opts),
+    wifiNetworksDetail: () => ipcRenderer.invoke('wifi-networks-detail'),
+    lanNeighbours: () => ipcRenderer.invoke('lan-neighbours'),
+    bluetoothDevices: () => ipcRenderer.invoke('bluetooth-devices'),
+    // Radio power state (WinRT). radioSet is state-changing and is only called
+    // after the user answers an explicit spoken confirmation.
+    // Full process visibility — read-only; no kill/stop handler exists
+    systemProcesses: () => ipcRenderer.invoke('system-processes'),
+    // Metric history + derived event log (telemetry tier, never embedded in RAG)
+    getMetricHistory: (opts) => ipcRenderer.invoke('get-metric-history', opts),
+    getSystemEvents: (opts) => ipcRenderer.invoke('get-system-events', opts),
+    radioState: () => ipcRenderer.invoke('radio-state'),
+    radioSet: (opts) => ipcRenderer.invoke('radio-set', opts),
     // Finance watchlist (read + manage; NO order placement exists)
     watchlistGet: () => ipcRenderer.invoke('watchlist-get'),
     watchlistAdd: (entry) => ipcRenderer.invoke('watchlist-add', entry),
@@ -87,6 +114,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
     onchainToken: (opts) => ipcRenderer.invoke('onchain-token', opts),
     onchainCall: (opts) => ipcRenderer.invoke('onchain-call', opts),
     onchainTx: (opts) => ipcRenderer.invoke('onchain-tx', opts),
+    // Contract vs externally-owned account — on-chain fact, not attribution
+    onchainCode: (opts) => ipcRenderer.invoke('onchain-code', opts),
+    // Bounded Transfer-log reads (keyless, ~24h window) — Ondo mint/redeem flows
+    onchainLogs: (opts) => ipcRenderer.invoke('onchain-logs', opts),
+    // Dune analytics (key-gated on dune_api_key in the vault; vetted SQL only)
+    duneWhaleTransfers: (opts) => ipcRenderer.invoke('dune-whale-transfers', opts || {}),
+    duneTopHolders: (opts) => ipcRenderer.invoke('dune-top-holders', opts),
+    duneSupplyHistory: (opts) => ipcRenderer.invoke('dune-supply-history', opts),
     // Real-time chain stream + address watchlist (read-only, keyless)
     chainStreamStart: (opts) => ipcRenderer.invoke('chain-stream-start', opts || {}),
     chainStreamStop: () => ipcRenderer.invoke('chain-stream-stop'),
@@ -94,7 +129,17 @@ contextBridge.exposeInMainWorld('electronAPI', {
     chainWatchlistAdd: (opts) => ipcRenderer.invoke('chain-watchlist-add', opts),
     chainWatchlistGet: () => ipcRenderer.invoke('chain-watchlist-get'),
     chainWatchlistRemove: (opts) => ipcRenderer.invoke('chain-watchlist-remove', opts),
-    chainAlertsSummary: () => ipcRenderer.invoke('chain-alerts-summary'),
+    chainAlertsSummary: (opts) => ipcRenderer.invoke('chain-alerts-summary', opts || {}),
+    // Keyed providers — Alchemy (EVM portfolio/prices) + Helius (Solana).
+    // Still read-only; the raw payload comes back and chainIntel.js parses it.
+    chainProvidersStatus: () => ipcRenderer.invoke('chain-providers-status'),
+    chainIssuance: (opts) => ipcRenderer.invoke('chain-issuance', opts || {}),
+    solanaSupply: (opts) => ipcRenderer.invoke('solana-supply', opts || {}),
+    chainPortfolio: (opts) => ipcRenderer.invoke('chain-portfolio', opts),
+    chainPrices: (opts) => ipcRenderer.invoke('chain-prices', opts),
+    solanaActivity: (opts) => ipcRenderer.invoke('solana-activity', opts),
+    solanaAssets: (opts) => ipcRenderer.invoke('solana-assets', opts),
+    solanaCall: (opts) => ipcRenderer.invoke('solana-call', opts),
     fileOperation: (operation, ...args) => ipcRenderer.invoke('file-operation', operation, ...args),
     openWebsite: (url) => ipcRenderer.send('open-website', url),
     readClipboard: () => ipcRenderer.invoke('read-clipboard'),

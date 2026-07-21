@@ -107,5 +107,197 @@ check('short: null means contract creation', shortAddr(null) === 'contract creat
     check('deterministic across calls', a === b);
 }
 
+/* --- ERC-20 whale scanning -------------------------------------------------
+   Most large value on Ethereum moves as stablecoins, so these transfers are
+   the bulk of "where the money went". The traps encoded here: a 6-decimal
+   token read as 18 understates a $4M move by a factor of a trillion, and an
+   ERC-721 log has the same topic0 as an ERC-20 one. */
+{
+    const { TRANSFER_TOPIC, topicToAddress, formatTokenAmount, scanTokenLogs } = pkg;
+    const pad = (addr) => '0x' + '0'.repeat(24) + addr.slice(2);
+    const USDC = '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48';
+    const WETH = '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2';
+    const TOKENS = {
+        [USDC]: { symbol: 'USDC', decimals: 6 },
+        [WETH]: { symbol: 'WETH', decimals: 18 },
+    };
+    const PRICES = { USDC: 1.0, WETH: 1941.69 };
+    const log = (over = {}) => ({
+        address: USDC,
+        topics: [TRANSFER_TOPIC, pad(A), pad(B)],
+        data: hex(4_000_000n * 10n ** 6n), // 4,000,000 USDC
+        transactionHash: '0xdead',
+        ...over,
+    });
+
+    check('topic->address: 32-byte left-padded topic decodes', topicToAddress(pad(A)) === A);
+    check('topic->address: junk returns null, never a truncated address',
+        topicToAddress('0x1234') === null && topicToAddress(null) === null);
+
+    check('token fmt: 6-decimal token is not read as 18',
+        formatTokenAmount(4_000_000n * 10n ** 6n, 6) === '4,000,000');
+    check('token fmt: 18-decimal token', formatTokenAmount(25n * 10n ** 17n, 18) === '2.5');
+    check('token fmt: sub-unit dust keeps a value, never rounds to 0 silently',
+        formatTokenAmount(1n, 6, 6) === '0.000001');
+    check('token fmt: garbage -> 0, no throw', formatTokenAmount('nope', 6) === '0');
+
+    {
+        const { whales } = scanTokenLogs([log()], { tokens: TOKENS, prices: PRICES, minUsd: 1000000 });
+        check('token whale: $4M USDC transfer is caught', whales.length === 1);
+        check('token whale: amount exact at the right decimals', whales[0].amount === '4,000,000');
+        check('token whale: raw units preserved as a string', whales[0].raw === '4000000000000');
+        check('token whale: usd derived from the measured price', whales[0].usd === 4000000);
+        check('token whale: both parties reported', whales[0].from === A && whales[0].to === B);
+        check('token whale: symbol and contract both reported',
+            whales[0].symbol === 'USDC' && whales[0].contract === USDC);
+    }
+
+    check('token whale: below threshold stays silent',
+        scanTokenLogs([log({ data: hex(1000n * 10n ** 6n) })], { tokens: TOKENS, prices: PRICES }).whales.length === 0);
+
+    check('token whale: an unknown contract is ignored, not priced by guess',
+        scanTokenLogs([log({ address: '0x9999999999999999999999999999999999999999' })],
+            { tokens: TOKENS, prices: PRICES }).whales.length === 0);
+
+    check('token whale: ERC-721 (4 topics) is not a value transfer',
+        scanTokenLogs([log({ topics: [TRANSFER_TOPIC, pad(A), pad(B), pad(C)], data: '0x' })],
+            { tokens: TOKENS, prices: PRICES }).whales.length === 0);
+
+    check('token whale: a non-Transfer log is skipped',
+        scanTokenLogs([log({ topics: ['0x' + '1'.repeat(64), pad(A), pad(B)] })],
+            { tokens: TOKENS, prices: PRICES }).whales.length === 0);
+
+    check('token whale: zero-value transfer ignored',
+        scanTokenLogs([log({ data: '0x0' })], { tokens: TOKENS, prices: PRICES }).whales.length === 0);
+
+    {
+        // No price -> significance cannot be judged in dollars. Silence unless
+        // the caller supplied a raw floor.
+        const noPrice = scanTokenLogs([log()], { tokens: TOKENS, prices: {} });
+        check('token whale: unpriced token is not announced on a guess', noPrice.whales.length === 0);
+        const floored = scanTokenLogs([log()], { tokens: TOKENS, prices: {}, minAmount: { USDC: 1_000_000n * 10n ** 6n } });
+        check('token whale: unpriced token uses the raw floor when given',
+            floored.whales.length === 1 && floored.whales[0].usd === null);
+    }
+
+    {
+        const hits = scanTokenLogs([log(), log({ topics: [TRANSFER_TOPIC, pad(C), pad(A)], data: hex(5n * 10n ** 6n) })],
+            { tokens: TOKENS, prices: PRICES, watch: [A] }).watchHits;
+        check('token watch: both directions caught regardless of size', hits.length === 2);
+        check('token watch: direction out when the watched address sends',
+            hits[0].direction === 'out' && hits[0].watched === A);
+        check('token watch: direction in when it receives',
+            hits[1].direction === 'in' && hits[1].watched === A);
+        check('token watch: small transfers still reported for a watched address',
+            hits[1].amount === '5');
+    }
+
+    check('token whale: garbage input -> empty, never throws',
+        scanTokenLogs(null).whales.length === 0 && scanTokenLogs([null, {}, { topics: [] }]).whales.length === 0);
+
+    {
+        const a = JSON.stringify(scanTokenLogs([log()], { tokens: TOKENS, prices: PRICES, watch: [B] }));
+        const b = JSON.stringify(scanTokenLogs([log()], { tokens: TOKENS, prices: PRICES, watch: [B] }));
+        check('token scan: deterministic across calls', a === b);
+    }
+
+    /* --- per-transaction aggregation --------------------------------------
+       Regression tests for a bug caught by a live drill, not by unit fixtures:
+       one arbitrage tx moved 14,050 WETH through three hops and the stream
+       announced "$27 million" three times. */
+    {
+        const { aggregateTokenWhales } = pkg;
+        const D = '0xdddddddddddddddddddddddddddddddddddddddd';
+        const hop = (from, to, units, over = {}) => ({
+            chain: 'ethereum', kind: 'token', hash: '0xsame', contract: USDC, symbol: 'USDC',
+            decimals: 6, from, to, raw: String(units * 1000000n),
+            amount: formatTokenAmount(units * 1000000n, 6), usd: Number(units), ...over,
+        });
+
+        const route = aggregateTokenWhales([hop(A, B, 4000000n), hop(B, C, 4000000n), hop(C, D, 4000000n)]);
+        check('aggregate: a three-hop route is ONE movement', route.length === 1);
+        check('aggregate: reports the true source and final destination',
+            route[0].from === A && route[0].to === D);
+        check('aggregate: amount is what left the source, not the sum of hops',
+            route[0].amount === '4,000,000' && route[0].usd === 4000000);
+        check('aggregate: hop count is kept as context', route[0].hops === 3);
+        check('aggregate: a straight route is not a round trip', route[0].roundTrip === false);
+
+        const cycle = aggregateTokenWhales([hop(A, B, 1000000n), hop(B, A, 1000000n)]);
+        check('aggregate: money returning to its origin is flagged as a round trip',
+            cycle.length === 1 && cycle[0].roundTrip === true);
+
+        const twoTx = aggregateTokenWhales([hop(A, B, 2000000n), hop(A, B, 3000000n, { hash: '0xother' })]);
+        check('aggregate: separate transactions stay separate', twoTx.length === 2);
+        check('aggregate: output ordered biggest first', twoTx[0].usd === 3000000);
+
+        const twoTokens = aggregateTokenWhales([
+            hop(A, B, 2000000n),
+            { ...hop(A, B, 5n), contract: WETH, symbol: 'WETH', decimals: 18, raw: String(5n * 10n ** 18n), amount: '5', usd: 9708 },
+        ]);
+        check('aggregate: two tokens in one tx are two movements', twoTokens.length === 2);
+
+        check('aggregate: single transfer passes through unchanged in value',
+            aggregateTokenWhales([hop(A, B, 7000000n)])[0].amount === '7,000,000');
+        check('aggregate: empty/garbage input is safe',
+            aggregateTokenWhales([]).length === 0 && aggregateTokenWhales(null).length === 0);
+        check('aggregate: deterministic across calls', (() => {
+            const rows = [hop(A, B, 4000000n), hop(B, C, 4000000n)];
+            return JSON.stringify(aggregateTokenWhales(rows)) === JSON.stringify(aggregateTokenWhales([...rows].reverse()));
+        })());
+    }
+
+    /* --- issuance (mint/burn) --------------------------------------------- */
+    {
+        const { scanIssuanceLogs, summarizeIssuance, ZERO_ADDRESS } = pkg;
+        const iss = (from, to, units, over = {}) => ({
+            address: USDC,
+            topics: [TRANSFER_TOPIC, pad(from), pad(to)],
+            data: hex(units * 1000000n),
+            transactionHash: '0xiss',
+            blockNumber: '0x1863a94',
+            ...over,
+        });
+
+        const mints = scanIssuanceLogs([iss(ZERO_ADDRESS, A, 5000000n)], { tokens: TOKENS });
+        check('issuance: transfer from 0x0 is a mint', mints.length === 1 && mints[0].kind === 'mint');
+        check('issuance: mint amount exact at token decimals', mints[0].amount === '5,000,000');
+        check('issuance: counterparty is where the new supply landed', mints[0].counterparty === A);
+        check('issuance: block number decoded', mints[0].blockNumber === 0x1863a94);
+
+        const burns = scanIssuanceLogs([iss(A, ZERO_ADDRESS, 7500000n)], { tokens: TOKENS });
+        check('issuance: transfer to 0x0 is a burn', burns.length === 1 && burns[0].kind === 'burn');
+        check('issuance: burn counterparty is who burned it', burns[0].counterparty === A);
+
+        check('issuance: an ordinary transfer is not an issuance event',
+            scanIssuanceLogs([iss(A, B, 9000000n)], { tokens: TOKENS }).length === 0);
+        check('issuance: below the treasury threshold is ignored',
+            scanIssuanceLogs([iss(ZERO_ADDRESS, A, 500n)], { tokens: TOKENS }).length === 0);
+        check('issuance: threshold is configurable',
+            scanIssuanceLogs([iss(ZERO_ADDRESS, A, 500n)], { tokens: TOKENS, minAmount: 100 }).length === 1);
+        check('issuance: unknown contract ignored',
+            scanIssuanceLogs([iss(ZERO_ADDRESS, A, 5000000n, { address: '0x9999999999999999999999999999999999999999' })], { tokens: TOKENS }).length === 0);
+        check('issuance: garbage is safe',
+            scanIssuanceLogs(null).length === 0 && scanIssuanceLogs([{}, null]).length === 0);
+        check('issuance: largest first', (() => {
+            const rows = scanIssuanceLogs([iss(ZERO_ADDRESS, A, 2000000n), iss(ZERO_ADDRESS, B, 9000000n, { transactionHash: '0xb' })], { tokens: TOKENS });
+            return rows[0].units === 9000000;
+        })());
+
+        const sum = summarizeIssuance([
+            { symbol: 'USDC', kind: 'mint', units: 5000000 },
+            { symbol: 'USDC', kind: 'mint', units: 1000000 },
+            { symbol: 'USDC', kind: 'burn', units: 7500000 },
+            { symbol: 'USDT', kind: 'mint', units: 3000000 },
+        ]);
+        check('issuance summary: nets mints against burns per token',
+            sum.USDC.minted === 6000000 && sum.USDC.burned === 7500000 && sum.USDC.net === -1500000);
+        check('issuance summary: counts events', sum.USDC.mints === 2 && sum.USDC.burns === 1);
+        check('issuance summary: tracks the largest single event', sum.USDC.largest.units === 7500000);
+        check('issuance summary: tokens kept separate', sum.USDT.net === 3000000);
+        check('issuance summary: empty input is safe', Object.keys(summarizeIssuance([])).length === 0);
+    }
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
