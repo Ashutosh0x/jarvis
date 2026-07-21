@@ -15,6 +15,7 @@ import * as chainIntel from './services/chainIntel.js';
 import * as prediction from './services/predictionMarkets.js';
 import * as security from './services/security.js';
 import * as feeds from './services/feeds.js';
+import * as feedback from './services/feedback.js';
 import { parseOndoQuery, ONDO_COUNT, HOT_LIST as ONDO_HOT_LIST } from './services/ondoRegistry.js';
 import * as netInspect from './services/netInspect.js';
 import * as netDiscovery from './services/netDiscovery.js';
@@ -1252,6 +1253,13 @@ class Jarvis {
         const priceEntity = this.parsePriceQuery(cmd);
         if (priceEntity) return { intent: 'PRICE_QUERY', entity: priceEntity };
 
+        /* SELF-CRITIQUE — "what are you getting wrong", "where do you fail".
+           Answered from the interaction log, so it reports measured failures
+           rather than a modest-sounding guess. */
+        if (/\b(what are you getting wrong|where do you fail|what do you get wrong|your (weak|failure)|self ?critique|how often are you wrong)\b/.test(cmd)) {
+            return { intent: 'SELF_CRITIQUE' };
+        }
+
         /* FEED BRIEF — "brief me", "what changed today", "anything new".
            Checked before the news matcher: this reads the ingested event log
            with provenance, which is a different and better answer than a fresh
@@ -1633,6 +1641,9 @@ class Jarvis {
                     break;
                 case 'NEWS_QUERY':
                     await this.handleNewsQuery(intent.topic);
+                    break;
+                case 'SELF_CRITIQUE':
+                    await this.handleSelfCritique();
                     break;
                 case 'FEED_BRIEF':
                     await this.handleFeedBrief(intent.hours);
@@ -4363,6 +4374,43 @@ class Jarvis {
         console.log(`Feeds: ${fresh.length} new events, ${stored} into memory, ${failed.length} feeds unreachable`);
         if (announce) this.speak(feeds.describeBrief(fresh));
         return { ingested: fresh.length, stored, failed };
+    }
+
+    /* Where the ROUTER is wrong on real traffic. The 1000-prompt harness scores
+       prompts I wrote; this scores what actually happened in front of the user,
+       which is the only set neither of us can bias. Nothing here changes a
+       weight — it ranks what to fix next by evidence. */
+    async handleSelfCritique() {
+        if (!window.electronAPI?.getInteractions) { this.speak('The interaction log is not available here, Sir.'); return; }
+        const r = await window.electronAPI.getInteractions({ sinceTs: 0 }).catch(() => null);
+        const turns = r?.interactions || r?.rows || [];
+        if (!turns.length) { this.speak('I have no interaction history to learn from yet, Sir.'); return; }
+
+        const a = feedback.analyze(turns);
+        const missed = feedback.rankFallbacks(a.fallbacks);
+        const lines = [`Self-critique over ${a.total} recorded turns`, ''];
+        if (missed.length) {
+            lines.push('QUESTIONS THAT REACHED THE MODEL BUT HAVE A HANDLER');
+            for (const g of missed) {
+                lines.push(`  ${String(g.count).padStart(3)}  ${g.handler.padEnd(11)} ${Math.round(g.wastedMs / 1000)}s of model time`);
+                for (const ex of g.examples) lines.push(`         "${ex.slice(0, 72)}"`);
+            }
+            lines.push('');
+        }
+        lines.push(`rephrased: ${a.rephrases.length}    corrected: ${a.corrections.length}`);
+        if (a.worstIntents.length) {
+            lines.push('', 'WEAKEST PATHS');
+            for (const w of a.worstIntents.slice(0, 6)) {
+                lines.push(`  ${w.intent.padEnd(16)} ${Math.round(w.failRate * 100)}% of ${w.turns} turns`);
+            }
+        }
+        /* The log spans fixes: a question that missed a handler in the morning
+           may route correctly now. Said out loud so the list is not mistaken
+           for a list of CURRENT bugs. */
+        lines.push('', 'Note: this log spans past fixes — some entries are already resolved.');
+        this.displayText(lines.join('\n'), null);
+        this.speak(feedback.describeFailures(a) + ' Some of those are already fixed; the log goes back further than the fixes do.');
+        this._lastFactual = { text: lines.join('\n'), at: Date.now() };
     }
 
     /** "brief me" / "what changed today" — from the recorded log, not a fresh guess. */
