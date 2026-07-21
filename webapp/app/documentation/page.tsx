@@ -672,10 +672,10 @@ npm run electron`}</Code>
               probe actually verified.
             </p>
             <p>
-              The test suite runs on plain <Term>node</Term> with no framework — 934 checks
-              across 24 files, including routing tests that drive the real intent parser,
-              because every routing bug this project has had ended as a confident, wrong
-              answer rather than an error.
+              The test suite runs on plain <Term>node</Term> with no framework —{" "}
+              <Term>npm test</Term> prints 987 checks across 27 suites, including routing
+              tests that drive the real intent parser, because every routing bug this
+              project has had ended as a confident, wrong answer rather than an error.
             </p>
           </Section>
 

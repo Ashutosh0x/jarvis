@@ -4,6 +4,8 @@
   "description": "JARVIS - Advanced Audio Visualizer and AI Assistant",
   "main": "electron.js",
   "scripts": {
+    "test": "node scripts/run-tests.mjs",
+    "eval": "node eval/retrieval-eval.mjs && node eval/memory-eval.mjs",
     "dev": "vite",
     "build": "vite build",
     "electron": "node node_modules/electron/cli.js .",

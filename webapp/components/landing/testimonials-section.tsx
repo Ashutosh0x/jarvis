@@ -56,7 +56,7 @@ export function TestimonialsSection() {
         {/* Section Label */}
         <div className="flex items-center gap-4 mb-16">
           <span className="font-mono text-xs tracking-widest text-muted-foreground uppercase">
-            What it stands for
+            Design principles — not testimonials
           </span>
           <div className="flex-1 h-px bg-foreground/10" />
           <span className="font-mono text-xs text-muted-foreground">
@@ -72,28 +72,27 @@ export function TestimonialsSection() {
                 isAnimating ? "opacity-0 translate-y-4" : "opacity-100 translate-y-0"
               }`}
             >
+              {/* No quotation marks, no avatar, no author line. These are design
+                  principles, not customer quotes — and a carousel with initials
+                  in a circle reads as real people no matter what the label says.
+                  There are no testimonials here because no user has been asked
+                  for one. */}
               <p className="font-display text-4xl md:text-5xl lg:text-6xl leading-[1.1] tracking-tight text-foreground">
-                "{activeTestimonial.quote}"
+                {activeTestimonial.quote}
               </p>
             </blockquote>
 
-            {/* Author */}
+            {/* Which principle, and what it buys */}
             <div
-              className={`mt-12 flex items-center gap-6 transition-all duration-300 delay-100 ${
+              className={`mt-12 flex items-baseline gap-4 flex-wrap transition-all duration-300 delay-100 ${
                 isAnimating ? "opacity-0" : "opacity-100"
               }`}
             >
-              <div className="w-16 h-16 rounded-full bg-foreground/5 border border-foreground/10 flex items-center justify-center">
-                <span className="font-display text-2xl text-foreground">
-                  {activeTestimonial.author.charAt(0)}
-                </span>
-              </div>
-              <div>
-                <p className="text-lg font-medium text-foreground">{activeTestimonial.author}</p>
-                <p className="text-muted-foreground">
-                  {activeTestimonial.role}, {activeTestimonial.company}
-                </p>
-              </div>
+              <span className="font-mono text-xs uppercase tracking-widest text-muted-foreground">
+                {activeTestimonial.role}
+              </span>
+              <span className="text-lg font-medium text-foreground">{activeTestimonial.author}</span>
+              <span className="text-muted-foreground">— {activeTestimonial.company}</span>
             </div>
           </div>
 

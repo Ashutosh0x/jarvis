@@ -120,6 +120,33 @@ function stubFetch(map, { calls = [] } = {}) {
     check('discover: an endpoint claiming the wrong chain is never adopted',
         !('ethereum' in liar.verified) && /mismatch/.test(liar.rejected.ethereum));
 
+    /* Transient vs verdict. Observed live: one startup dropped Ethereum because
+       a single probe exceeded six seconds, so the session ran keyless on the
+       chain that matters most. A timeout is retried; a 403 is not. */
+    {
+        let attempts = 0;
+        const flaky = async (url) => {
+            attempts++;
+            if (attempts === 1) { const e = new Error('aborted'); e.name = 'AbortError'; throw e; }
+            return okRes({ jsonrpc: '2.0', id: 1, result: hex(1) });
+        };
+        const r = await cp.discoverAlchemyNetworks('K', { ethereum: { id: 1 } }, flaky);
+        check('discover: a timed-out probe is retried, not written off',
+            r.verified.ethereum?.chainId === 1 && attempts === 2, `attempts: ${attempts}`);
+    }
+    {
+        let attempts = 0;
+        const denied = async () => { attempts++; return errRes(403); };
+        const r = await cp.discoverAlchemyNetworks('K', { base: { id: 8453 } }, denied);
+        check('discover: a 403 verdict is NOT retried', !r.verified.base && attempts === 1, `attempts: ${attempts}`);
+    }
+    {
+        let attempts = 0;
+        const liar = async () => { attempts++; return okRes({ jsonrpc: '2.0', id: 1, result: hex(999) }); };
+        const r = await cp.discoverAlchemyNetworks('K', { ethereum: { id: 1 } }, liar);
+        check('discover: a chain-id mismatch is NOT retried', !r.verified.ethereum && attempts === 1, `attempts: ${attempts}`);
+    }
+
     const keyless = await cp.discoverAlchemyNetworks(null, CHAINS, () => { throw new Error('should not be called'); });
     check('discover: no key -> no probes, no throw, empty result',
         Object.keys(keyless.verified).length === 0 && Object.keys(keyless.rejected).length === 0);

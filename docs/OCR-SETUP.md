@@ -1,7 +1,14 @@
 # Jarvis Local AI Setup — Unlimited-OCR + Gemma Local Mode
 
-Jarvis supports two local, fully private AI backends. Both are optional — Jarvis
-falls back to cloud Gemini when they're offline.
+Jarvis supports two local, fully private AI backends.
+
+This document previously said Jarvis "falls back to cloud Gemini when they're
+offline". **That is no longer true and this note exists because the stale
+sentence was later read, reasonably, as evidence that screenshots were being
+sent to Google.** Vision runs on local Gemma; the only fallback for screen
+reading is the optional OCR server below, which also listens on loopback. When
+neither is running, Jarvis says it cannot read the screen rather than sending it
+anywhere.
 
 ---
 
@@ -49,7 +56,7 @@ elsewhere.
 |---|---|---|
 | Voice: "read my screen" / `ocr_screen` tool | `gundam` (dynamic res) | dense single-page layouts |
 | Voice: "parse ~/Downloads/x.pdf" / `parse_document_ocr` tool | `base` (1024×1024) | multi-page, up to 20 pages/pass |
-| Typed: "read screen" command | auto | local OCR if server is up, else Gemini Vision |
+| Typed: "read screen" command | auto | local Gemma vision; local OCR server as fallback |
 
 The anti-repetition logits processor (`ngram_size=35`, window 128/1024) is
 applied per the model card.

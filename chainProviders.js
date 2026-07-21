@@ -116,10 +116,23 @@ async function discoverAlchemyNetworks(key, chains, fetchImpl) {
     const rejected = {};
     if (!key) return { verified, rejected };
 
+    /* A rejection means two different things and they deserve different
+       treatment. "http 403" or a chain-id mismatch is a VERDICT — the key does
+       not serve this network, and asking again will not change that. A timeout
+       or a failed connection is NOISE, and observed live: one startup dropped
+       Ethereum entirely because a single probe took longer than six seconds,
+       leaving the session on public endpoints for the chain that matters most.
+       Transient failures are retried once; verdicts are not. */
+    const isTransient = (reason) => /timeout|failed|ENOTFOUND|ECONN|socket|network|http 5\d\d|http 429/i.test(reason || '');
+
     await Promise.all(Object.entries(chains).map(async ([chainKey, meta]) => {
         const reasons = [];
         for (const slug of slugCandidates(chainKey)) {
-            const r = await probeSlug(slug, key, meta.id, fetchImpl);
+            let r = await probeSlug(slug, key, meta.id, fetchImpl);
+            if (!r.ok && isTransient(r.reason)) {
+                reasons.push(`${slug}: ${r.reason} (retrying)`);
+                r = await probeSlug(slug, key, meta.id, fetchImpl, 10000);
+            }
             if (r.ok) {
                 verified[chainKey] = { slug, chainId: r.chainId, url: alchemyRpcUrl(slug, key) };
                 return;

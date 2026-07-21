@@ -145,6 +145,47 @@ export function describePortfolio(holdings, { limit = 5 } = {}) {
     return line;
 }
 
+/* --- Time -------------------------------------------------------------------
+   Alerts without a time are hard to act on: "2.98 million USDC moved" reads the
+   same whether it happened twelve seconds ago or was recovered from a block
+   missed during a twenty-minute outage. Both forms are given — relative for
+   speech, because nobody converts a clock time in their head mid-sentence, and
+   absolute for the screen, because that is what you correlate against an
+   explorer or a log. */
+
+/**
+ * "just now" / "3 minutes ago" / "2 hours ago". Deliberately coarse: block
+ * timestamps have second resolution and a spoken alert does not benefit from
+ * more precision than the listener can use.
+ * @param {number} ts   milliseconds
+ * @param {number} [now]
+ */
+export function timeAgo(ts, now = Date.now()) {
+    if (!Number.isFinite(ts) || ts <= 0) return null;
+    const secs = Math.round((now - ts) / 1000);
+    // A block timestamp can sit a second or two in the future relative to this
+    // clock; that is clock skew, not a time traveller, so it reads as "just now".
+    if (secs < 0) return 'just now';
+    if (secs < 20) return 'just now';
+    // Switch to minutes at 60, not 90: "60 seconds ago" is not how anyone says
+    // it out loud, and these lines are spoken.
+    if (secs < 60) return `${secs} seconds ago`;
+    const mins = Math.round(secs / 60);
+    if (mins < 60) return `${mins} minute${mins === 1 ? '' : 's'} ago`;
+    const hours = Math.round(mins / 60);
+    if (hours < 24) return `${hours} hour${hours === 1 ? '' : 's'} ago`;
+    const days = Math.round(hours / 24);
+    return `${days} day${days === 1 ? '' : 's'} ago`;
+}
+
+/** Wall-clock time for the screen: 20:14:32. */
+export function clockTime(ts) {
+    if (!Number.isFinite(ts) || ts <= 0) return null;
+    const d = new Date(ts);
+    const p = (n) => String(n).padStart(2, '0');
+    return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
 /* --- Prices ---------------------------------------------------------------- */
 
 /** parse by-symbol / by-address price payloads into a symbol -> price map. */
@@ -280,6 +321,6 @@ export function describeSolanaAssets({ total, assets, nativeSol }) {
 
 export default {
     usdPrice, parseTokenHoldings, portfolioTotal, formatUsd, describePortfolio,
-    parsePrices, describePrices,
+    parsePrices, describePrices, timeAgo, clockTime,
     parseSolanaActivity, describeSolanaActivity, parseSolanaAssets, describeSolanaAssets,
 };

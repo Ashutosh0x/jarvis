@@ -7,6 +7,12 @@ class SettingsManager {
             speechRate: 0.9,
             speechPitch: 1.0,
             speechVolume: 1.0,
+            /* Silence between spoken lines. The browser plays queued utterances
+               back to back, which turns a three-fact answer into one unbroken
+               run of speech — the listener never gets a boundary to process one
+               fact before the next arrives. The gap sits INSIDE the microphone
+               gate, so Jarvis cannot hear its own next line during it. */
+            speechGapMs: 450,
             voiceName: null, // Will be set automatically to a male voice
             visualizerMode: 'sphere',
             visualizerSensitivity: 1.0,

@@ -837,6 +837,22 @@ class Jarvis {
 
             // Flush the queue: the newest information wins
             this.synthesis.cancel();
+            this._flushSpeechQueue();
+
+            /* Multi-sentence answers go through the paced queue so they get the
+               same breathing room as streamed ones. A whale alert is three
+               facts — amount, both parties, the block — and running them
+               together is what makes the delivery feel rushed. Single-sentence
+               answers keep the direct path below, including its resume() nudge
+               for Chromium's long-utterance pause bug. */
+            const sentences = clean.match(/[^.!?]+[.!?]+(\s|$)|[^.!?]+$/g)?.map(s => s.trim()).filter(Boolean) || [];
+            if (sentences.length > 1) {
+                this.ttsActive = true;
+                this._utterCount = sentences.length;
+                this._speechQueue = sentences;
+                this._drainSpeech();
+                return;
+            }
 
             const utterance = new SpeechSynthesisUtterance(clean);
             if (this.selectedVoice) utterance.voice = this.selectedVoice;
@@ -1824,12 +1840,17 @@ class Jarvis {
         }
     }
 
-    // Screen Analysis Handler
-    // Prefers local Unlimited-OCR (private, structured Markdown) when the
-    // SGLang server is up; falls back to Gemini Vision otherwise.
-    // Read the screen: screenshot -> base64 -> local Gemma vision -> spoken
-    // answer. Fully offline (gemma3 is multimodal). Answers the user's ACTUAL
-    // question ("what error is showing?") rather than a fixed prompt.
+    /* Screen Analysis Handler.
+       screenshot -> base64 -> local Gemma vision -> spoken answer. Fully
+       offline; gemma3 is multimodal. Answers the user's ACTUAL question
+       ("what error is showing?") rather than a fixed prompt.
+
+       NOTE the fallback order, because a stale comment here previously claimed
+       a Gemini Vision fallback and an audit reasonably read that as the code
+       sending screenshots to Google. It does not, and has not since vision went
+       local: the only fallback is the OPTIONAL Unlimited-OCR server, which also
+       runs on loopback. If neither is up, the screen is not read and that is
+       said plainly. No capture leaves this machine on this path. */
     async handleReadScreen(question) {
         try {
             if (!window.electronAPI || !window.electronAPI.captureScreen) {
@@ -4036,14 +4057,34 @@ class Jarvis {
             return;
         }
         const items = res.items;
+        /* WHEN each headline was published, spoken as well as displayed. It was
+           computed and shown on screen but dropped from speech, so a listener
+           got no way to tell a story filed twenty minutes ago from one filed
+           two days ago — and no way to notice a feed that had gone stale. */
         const display = items.map((it, i) =>
-            `${i + 1}. ${it.title}${it.source ? `  — ${it.source}` : ''}${it.publishedText ? `  (${it.publishedText})` : ''}`
+            `${i + 1}. ${it.title}${it.source ? `  — ${it.source}` : ''}` +
+            `${it.publishedLocal ? `\n     ${it.publishedLocal}${it.publishedText ? ` (${it.publishedText})` : ''}` : ''}`
         ).join('\n');
-        this.displayText(`${topic ? `News: ${topic}` : 'Top headlines'}\n${display}`, null);
+
+        const now = new Date();
+        const header = `${topic ? `News: ${topic}` : 'Top headlines'} — read at ${now.toLocaleString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })}` +
+            `${res.provider ? ` via ${res.provider}` : ''}`;
+        this.displayText(`${header}\n${display}`, null);
+
         const spoken = items.slice(0, 3).map((it, i) =>
-            `${i + 1}. ${it.title}${it.source ? `, from ${it.source}` : ''}`
+            `${i + 1}. ${it.title}${it.source ? `, from ${it.source}` : ''}${it.publishedText ? `, ${it.publishedText.replace(/(\d+)m ago/, '$1 minutes ago').replace(/(\d+)h ago/, '$1 hours ago').replace(/(\d+)d ago/, '$1 days ago')}` : ''}`
         ).join('. ');
-        this.speak(`${topic ? `Here's the latest on ${topic}. ` : 'Here are the top headlines. '}${spoken}.`);
+
+        /* A provider that starts serving a cached feed looks healthy from the
+           inside; the only tell is the age of its newest story. Six hours is
+           well beyond normal for a wire feed, so past that the age is stated
+           plainly instead of the headlines being read as though they are current. */
+        const stale = Number.isFinite(res.newestAgeMinutes) && res.newestAgeMinutes > 360;
+        const lead = topic ? `Here's the latest on ${topic}. ` : 'Here are the top headlines. ';
+        const caveat = stale
+            ? ` Note that the freshest story here is ${Math.round(res.newestAgeMinutes / 60)} hours old, Sir, so this feed may not be current.`
+            : '';
+        this.speak(`${lead}${spoken}.${caveat}`);
     }
 
     // Surface the interaction log — the self-improvement telemetry — as a
@@ -4712,7 +4753,8 @@ class Jarvis {
                         const late = w.backfilled ? ' (recovered from a missed block)' : '';
                         if (w.summary) {
                             const usd = w.largestUsd ? ` (about ${w.largestUsd.toLocaleString('en-US')} dollars)` : '';
-                            const line = `${w.count} further large transfers in block ${w.blockNumber}, the largest ${w.largestAmount} ${w.largestAsset || 'ETH'}${usd}.`;
+                            const sAgo = chainIntel.timeAgo(w.blockTs);
+                            const line = `${w.count} further large transfers in block ${w.blockNumber}${sAgo ? `, ${sAgo}` : ''}, the largest ${w.largestAmount} ${w.largestAsset || 'ETH'}${usd}.`;
                             this.displayText(`Whale summary: ${line}${late}`, null);
                             if (this._whaleAlertsOn) this.speak(`Also, ${line}`);
                             break;
@@ -4727,14 +4769,22 @@ class Jarvis {
                         ]);
                         const asset = w.asset || 'ETH';
                         const usd = w.usd ? `, approximately ${w.usd.toLocaleString('en-US')} dollars,` : '';
+                        /* When it happened, from the block's own timestamp. A
+                           live head is seconds old and a recovered one can be
+                           many minutes old; announcing both the same way would
+                           make stale news sound current. */
+                        const ago = chainIntel.timeAgo(w.blockTs);
+                        const clock = chainIntel.clockTime(w.blockTs);
+                        const when = ago ? `, ${ago}` : '';
                         // A multi-hop route is one movement taking a path, and a
                         // round trip is money that ended up back where it began —
                         // saying "moved from A to B" for either would misdescribe it.
                         const route = w.hops > 1 ? ` It took ${w.hops} hops inside one transaction${w.roundTrip ? ', and returned to where it started' : ''}.` : '';
-                        const spokenLine = `${w.amount} ${asset}${usd} moved from ${this._partyPhrase(fromInfo, w.fromLabel)} to ${this._partyPhrase(toInfo, w.toLabel)} in block ${w.blockNumber}.${route}`;
+                        const spokenLine = `${w.amount} ${asset}${usd} moved from ${this._partyPhrase(fromInfo, w.fromLabel)} to ${this._partyPhrase(toInfo, w.toLabel)} in block ${w.blockNumber}${when}.${route}`;
 
                         const detail = [
                             `Whale alert — ${w.amount} ${asset}${w.usd ? ` ($${w.usd.toLocaleString('en-US')})` : ''} on ${w.chain || 'ethereum'}${late}`,
+                            clock ? `TIME ${clock}${ago ? ` (${ago})` : ''}` : null,
                             w.hops > 1 ? `ROUTE ${w.hops} hops in one transaction${w.roundTrip ? ' (round trip)' : ''}` : null,
                             `FROM ${w.from || 'contract creation'}${fromInfo.ensName ? ` (${fromInfo.ensName})` : ''}${fromInfo.facts.length ? ` — ${fromInfo.facts.join(', ')}` : ''}`,
                             `TO   ${w.to || 'contract creation'}${toInfo.ensName ? ` (${toInfo.ensName})` : ''}${toInfo.facts.length ? ` — ${toInfo.facts.join(', ')}` : ''}`,
@@ -4754,12 +4804,15 @@ class Jarvis {
                            it, so no issuer is named as the actor. */
                         const e = evt.payload;
                         const verb = e.kind === 'mint' ? 'minted into' : 'burned from';
-                        const line = `${e.amount} ${e.symbol} was ${verb} circulation in block ${e.blockNumber}.`;
+                        const eAgo = chainIntel.timeAgo(e.blockTs);
+                        const eClock = chainIntel.clockTime(e.blockTs);
+                        const line = `${e.amount} ${e.symbol} was ${verb} circulation in block ${e.blockNumber}${eAgo ? `, ${eAgo}` : ''}.`;
                         this.displayText([
                             `Stablecoin ${e.kind.toUpperCase()} — ${e.amount} ${e.symbol} on ${e.chain}`,
+                            eClock ? `TIME ${eClock}${eAgo ? ` (${eAgo})` : ''}` : null,
                             `${e.kind === 'mint' ? 'TO  ' : 'FROM'} ${e.counterparty}`,
                             `TX   ${e.hash}`,
-                        ].join('\n'), null);
+                        ].filter(Boolean).join('\n'), null);
                         if (this._whaleAlertsOn) this.speak(`Sir, stablecoin supply change. ${line}`);
                         break;
                     }
@@ -4772,9 +4825,16 @@ class Jarvis {
                         const other = h.direction === 'out' ? 'to' : 'from';
                         const usd = h.usd ? ` — roughly ${h.usd.toLocaleString('en-US')} dollars` : '';
                         const cpInfo = await this.describeAddress(h.counterpartyAddress);
-                        const line = `${h.label} just ${verb} ${h.amount} ${h.asset || 'ETH'} ${other} ${this._partyPhrase(cpInfo, h.counterparty)} in block ${h.blockNumber}${usd}.`;
+                        const hAgo = chainIntel.timeAgo(h.blockTs);
+                        const hClock = chainIntel.clockTime(h.blockTs);
+                        // "just" is only honest for a live block. A recovered one
+                        // can be twenty minutes old, and saying "just" would be a
+                        // small lie told confidently.
+                        const recent = hAgo === 'just now';
+                        const line = `${h.label} ${recent ? 'just ' : ''}${verb} ${h.amount} ${h.asset || 'ETH'} ${other} ${this._partyPhrase(cpInfo, h.counterparty)} in block ${h.blockNumber}${hAgo && !recent ? `, ${hAgo}` : ''}${usd}.`;
                         this.displayText([
                             `Watched address ${h.direction === 'out' ? 'SENT' : 'RECEIVED'} ${h.amount} ${h.asset || 'ETH'}${h.usd ? ` ($${h.usd.toLocaleString('en-US')})` : ''}`,
+                            hClock ? `TIME ${hClock}${hAgo ? ` (${hAgo})` : ''}` : null,
                             `WATCHED ${h.watched}`,
                             `${h.direction === 'out' ? 'TO  ' : 'FROM'} ${h.counterpartyAddress || 'unknown'}${cpInfo.ensName ? ` (${cpInfo.ensName})` : ''}${cpInfo.facts.length ? ` — ${cpInfo.facts.join(', ')}` : ''}`,
                             `TX   ${h.hash}`,
@@ -5306,9 +5366,17 @@ class Jarvis {
         return 'Local inference failed, Sir, so I have no answer for that rather than an invented one.';
     }
 
-    // Queued speech for streaming answers: does NOT cancel prior utterances
-    // (unlike speak(), which flushes). Keeps the mic gate (ttsActive) held
-    // until the last queued utterance finishes.
+    /* Queued speech for streaming answers: does NOT cancel prior utterances
+       (unlike speak(), which flushes). Keeps the mic gate (ttsActive) held
+       until the last queued line has finished AND its trailing pause elapsed.
+
+       PACING: the browser plays queued utterances back to back with no gap, so
+       a multi-sentence answer arrives as one unbroken wall of speech — the
+       listener gets no boundary between "1,278,685 USDC moved from A to B" and
+       the next alert. Lines are therefore drained one at a time with a real
+       silence between them. The gap is inside the mic gate on purpose: opening
+       the microphone during the pause would let Jarvis transcribe its own next
+       sentence. */
     _speakQueued(text) {
         try {
             // Same cleanup as speak(). This is the path Gemma's streamed
@@ -5328,22 +5396,56 @@ class Jarvis {
 
             this._utterCount = (this._utterCount || 0) + 1;
             this.ttsActive = true;
-
-            const u = new SpeechSynthesisUtterance(clean);
-            if (this.selectedVoice) u.voice = this.selectedVoice;
-            u.rate = this.settings.get('speechRate') || 1.0;
-            u.pitch = this.settings.get('speechPitch') || 1.0;
-            u.volume = this.settings.get('speechVolume') || 1.0;
-            const done = () => {
-                this._utterCount = Math.max(0, (this._utterCount || 1) - 1);
-                if (this._utterCount === 0) this.ttsActive = false;
-            };
-            u.onend = done;
-            u.onerror = done;
-            this.synthesis.speak(u);
+            (this._speechQueue = this._speechQueue || []).push(clean);
+            this._drainSpeech();
         } catch (e) {
             console.warn('Queued TTS failed:', e);
         }
+    }
+
+    /** Speak one queued line, pause, then the next. Never runs twice at once. */
+    _drainSpeech() {
+        if (this._speechDraining) return;
+        const queue = this._speechQueue || [];
+        if (!queue.length) return;
+
+        this._speechDraining = true;
+        const line = queue.shift();
+        const u = new SpeechSynthesisUtterance(line);
+        if (this.selectedVoice) u.voice = this.selectedVoice;
+        u.rate = this.settings.get('speechRate') || 1.0;
+        u.pitch = this.settings.get('speechPitch') || 1.0;
+        u.volume = this.settings.get('speechVolume') || 1.0;
+
+        let settled = false;
+        const finish = () => {
+            if (settled) return;   // onend and the safety timer can both fire
+            settled = true;
+            clearTimeout(safety);
+            this._utterCount = Math.max(0, (this._utterCount || 1) - 1);
+            // The pause. ttsActive stays true across it so the microphone does
+            // not open into the gap and hear the line that follows.
+            setTimeout(() => {
+                this._speechDraining = false;
+                if ((this._speechQueue || []).length) this._drainSpeech();
+                else if (this._utterCount === 0) this.ttsActive = false;
+            }, this.settings.get('speechGapMs') ?? 450);
+        };
+        u.onend = finish;
+        u.onerror = finish;
+        /* A line that never reports back must not stall the queue forever —
+           the same eventless-death problem as the mic watchdog. Budget is
+           generous (SAPI runs ~450ms/word) and only fires if onend does not. */
+        const safety = setTimeout(finish, Math.min(line.split(/\s+/).length * 500 + 4000, 40000));
+
+        this.synthesis.speak(u);
+    }
+
+    /** Drop anything still waiting — used when a newer turn takes over. */
+    _flushSpeechQueue() {
+        this._speechQueue = [];
+        this._speechDraining = false;
+        this._utterCount = 0;
     }
 }
 

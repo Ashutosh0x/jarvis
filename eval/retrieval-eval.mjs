@@ -54,6 +54,12 @@ console.log(`embedder: ${embedderUp ? 'available (nomic-embed-text)' : 'UNAVAILA
 const TEXT_TO_ID = new Map(DOCS.map(d => [d.text.trim(), d.id]));
 function idOf(text) {
     const t = String(text || '').trim();
+    /* An empty string matches EVERY document: "anything".startsWith("") is true
+       in JavaScript, so a missing or blank result would silently resolve to
+       whichever document happens to be first in the map — turning a retrieval
+       failure into a scored hit whenever that document was the labelled answer.
+       A benchmark that flatters itself is worse than no benchmark. */
+    if (!t) return null;
     if (TEXT_TO_ID.has(t)) return TEXT_TO_ID.get(t);
     for (const [docText, id] of TEXT_TO_ID) if (docText.startsWith(t) || t.startsWith(docText)) return id;
     return null;

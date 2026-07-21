@@ -878,6 +878,8 @@ on port 5173.
 
 | Command | Effect |
 | --- | --- |
+| `npm test` | Every suite, printing the total check count |
+| `npm run eval` | Retrieval and memory benchmarks (needs Ollama) |
 | `npm run dev` | Vite dev server on port 5173 |
 | `npm run build` | Production bundle into `dist/` |
 | `npm run electron` | Launch against `dist/` |
@@ -1008,7 +1010,7 @@ src/
       ondoRegistry.js    Tokenized-security catalogue and query parsing
       groundingGuard.js  Blocks invented identifiers before they are spoken
       factStore.js       Belief memory with confidence and revision
-      __tests__/         934 checks across 24 suites, run with plain node
+      __tests__/         987 checks across 27 suites, run with `npm test`
     capture-processor.js AudioWorklet, capture
     playback-processor.js AudioWorklet, playback
 

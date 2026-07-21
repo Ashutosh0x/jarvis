@@ -54,9 +54,32 @@ fusion is pure dilution, dragging a correct dense rank-1 down behind a wrong
 lexical one. Raising the dense weight recovers most of the gap monotonically,
 which is the signature of dilution rather than noise.
 
-Reranking changed nothing on this set (72.4% → 72.4%) while costing **3.2s per
-query**. It is already opt-in and off the voice path; this is evidence for
-leaving it that way, and for questioning it on the typed path too.
+### Reranking depends on whether the model is warm
+
+The first run showed reranking changing nothing (72.4% → 72.4%) at 3.2s per
+query. Re-run with gemma3:4b already resident, it gives **82.8% P@1 at 1.1-1.5s**
+— reproducibly, across runs.
+
+Reranking did not improve; the first run's calls were exceeding their timeout on
+a cold model and falling back to the fused order, which is what the fallback is
+for. The honest statement is therefore conditional: reranking earns its keep
+**only when the model is already loaded**, and a run against a cold model
+measures the timeout rather than the reranker. It stays opt-in and off the voice
+path, which cannot assume a warm model either.
+
+### A bug in this harness, found by an audit
+
+`idOf()` mapped a retrieved chunk back to its document by text prefix and had no
+guard for the empty string. Every string starts with `""` in JavaScript, so a
+blank or missing result would have matched whichever document came first in the
+map — turning a retrieval failure into a scored hit whenever that document
+happened to be the labelled answer.
+
+Fixed, and the benchmark re-run: **eight of the nine configurations produced
+byte-identical numbers.** That is the evidence the bug never actually fired —
+`recall()` always returns chunk text — and the reranked row moved for the
+warm-model reason above, not because of the fix. The scores stand, but they now
+stand on a checked harness.
 
 ### What has not been changed as a result
 

@@ -1239,27 +1239,71 @@ ipcMain.handle('get-os-info', () => {
 const RAG_STORE_FILE = () => path.join(app.getPath('userData'), 'rag-store.json');
 const TRAJECTORY_FILE = () => path.join(app.getPath('userData'), 'trajectories.jsonl');
 
-ipcMain.handle('rag-load', async () => {
-    try {
-        const raw = await fs.readFile(RAG_STORE_FILE(), 'utf-8');
-        return JSON.parse(raw);
-    } catch {
-        return null; // first run — no store yet
-    }
-});
+/* =========================
+   DURABLE STORES
+   Every persistent file in this app used the same shape: read, JSON.parse,
+   and on ANY failure return an empty default. That conflates two situations
+   that must never be conflated — "this file does not exist yet" and "this file
+   exists but I could not read it". The second returned empty memory, empty
+   facts, an empty credential vault, and then the next save wrote that emptiness
+   over the user's real data. A single truncated write during a power cut would
+   permanently destroy months of memory.
 
-ipcMain.handle('rag-save', async (event, data) => {
+   Now: ENOENT is a genuine first run. A corrupt file is PRESERVED under
+   .corrupt-<timestamp> before anything can overwrite it. An unreadable file
+   (permissions, locking) poisons that path so saves refuse to run at all —
+   better to lose this session's changes than the whole store.
+========================= */
+const poisonedStores = new Set();
+
+async function readJsonStore(file, fallback, label) {
+    let raw;
     try {
-        // Atomic-ish write: temp file then rename, so a crash can't corrupt memory
-        const tmp = RAG_STORE_FILE() + '.tmp';
+        raw = await fs.readFile(file, 'utf-8');
+    } catch (e) {
+        if (e.code === 'ENOENT') return fallback;   // genuinely nothing there yet
+        // Present but unreadable. Refuse to let a save overwrite what we could
+        // not see; the user keeps their data and loses only this session.
+        poisonedStores.add(file);
+        console.error(`[store] ${label}: cannot read (${e.code}). Saving is disabled for it this session so nothing is overwritten.`);
+        return fallback;
+    }
+    try {
+        return JSON.parse(raw);
+    } catch (e) {
+        const quarantine = `${file}.corrupt-${Date.now()}`;
+        try {
+            await fs.rename(file, quarantine);
+            console.error(`[store] ${label}: file is corrupt and has been preserved at ${quarantine}. Starting from empty.`);
+        } catch {
+            poisonedStores.add(file);
+            console.error(`[store] ${label}: file is corrupt and could not be preserved. Saving is disabled for it this session.`);
+        }
+        return fallback;
+    }
+}
+
+/** Atomic write: temp file then rename, so a crash cannot leave a half file. */
+async function writeJsonStore(file, data, label) {
+    if (poisonedStores.has(file)) {
+        console.error(`[store] ${label}: save refused — the existing file could not be read and must not be overwritten.`);
+        return { success: false, error: 'store unreadable; save refused to protect existing data' };
+    }
+    const tmp = `${file}.tmp`;
+    try {
         await fs.writeFile(tmp, JSON.stringify(data), 'utf-8');
-        await fs.rename(tmp, RAG_STORE_FILE());
+        await fs.rename(tmp, file);
         return { success: true };
     } catch (error) {
-        console.error('RAG save error:', error.message);
+        await fs.unlink(tmp).catch(() => {});
+        console.error(`[store] ${label}: save failed — ${error.message}`);
         return { success: false, error: error.message };
     }
-});
+}
+
+ipcMain.handle('rag-load', async () => readJsonStore(RAG_STORE_FILE(), null, 'RAG memory'));
+
+ipcMain.handle('rag-save', async (event, data) => writeJsonStore(RAG_STORE_FILE(), data, 'RAG memory'));
 
 ipcMain.handle('log-trajectory', async (event, entry) => {
     try {
@@ -1392,22 +1436,9 @@ ipcMain.handle('get-memory-audit', async (event, opts) => {
     }
 });
 
-ipcMain.handle('load-fact-store', async () => {
-    try { return JSON.parse(await fs.readFile(FACT_STORE_FILE(), 'utf-8')); }
-    catch { return { facts: [] }; }
-});
+ipcMain.handle('load-fact-store', async () => readJsonStore(FACT_STORE_FILE(), { facts: [] }, 'belief store'));
 
-ipcMain.handle('save-fact-store', async (event, data) => {
-    try {
-        const tmp = FACT_STORE_FILE() + '.tmp';
-        await fs.writeFile(tmp, JSON.stringify(data), 'utf-8');
-        await fs.rename(tmp, FACT_STORE_FILE()); // atomic: a crash can't corrupt the ledger
-        return { success: true };
-    } catch (error) {
-        console.warn('Fact store save error:', error.message);
-        return { success: false, error: error.message };
-    }
-});
+ipcMain.handle('save-fact-store', async (event, data) => writeJsonStore(FACT_STORE_FILE(), data, 'belief store'));
 
 ipcMain.handle('get-reflections', async (event, opts) => {
     try {
@@ -2121,6 +2152,11 @@ ipcMain.handle('onchain-logs', async (event, { chain, address, topics, spanBlock
 
         const latestHex = await rpcCall(chainKey, 'eth_blockNumber', []);
         const latest = parseInt(latestHex, 16);
+        /* A malformed reply makes parseInt return NaN, and NaN.toString(16) is
+           the string "NaN" — so the next call would quietly request block
+           "0xNaN" and get back nothing, or worse, something. Fail loudly here
+           instead of asking for a block that cannot exist. */
+        if (!Number.isFinite(latest)) throw new Error(`bad block number from ${chainKey}: ${JSON.stringify(latestHex)}`);
         const fromBlock = '0x' + Math.max(0, latest - span).toString(16);
 
         const { value } = await hedgedRace(
@@ -2299,6 +2335,7 @@ ipcMain.handle('chain-issuance', async (event, { chain = 'ethereum', spanBlocks,
 
         const span = Math.min(Math.max(10, Number(spanBlocks) || 300), ISSUANCE_MAX_SPAN);
         const latest = parseInt(await rpcCall(chain, 'eth_blockNumber', []), 16);
+        if (!Number.isFinite(latest)) return { success: false, error: `bad block number from ${chain}` };
 
         /* CHUNKED, because the free endpoints disagree about how wide a log
            query may be and the limits move: measured in one sitting, drpc
@@ -2534,13 +2571,12 @@ let chainWatchCache = null;      // watchlist kept in memory, persisted on chang
 
 async function loadChainWatchlist() {
     if (chainWatchCache) return chainWatchCache;
-    try { chainWatchCache = JSON.parse(await fs.readFile(CHAIN_WATCHLIST_FILE(), 'utf-8')); }
-    catch { chainWatchCache = []; }
+    chainWatchCache = await readJsonStore(CHAIN_WATCHLIST_FILE(), [], 'address watchlist');
     return chainWatchCache;
 }
 async function saveChainWatchlist(list) {
     chainWatchCache = list;
-    await fs.writeFile(CHAIN_WATCHLIST_FILE(), JSON.stringify(list, null, 2), 'utf-8');
+    return writeJsonStore(CHAIN_WATCHLIST_FILE(), list, 'address watchlist');
 }
 
 /* ETH/USD context for whale announcements. Best-effort with a 5-minute cache —
@@ -2714,6 +2750,15 @@ function startChainStream(chainKey = 'ethereum') {
         if (!block?.transactions || chainStream !== state) return;
         state.blocks++;
 
+        const blockNumber = parseInt(blockHex, 16);
+        /* When the movement actually happened, taken from the block rather than
+           from when this process got round to announcing it. The two differ by
+           seconds on a live head and by many minutes on a block recovered after
+           an outage — and only the block's own timestamp is a fact about the
+           transfer. Every alert carries it so nothing is announced as though it
+           were happening now when it is not. */
+        const blockTs = block.timestamp ? parseInt(block.timestamp, 16) * 1000 : null;
+
         const watch = await loadChainWatchlist();
         const watchedAddrs = watch.filter(w => (w.chains || ['ethereum']).includes(chainKey)).map(w => w.address);
         const { whales, watchHits } = scanBlockTxs(block.transactions, { chain: chainKey, watch: watchedAddrs });
@@ -2752,10 +2797,10 @@ function startChainStream(chainKey = 'ethereum') {
                     if (state.dedup.seen(`${chainKey}:${ev.hash}:${ev.symbol}:${ev.kind}`)) continue;
                     state.alerts++;
                     publishEvent('stablecoin-issuance', {
-                        ...ev, blockNumber: parseInt(blockHex, 16), backfilled,
+                        ...ev, blockNumber, blockTs, backfilled,
                         counterpartyLabel: await describeParty(ev.counterparty),
                     });
-                    appendChainAlert({ ts: Date.now(), type: 'issuance', chain: chainKey, kind: ev.kind, hash: ev.hash, asset: ev.symbol, amount: ev.amount, units: ev.units, to: ev.counterparty, blockNumber: parseInt(blockHex, 16) });
+                    appendChainAlert({ ts: Date.now(), blockTs, type: 'issuance', chain: chainKey, kind: ev.kind, hash: ev.hash, asset: ev.symbol, amount: ev.amount, units: ev.units, to: ev.counterparty, blockNumber });
                 }
             }
         }
@@ -2771,7 +2816,6 @@ function startChainStream(chainKey = 'ethereum') {
         if (!freshWhales.length && !freshHits.length && !freshTokenWhales.length && !freshTokenHits.length) return;
 
         const price = await getEthUsd();
-        const blockNumber = parseInt(blockHex, 16);
         const usdOf = (amount) => price ? Math.round(parseFloat(String(amount).replace(/,/g, '')) * price) : null;
 
         // Watch hits ALWAYS announce — the user asked about these addresses.
@@ -2780,7 +2824,7 @@ function startChainStream(chainKey = 'ethereum') {
             state.alerts++;
             const entry = watch.find(x => x.address === h.watched);
             const payload = {
-                ...h, blockNumber, backfilled,
+                ...h, blockNumber, blockTs, backfilled,
                 asset: h.symbol || CHAIN_IDS[chainKey]?.native || 'ETH',
                 label: entry?.label || chainShortAddr(h.watched),
                 counterparty: await describeParty(h.direction === 'out' ? h.to : h.from),
@@ -2788,7 +2832,7 @@ function startChainStream(chainKey = 'ethereum') {
                 usd: h.usd != null ? h.usd : usdOf(h.amount),
             };
             publishEvent('chain-watch-hit', payload);
-            appendChainAlert({ ts: Date.now(), type: 'watch', chain: chainKey, hash: h.hash, asset: payload.asset, amount: h.amount, usd: payload.usd, from: h.from, to: h.to, blockNumber });
+            appendChainAlert({ ts: Date.now(), blockTs, type: 'watch', chain: chainKey, hash: h.hash, asset: payload.asset, amount: h.amount, usd: payload.usd, from: h.from, to: h.to, blockNumber });
         }
 
         /* Whales: native and token movements ranked TOGETHER by dollar value,
@@ -2805,17 +2849,17 @@ function startChainStream(chainKey = 'ethereum') {
         for (const w of speak) {
             state.alerts++;
             const payload = {
-                ...w, blockNumber, backfilled,
+                ...w, blockNumber, blockTs, backfilled,
                 fromLabel: await describeParty(w.from),
                 toLabel: await describeParty(w.to),
             };
             publishEvent('whale-alert', payload);
-            appendChainAlert({ ts: Date.now(), type: 'whale', chain: chainKey, hash: w.hash, asset: w.asset, amount: w.amount, usd: w.usd, from: w.from, to: w.to, blockNumber });
+            appendChainAlert({ ts: Date.now(), blockTs, type: 'whale', chain: chainKey, hash: w.hash, asset: w.asset, amount: w.amount, usd: w.usd, from: w.from, to: w.to, blockNumber });
         }
         if (summary) {
             state.alerts++;
             publishEvent('whale-alert', {
-                summary: true, blockNumber, backfilled, chain: chainKey,
+                summary: true, blockNumber, blockTs, backfilled, chain: chainKey,
                 count: summary.count,
                 largestAmount: summary.largest.amount,
                 largestAsset: summary.largest.asset,
@@ -3010,9 +3054,11 @@ ipcMain.handle('chain-watchlist-remove', async (event, { address }) => {
 const { safeStorage } = require('electron');
 const CRED_FILE = () => path.join(app.getPath('userData'), 'credentials.json');
 
+/* The vault matters more than the other stores: a lost credential cannot be
+   recovered from anywhere else in the system, and the user may not discover it
+   is gone until the key it held is needed. */
 async function loadCreds() {
-    try { return JSON.parse(await fs.readFile(CRED_FILE(), 'utf-8')); }
-    catch { return {}; }
+    return readJsonStore(CRED_FILE(), {}, 'credential vault');
 }
 
 async function getCredential(name) {
@@ -3031,7 +3077,11 @@ ipcMain.handle('secure-cred-set', async (event, name, value) => {
     if (!safeName || !value) return { success: false, error: 'invalid name or value' };
     const creds = await loadCreds();
     creds[safeName] = safeStorage.encryptString(String(value)).toString('base64');
-    await fs.writeFile(CRED_FILE(), JSON.stringify(creds), 'utf-8');
+    // Atomic, like every other store: a crash mid-write must not truncate the
+    // vault, because the next load would then quarantine it and every stored
+    // key would need re-entering.
+    const w = await writeJsonStore(CRED_FILE(), creds, 'credential vault');
+    if (!w.success) return { success: false, error: w.error };
     return { success: true, name: safeName };
 });
 
@@ -3040,8 +3090,7 @@ ipcMain.handle('secure-cred-list', async () => Object.keys(await loadCreds()));
 ipcMain.handle('secure-cred-delete', async (event, name) => {
     const creds = await loadCreds();
     delete creds[String(name).toLowerCase()];
-    await fs.writeFile(CRED_FILE(), JSON.stringify(creds), 'utf-8');
-    return { success: true };
+    return writeJsonStore(CRED_FILE(), creds, 'credential vault');
 });
 
 /* =========================
@@ -3058,11 +3107,10 @@ const alertCooldowns = new Map(); // `${symbol}:${type}` -> ts
 let financeInterval = null;
 
 async function loadWatchlist() {
-    try { return JSON.parse(await fs.readFile(WATCHLIST_FILE(), 'utf-8')); }
-    catch { return []; }
+    return readJsonStore(WATCHLIST_FILE(), [], 'price watchlist');
 }
 async function saveWatchlist(list) {
-    await fs.writeFile(WATCHLIST_FILE(), JSON.stringify(list, null, 2), 'utf-8');
+    return writeJsonStore(WATCHLIST_FILE(), list, 'price watchlist');
 }
 
 async function fetchQuoteYahoo(symbol) {
@@ -3304,12 +3352,21 @@ function parseRssItems(xml, limit) {
             if (dash > 0) { source = title.slice(dash + 3); title = title.slice(0, dash); }
         }
         const pub = pick('pubDate');
+        const when = pub ? new Date(pub) : null;
+        const valid = when && !Number.isNaN(when.getTime());
         return {
             title,
             source,
             url: pick('link').trim(),
-            published: pub ? new Date(pub).toISOString() : null,
-            publishedText: pub ? timeAgo(new Date(pub)) : '',
+            published: valid ? when.toISOString() : null,
+            publishedText: valid ? timeAgo(when) : '',
+            /* The actual date, not just how long ago. "3h ago" is the useful
+               form in speech, but it cannot answer "what day is this from",
+               which is exactly the question asked of a headline that sounds
+               surprising. Both are carried. */
+            publishedLocal: valid
+                ? when.toLocaleString('en-GB', { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' })
+                : '',
         };
     }).filter((it) => it.title);
 }
@@ -3327,19 +3384,44 @@ ipcMain.handle('get-news', async (event, opts) => {
     const query = String(opts?.query || '').trim().slice(0, 120);
     const limit = Math.min(Math.max(Number(opts?.limit) || 5, 1), 10);
 
-    const sources = [
-        query
-            ? `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=en-US&gl=US&ceid=US:en`
-            : `https://news.google.com/rss?hl=en-US&gl=US&ceid=US:en`,
-        // Bing needs a query; for top headlines fall back to a broad term.
-        `https://www.bing.com/news/search?q=${encodeURIComponent(query || 'top stories')}&format=RSS`,
-    ];
+    /* FAILOVER CHAIN, ordered by what each provider actually serves.
+
+       MEASURED, not assumed: Bing's `format=RSS` returns 314KB of HTML with
+       zero <item> blocks for "top stories", "news" and "world news" — it only
+       emits real RSS for a specific topic. So the general-headline fallback it
+       was supposed to provide never worked; a Google outage meant no headlines
+       at all. Yahoo and BBC serve genuine RSS for general news (newest items
+       measured at 9 and 185 minutes old respectively) and are used instead. */
+    const sources = query
+        ? [
+            `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=en-US&gl=US&ceid=US:en`,
+            `https://www.bing.com/news/search?q=${encodeURIComponent(query)}&format=RSS`,
+        ]
+        : [
+            'https://news.google.com/rss?hl=en-US&gl=US&ceid=US:en',
+            'https://news.yahoo.com/rss/world',
+            'https://feeds.bbci.co.uk/news/world/rss.xml',
+        ];
 
     let lastError = null;
     for (const url of sources) {
         try {
             const items = parseRssItems(await fetchRss(url), limit);
-            if (items.length) return { success: true, query, items };
+            if (items.length) {
+                /* Feed freshness, stated rather than assumed. A provider that
+                   starts serving a cached or stale feed looks identical to a
+                   working one from the inside — the only tell is the age of its
+                   newest item, so that is reported and the caller decides what
+                   to say about it. */
+                const newest = items.map(i => Date.parse(i.published)).filter(Number.isFinite).sort((a, b) => b - a)[0] || null;
+                return {
+                    success: true, query, items,
+                    provider: new URL(url).hostname,
+                    newestAgeMinutes: newest ? Math.round((Date.now() - newest) / 60000) : null,
+                    fetchedAt: Date.now(),
+                };
+            }
+            lastError = `${new URL(url).hostname} returned no items`;
         } catch (error) {
             lastError = error.message; // try the next provider
         }

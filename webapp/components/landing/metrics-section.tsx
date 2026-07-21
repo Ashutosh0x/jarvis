@@ -44,12 +44,16 @@ function AnimatedCounter({ end, suffix = "", prefix = "" }: { end: number; suffi
   );
 }
 
+/* Every figure here has to be reproducible by a reader on their own machine.
+   The check count comes from `npm test`, which prints it; before that runner
+   existed the number on this page came from nowhere a reader could verify,
+   which is the opposite of what this section claims to be. */
 const metrics = [
   {
-    value: 934,
+    value: 987,
     suffix: "",
     prefix: "",
-    label: "Checks on the deterministic core",
+    label: "Checks on the deterministic core (npm test)",
   },
   {
     value: 100,
@@ -67,7 +71,10 @@ const metrics = [
     value: 0,
     suffix: "",
     prefix: "",
-    label: "Conversation bytes sent to a provider",
+    // Precise on purpose. Live-data lookups do leave the machine — a ticker, an
+    // address, a search string. What never leaves is the conversation: no
+    // transcript, no screen capture, no memory, no model call.
+    label: "Transcripts, screen captures or memories uploaded",
   },
 ];
 
