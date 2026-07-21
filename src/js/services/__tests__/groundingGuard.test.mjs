@@ -95,5 +95,43 @@ const check = (n, c) => { c ? pass++ : fail++; console.log(`${c ? 'PASS' : 'FAIL
         !guardOutput('Version 999.999.999.999 of nothing.', '').blocked);
 }
 
+/* --- security identifiers --------------------------------------------------
+   Added after the model invented a CVE severity and then defended the
+   correction. From the interaction log, 21 Jul 2026:
+
+     "latest cve number of chrome"
+       -> "CVE-2026-15905 is the latest CRITICAL vulnerability"
+     (user: it is rated High, not Critical)
+       -> "The latest critical vulnerability is CVE-2026-15899"
+
+   No advisory was in context for either answer. This user publishes CVEs; an
+   invented identifier or severity gets cited and propagated. */
+{
+    const noAdvisory = 'The user asked about Chrome vulnerabilities. No advisory text was retrieved.';
+    check('cve: an invented CVE id is blocked',
+        findUngrounded('CVE-2026-15905 is the latest critical vulnerability.', noAdvisory).length > 0);
+    check('cve: the blocked answer is not spoken',
+        guardOutput('CVE-2026-15905 is the latest critical vulnerability.', noAdvisory).blocked === true);
+
+    const withAdvisory = 'Chrome release notes: CVE-2026-15905 High, Aura, use-after-free. CVE-2026-15899 Critical, CameraCapture.';
+    check('cve: an id that IS in the advisory passes',
+        findUngrounded('CVE-2026-15905 affects Aura.', withAdvisory).length === 0);
+    check('cve: case does not matter', findUngrounded('cve-2026-15905 affects Aura.', withAdvisory).length === 0);
+    check('cve: a DIFFERENT id in the same answer is still caught',
+        findUngrounded('CVE-2026-15905 and CVE-2026-99999 were patched.', withAdvisory).length === 1);
+
+    check('cvss: an invented score is blocked',
+        findUngrounded('It has a CVSS score of 9.8.', noAdvisory).length > 0);
+    check('cvss: a score present in context passes',
+        findUngrounded('It has a CVSS score of 9.8.', 'Advisory: CVSS score of 9.8 (critical).').length === 0);
+
+    // Ordinary prose must not be caught: a guard that fires on everything is
+    // turned off, and then it protects nothing.
+    check('no false positive on ordinary security talk',
+        findUngrounded('Chrome had several high severity issues this month.', noAdvisory).length === 0);
+    check('no false positive on a version number',
+        findUngrounded('Chrome 151 shipped on Tuesday.', noAdvisory).length === 0);
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

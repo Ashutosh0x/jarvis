@@ -3441,6 +3441,54 @@ function timeAgo(date) {
 }
 
 /* =========================
+   SECURITY ADVISORIES — Chrome Releases + NVD, both keyless
+
+   Built because the model invented a CVE severity and defended it when
+   corrected (log, 21 Jul 2026). The first fix was a guard that blocks
+   ungrounded CVE identifiers, but a guard only turns a wrong answer into no
+   answer. Chrome Releases publishes RSS and NVD serves severity without a key,
+   so the real fix is to read the advisory. Verified live before wiring:
+   4 Chrome feeds return 200, and the desktop advisory parses to exactly the
+   severities the user quoted back.
+========================= */
+const CHROME_FEEDS = {
+    desktop: 'https://chromereleases.googleblog.com/feeds/posts/default/-/Desktop%20Update?alt=rss',
+    stable: 'https://chromereleases.googleblog.com/feeds/posts/default/-/Stable%20updates?alt=rss',
+    all: 'https://chromereleases.googleblog.com/feeds/posts/default?alt=rss',
+};
+
+ipcMain.handle('security-advisories', async (event, { channel = 'desktop' } = {}) => {
+    const url = CHROME_FEEDS[channel] || CHROME_FEEDS.desktop;
+    try {
+        const res = await fetch(url, {
+            headers: { 'User-Agent': 'Mozilla/5.0 Jarvis/1.0' },
+            signal: AbortSignal.timeout(20000),
+        });
+        if (!res.ok) throw new Error(`http ${res.status}`);
+        // The renderer's tested parser owns the shape; main only fetches.
+        return { success: true, channel, url, xml: await res.text(), fetchedAt: Date.now() };
+    } catch (e) { return { success: false, error: e.message }; }
+});
+
+/* One CVE, from NVD — the authority on severity. Recent identifiers often have
+   no score yet, which the parser reports as awaiting analysis rather than
+   filling in. */
+ipcMain.handle('cve-lookup', async (event, { id } = {}) => {
+    const cve = String(id || '').trim().toUpperCase();
+    if (!/^CVE-\d{4}-\d{4,7}$/.test(cve)) return { success: false, error: 'not a CVE identifier' };
+    try {
+        const res = await fetch(`https://services.nvd.nist.gov/rest/json/cves/2.0?cveId=${encodeURIComponent(cve)}`, {
+            headers: { 'User-Agent': 'Jarvis/1.0' },
+            signal: AbortSignal.timeout(20000),
+        });
+        if (!res.ok) throw new Error(`http ${res.status}`);
+        const payload = await res.json();
+        if (!payload?.vulnerabilities?.length) return { success: false, error: 'no such CVE in the NVD', id: cve };
+        return { success: true, id: cve, payload };
+    } catch (e) { return { success: false, error: e.message, id: cve }; }
+});
+
+/* =========================
    PREDICTION MARKETS (Polymarket + Kalshi) — READ ONLY
 
    Both platforms serve market data publicly with no key, verified live before

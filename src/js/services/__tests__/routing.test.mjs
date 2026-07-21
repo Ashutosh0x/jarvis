@@ -108,5 +108,59 @@ routes('recent solana activity for vines1vzrYbzLMRdu58ou5XTby4qAqVRLmqo36NKPTg',
 // Solana address, it is a word.
 routes('remind me about vines1vzrYbzLMRdu58ou5XTby4qAqVRLmqo36NKPTg', null);
 
+/* --- a pasted document is not a command --------------------------------------
+   From the log: a Chrome release announcement was pasted three times and each
+   time answered "Your phone is not linked, Sir", because the text contained the
+   word Android. Every action matcher scans for keywords, so a long document
+   will always contain some — the length and shape are what distinguish a
+   command from material to read. detectIntent owns this, so it is driven here
+   rather than through parseOnchainQuery. */
+{
+    const detect = Cls.prototype.detectIntent;
+    // Minimal `this`: detectIntent reaches for a few helpers on the way past.
+    const ctx = {
+        settings: { get: () => null },
+        _resolveNewsPronoun: Cls.prototype._resolveNewsPronoun,
+        parseNewsQuery: Cls.prototype.parseNewsQuery,
+        parseOnchainQuery: Cls.prototype.parseOnchainQuery,
+        parseNetworkQuery: Cls.prototype.parseNetworkQuery,
+    };
+    const intentOf = (text) => { try { return detect.call(ctx, text)?.intent ?? null; } catch (e) { return `THREW ${e.message}`; } };
+
+    const pastedRelease = `Chrome Releases Release updates from the Chrome team Chrome Beta for iOS Update Tuesday, July 21, 2026 Hi everyone! We've just released Chrome Beta 151 (151.0.7922.43) for iOS; it'll become available on App Store in the next few days. You can see a partial list of the changes in the Git log. If you find a new issue, please let us know by filing a bug. Chrome Release Team`;
+    check('pasted document does not become a phone command',
+        intentOf(pastedRelease) === 'AI_COMMAND', String(intentOf(pastedRelease)));
+
+    const multiline = 'CVE-2026-15899 Critical CameraCapture\nCVE-2026-15900 Critical GPU\nCVE-2026-15901 Critical Network';
+    check('a multi-line paste is treated as material, not a command',
+        intentOf(multiline) === 'AI_COMMAND', String(intentOf(multiline)));
+
+    // Real commands must still work — the guard must not swallow short input.
+    check('a short command is unaffected', intentOf('open chrome') === 'OPEN_APP', String(intentOf('open chrome')));
+    check('a phone command still routes to the phone',
+        intentOf('turn on the flashlight on my phone') === 'PHONE_TOOL', String(intentOf('turn on the flashlight on my phone')));
+}
+
+/* --- pronouns in news queries ------------------------------------------------
+   "yesterdays news about him" searched for the literal word "him" and returned
+   three unrelated stories that happened to contain it. */
+{
+    const ctx = { _lastNewsSubject: null, _resolveNewsPronoun: Cls.prototype._resolveNewsPronoun };
+    const parse = Cls.prototype.parseNewsQuery.bind(ctx);
+
+    check('a real subject is captured', parse('news about elon musk')?.topic === 'elon musk');
+    check('a following pronoun resolves to that subject', parse('news about him')?.topic === 'elon musk');
+    check('the subject persists across a rephrase', parse("what's the latest on him")?.topic === 'elon musk');
+
+    const fresh = { _lastNewsSubject: null, _resolveNewsPronoun: Cls.prototype._resolveNewsPronoun };
+    const parseFresh = Cls.prototype.parseNewsQuery.bind(fresh);
+    check('a pronoun with no antecedent falls back to headlines, not the word itself',
+        parseFresh('news about him')?.topic === '', JSON.stringify(parseFresh('news about him')));
+    check('a new subject replaces the old one', (() => {
+        parse('news about tesla');
+        return parse('news about it')?.topic === 'tesla';
+    })());
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

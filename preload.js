@@ -107,6 +107,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
     getNews: (opts) => ipcRenderer.invoke('get-news', opts),
     // Historical daily closes for the quant analytics engine
     getHistory: (opts) => ipcRenderer.invoke('get-history', opts),
+    // Security advisories: Chrome Releases RSS + NVD, both keyless. Exists so
+    // CVE answers come from an advisory rather than from the model.
+    securityAdvisories: (opts) => ipcRenderer.invoke('security-advisories', opts || {}),
+    cveLookup: (opts) => ipcRenderer.invoke('cve-lookup', opts),
     // Prediction markets (Polymarket + Kalshi). Read-only: no order placement
     // exists on either platform anywhere in this project.
     predictionSearch: (opts) => ipcRenderer.invoke('prediction-search', opts),

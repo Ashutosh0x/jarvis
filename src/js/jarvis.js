@@ -13,6 +13,7 @@ import * as onchain from './services/onchain.js';
 import * as ens from './services/ens.js';
 import * as chainIntel from './services/chainIntel.js';
 import * as prediction from './services/predictionMarkets.js';
+import * as security from './services/security.js';
 import { parseOndoQuery, ONDO_COUNT, HOT_LIST as ONDO_HOT_LIST } from './services/ondoRegistry.js';
 import * as netInspect from './services/netInspect.js';
 import * as netDiscovery from './services/netDiscovery.js';
@@ -1005,6 +1006,19 @@ class Jarvis {
     detectIntent(command) {
         const cmd = command.toLowerCase().trim();
 
+        /* A PASTED DOCUMENT IS NOT A COMMAND.
+           From the log: a Chrome release announcement was pasted three times in
+           a row and each time answered "Your phone is not linked, Sir" —
+           because the text happened to contain the word Android. Every action
+           matcher below scans for keywords, and a long document will always
+           contain some of them, so a paste can trigger an arbitrary action.
+           Length and line count are what separate the two: nobody speaks 300
+           characters, and a spoken command is never multi-paragraph. Documents
+           go to the model as material to read, which is what pasting one
+           means. */
+        const looksPasted = command.length > 280 || (command.match(/\n/g) || []).length >= 2;
+        if (looksPasted) return { intent: 'AI_COMMAND', pastedDocument: true };
+
         // Phone-targeted commands: "open whatsapp on my phone", "flashlight on
         // my phone". Checked before every desktop matcher, otherwise "open
         // chrome on my phone" opens Chrome on the PC.
@@ -1223,6 +1237,23 @@ class Jarvis {
         // is a quote, not a headline search.
         const priceEntity = this.parsePriceQuery(cmd);
         if (priceEntity) return { intent: 'PRICE_QUERY', entity: priceEntity };
+
+        /* SECURITY ADVISORIES. Checked before news and before the AI fallback,
+           because this is the exact query that produced an invented CVE
+           severity and then a defended correction. A CVE identifier is now
+           answered from NVD, and "latest chrome vulnerabilities" from the
+           Chrome Releases feed — never from the model. */
+        {
+            const cveId = security.extractCveId(cmd);
+            if (cveId && /\b(what|which|tell|about|severity|score|details?|look ?up|explain|is)\b/.test(cmd)) {
+                return { intent: 'CVE_LOOKUP', cveId };
+            }
+            if (/\b(cve|vulnerabilit(y|ies)|security (fix|fixes|update|patch|advisor)|patched?|zero.?day)\b/.test(cmd)
+                && /\b(chrome|chromium|browser)\b/.test(cmd)) {
+                return { intent: 'SECURITY_ADVISORY' };
+            }
+            if (cveId) return { intent: 'CVE_LOOKUP', cveId };
+        }
 
         // News / latest updates — "latest news", "news about Tesla", "what's
         // happening with AI". Empty topic means top headlines. Uses the keyless
@@ -1579,6 +1610,12 @@ class Jarvis {
                     break;
                 case 'NEWS_QUERY':
                     await this.handleNewsQuery(intent.topic);
+                    break;
+                case 'SECURITY_ADVISORY':
+                    await this.handleSecurityAdvisory();
+                    break;
+                case 'CVE_LOOKUP':
+                    await this.handleCveLookup(intent.cveId);
                     break;
                 case 'USAGE_STATS':
                     await this.handleUsageStats();
@@ -2144,9 +2181,9 @@ class Jarvis {
         let m;
         // Explicit topic after a connector: "news about X", "latest on X".
         if ((m = cmd.match(/\b(?:news|headlines?|updates?)\s+(?:about|on|for|regarding|around)\s+(.+)/i)))
-            return { topic: clean(m[1]) || '' };
+            return { topic: this._resolveNewsPronoun(clean(m[1])) };
         if ((m = cmd.match(/\bwhat(?:'s| is| has| are)\s+(?:the\s+)?(?:latest|happening|new|going on)\s+(?:on|with|about|in|for)\s+(.+)/i)))
-            return { topic: clean(m[1]) || '' };
+            return { topic: this._resolveNewsPronoun(clean(m[1])) };
 
         // Beyond this point it is only a news request if it actually mentions
         // news, or is one of a few fixed "catch me up" phrasings. This gate is
@@ -2164,10 +2201,26 @@ class Jarvis {
             let head = clean(m[1]);
             let prev;
             do { prev = head; head = head.replace(FILLER, '').trim(); } while (head && head !== prev);
-            if (head) return { topic: head };
+            if (head) return { topic: this._resolveNewsPronoun(head) };
         }
         // Mentions news but no clean topic -> top headlines.
         return { topic: '' };
+    }
+
+    /* "news about him" — a pronoun is not a search term.
+       From the log: "yesterdays news about him", one turn after asking about
+       Elon Musk, searched for the literal word "him" and returned three
+       unrelated stories that all happened to contain it. A pronoun refers to
+       the last subject asked about, so that is what it resolves to; with no
+       prior subject it falls back to headlines rather than searching for a
+       word that means nothing on its own. */
+    _resolveNewsPronoun(topic) {
+        const t = String(topic || '').trim();
+        if (!/^(him|her|them|it|he|she|they|that|this|those)$/i.test(t)) {
+            if (t) this._lastNewsSubject = t;   // remember real subjects
+            return t;
+        }
+        return this._lastNewsSubject || '';
     }
 
     _fmtMoney(price, ccy) {
@@ -4223,6 +4276,107 @@ class Jarvis {
             ? ` Note that the freshest story here is ${Math.round(res.newestAgeMinutes / 60)} hours old, Sir, so this feed may not be current.`
             : '';
         this.speak(`${lead}${spoken}.${caveat}`);
+    }
+
+    /* Chrome security releases, read from the advisory itself.
+       The model is not in this path at all: the feed is fetched, the tested
+       parser extracts the CVE table, and the severities spoken are the ones
+       Google published. */
+    async handleSecurityAdvisory() {
+        if (!window.electronAPI?.securityAdvisories) { this.speak('Advisory lookups are not available here, Sir.'); return; }
+        this.displayText('Reading the Chrome release advisories...', null);
+        const r = await window.electronAPI.securityAdvisories({ channel: 'desktop' }).catch(() => null);
+        if (!r?.success) { this.speak(`I could not reach the Chrome release feed, Sir. ${r?.error || ''}`.trim()); return; }
+
+        const posts = security.parseAdvisoryFeed(r.xml, { limit: 12 });
+        /* The newest POST is not the newest SECURITY post — a driver or Android
+           release often lands after the desktop advisory, and answering with it
+           would answer a different question. */
+        const latest = posts.find(p => p.securityUpdate);
+        if (!latest) {
+            this.speak('The recent Chrome releases in the feed carry no security fixes, Sir.');
+            return;
+        }
+        const ranked = security.sortBySeverity(latest.cves);
+        const counts = security.countBySeverity(latest.cves);
+        const when = chainIntel.timeAgo(Date.parse(latest.published));
+        this.displayText([
+            `${latest.title} — ${new Date(latest.published).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}${when ? ` (${when})` : ''}`,
+            `${latest.cves.length} security fixes: ${Object.entries(counts).filter(([, n]) => n > 0).map(([k, n]) => `${n} ${k}`).join(', ')}`,
+            '',
+            ...ranked.map(c => `${c.severity.padEnd(8)} ${c.id}  ${c.description}`),
+            '',
+            `Source: ${latest.url}`,
+        ].join('\n'), null);
+        this.speak(security.describeAdvisory(latest));
+        this._lastFactual = { text: this.lastDisplayed || '', at: Date.now() };
+    }
+
+    /** One CVE, from NVD — the authority on severity, not the model. */
+    async handleCveLookup(cveId) {
+        if (!window.electronAPI?.cveLookup) { this.speak('CVE lookups are not available here, Sir.'); return; }
+        this.displayText(`Looking up ${cveId}...`, null);
+        const r = await window.electronAPI.cveLookup({ id: cveId }).catch(() => null);
+
+        if (!r?.success) {
+            /* Before giving up, check the Chrome advisories: a CVE published in
+               the last few days is often in Google's feed with a severity while
+               the NVD record is still empty. */
+            const feed = await window.electronAPI.securityAdvisories?.({ channel: 'desktop' }).catch(() => null);
+            if (feed?.success) {
+                for (const post of security.parseAdvisoryFeed(feed.xml, { limit: 12 })) {
+                    const hit = post.cves.find(c => c.id === cveId);
+                    if (hit) {
+                        this.displayText([
+                            `${hit.id} — ${hit.severity}`,
+                            hit.description,
+                            '',
+                            `From: ${post.title}, ${new Date(post.published).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}`,
+                            post.url,
+                        ].join('\n'), null);
+                        this.speak(`${hit.id} is rated ${hit.severity.toLowerCase()} by Google, Sir: ${hit.description}. ` +
+                            `The NVD has not published a CVSS score for it yet.`);
+                        return;
+                    }
+                }
+            }
+            this.speak(`I have no record for ${cveId}, Sir. ${r?.error === 'no such CVE in the NVD' ? 'It is not in the NVD and not in the recent Chrome advisories.' : ''}`.trim());
+            return;
+        }
+
+        const cve = security.parseNvdCve(r.payload);
+        if (!cve) { this.speak(`I could not read the record for ${cveId}, Sir.`); return; }
+
+        /* Ask the vendor too, and compare. One source can be wrong or stale;
+           two disagreeing sources is a fact worth stating rather than a tie to
+           break silently. Costs one cached feed fetch. */
+        let vendorEntry = null;
+        const feed = await window.electronAPI.securityAdvisories?.({ channel: 'desktop' }).catch(() => null);
+        if (feed?.success) {
+            for (const post of security.parseAdvisoryFeed(feed.xml, { limit: 12 })) {
+                const hit = post.cves.find(c => c.id === cveId);
+                if (hit) { vendorEntry = hit; break; }
+            }
+        }
+        const verdict = security.crossVerify(vendorEntry, cve, { vendorName: 'Google' });
+
+        this.displayText([
+            `${cve.id}${cve.severity ? ` — ${cve.severity}${cve.baseScore != null ? ` (CVSS ${cve.baseScore})` : ''}` : ' — no score assigned yet'}`,
+            cve.vector ? `Vector: ${cve.vector}` : null,
+            cve.published ? `Published: ${new Date(cve.published).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}` : null,
+            cve.source ? `Source: ${cve.source}` : null,
+            vendorEntry ? `Google advisory: ${vendorEntry.severity} — ${vendorEntry.description}` : null,
+            `Verification: ${verdict.status}${verdict.sources.length ? ` (${verdict.sources.join(', ')})` : ''}`,
+            '',
+            cve.description || '',
+        ].filter(Boolean).join('\n'), null);
+
+        /* A disagreement between authorities outranks either one's own summary:
+           it is the single most useful thing to say, and the thing a
+           single-source answer would have hidden. */
+        this.speak(verdict.status === 'conflict'
+            ? security.describeVerification(verdict, cveId)
+            : `${security.describeCve(cve)}${verdict.status === 'confirmed' ? ' Google\'s advisory agrees.' : ''}`);
     }
 
     // Surface the interaction log — the self-improvement telemetry — as a

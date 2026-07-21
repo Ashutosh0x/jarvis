@@ -51,6 +51,35 @@ const PATTERNS = [
         // appears in context, speaking it as a device name is wrong.
         alwaysUngrounded: true,
     },
+    {
+        name: 'cve',
+        /* Security identifiers, added after the model invented one and then
+           defended it. From the log of 21 Jul 2026:
+
+             23:54  "latest cve number of chrome 2026 july today 21"
+                    -> "CVE-2026-15905 is the latest CRITICAL vulnerability"
+             23:56  (user corrects: it is rated High, not Critical)
+                    -> "The latest critical vulnerability is CVE-2026-15899"
+
+           Both answers were produced with no advisory in context. This user is
+           a security researcher; a fabricated CVE number or severity is acted
+           on, cited, and propagated. It is the highest-cost identifier class in
+           this whole file. */
+        re: /\bCVE-\d{4}-\d{4,7}\b/gi,
+        normalise: (s) => s.toUpperCase(),
+    },
+    {
+        name: 'cvss-score',
+        // "a CVSS score of 9.8" — a precise-looking severity number that the
+        // model has no way to know without an advisory in front of it.
+        // "CVSS 9.8", "CVSS score of 9.8", "CVSS v3.1 base score of 9.8" — the
+        // connectives between the label and the number vary, so anything short
+        // and wordy is allowed between them rather than an exact shape.
+        re: /\bCVSS\b[^.\n]{0,24}?\b\d{1,2}\.\d\b/gi,
+        // Only the score itself has to appear in context; the phrasing around
+        // it is the model's own and is not evidence of anything.
+        normalise: (s) => (s.match(/\d{1,2}\.\d(?!.*\d{1,2}\.\d)/) || [s])[0],
+    },
 ];
 
 /**
