@@ -10,6 +10,7 @@ import ragService from './services/ragService.js';
 import reflectionService from './services/reflectionService.js';
 import * as quant from './services/quant.js';
 import * as onchain from './services/onchain.js';
+import * as ens from './services/ens.js';
 import { LocalVoiceService } from './services/voiceService.js';
 import { config } from '../config.js';
 
@@ -2065,27 +2066,64 @@ class Jarvis {
         if (txMatch) return { kind: 'tx', hash: txMatch[0], chain: onchain.resolveChain(text, 'ethereum') };
 
         const addr = onchain.extractAddress(text);
+        // An ENS name works anywhere an address does ("balance of vitalik.eth").
+        const ensMatch = !addr && text.match(/\b([a-z0-9-]+(?:\.[a-z0-9-]+)*\.eth)\b/i);
+        const ensName = ensMatch ? ensMatch[1].toLowerCase() : null;
+
+        // "who is <addr/name>" — identity via ENS (forward or reverse), the one
+        // attribution that is on-chain truth rather than a proprietary label.
+        if ((addr || ensName) && /\b(who is|who'?s|whose (address|wallet)|what name|identify)\b/i.test(text)) {
+            return { kind: 'whois', address: addr, ensName, chain: 'ethereum' };
+        }
 
         // Gas needs no address, but must be unambiguously about a chain (a named
         // chain, "gwei", or "gas fee") so it never eats "gas prices at the pump".
-        if (!addr && /\bgas\b/i.test(text) &&
+        if (!addr && !ensName && /\bgas\b/i.test(text) &&
             (/\b(arbitrum|arb|ethereum|eth|mainnet|base|optimism|\bop\b|polygon|matic|chain|network|l1|l2|gwei)\b/i.test(text) || /\bgas fees?\b/i.test(text))) {
             return { kind: 'gas', chain: onchain.resolveChain(text, 'ethereum') };
         }
-        if (!addr) return null; // every other on-chain read needs an address
+        if (!addr && !ensName) return null; // other on-chain reads need a subject
 
         const chain = onchain.resolveChain(text, 'ethereum');
         // Contract classification — "what kind of token is 0x…", "is 0x… an NFT /
         // ERC-721", "what standard does 0x… implement". Deterministic (ERC-165).
         if (/\b(what (kind|type|standard)|which standard|classify|is (it|this|that)?\s*an?\s*(erc|nft|token)|is 0x[0-9a-fA-F]{40} an?|erc-?165|nft contract|token standard)\b/i.test(text)) {
-            return { kind: 'classify', address: addr, chain };
+            return { kind: 'classify', address: addr, ensName, chain };
         }
         if (/\b(how many (transactions|txs?|transfers)|transaction count|number of transactions|nonce)\b/i.test(text)) {
-            return { kind: 'txcount', address: addr, chain };
+            return { kind: 'txcount', address: addr, ensName, chain };
         }
         const token = onchain.resolveToken(text, chain);
-        if (token) return { kind: 'token', address: addr, chain, token };
-        return { kind: 'balance', address: addr, chain };
+        if (token) return { kind: 'token', address: addr, ensName, chain, token };
+        return { kind: 'balance', address: addr, ensName, chain };
+    }
+
+    // Resolve an ENS name (vitalik.eth) to an address via the mainnet registry.
+    // Keyless, deterministic. Returns null if unregistered or unresolvable.
+    async resolveEns(name) {
+        if (!window.electronAPI?.onchainCall) return null;
+        try {
+            const node = ens.namehash(name);
+            const rRaw = await window.electronAPI.onchainCall({ chain: 'ethereum', to: ens.ENS_REGISTRY, data: ens.encodeResolver(node) });
+            const resolver = rRaw?.success ? ens.decodeAddress(rRaw.raw) : null;
+            if (!resolver) return null;
+            const aRaw = await window.electronAPI.onchainCall({ chain: 'ethereum', to: resolver, data: ens.encodeAddr(node) });
+            return aRaw?.success ? ens.decodeAddress(aRaw.raw) : null;
+        } catch { return null; }
+    }
+
+    // Reverse-resolve an address to its primary ENS name, or null.
+    async reverseEns(address) {
+        if (!window.electronAPI?.onchainCall) return null;
+        try {
+            const node = ens.reverseNode(address);
+            const rRaw = await window.electronAPI.onchainCall({ chain: 'ethereum', to: ens.ENS_REGISTRY, data: ens.encodeResolver(node) });
+            const resolver = rRaw?.success ? ens.decodeAddress(rRaw.raw) : null;
+            if (!resolver) return null;
+            const nRaw = await window.electronAPI.onchainCall({ chain: 'ethereum', to: resolver, data: ens.encodeName(node) });
+            if (!nRaw?.success || ens.isZeroNodeResult(nRaw.raw)) return null;
+            return onchain.decodeAbiString(nRaw.raw) || null;
+        } catch { return null; }
     }
 
     async handleOnchainQuery(intent) {
@@ -2107,8 +2145,21 @@ class Jarvis {
                 await this.handleTx(intent.hash, intent.chain, chainName);
                 return;
             }
+            if (intent.kind === 'whois') {
+                await this.handleWhois(intent);
+                return;
+            }
 
-            const short = onchain.shortAddress(intent.address);
+            // Resolve an ENS name to an address up front for reads that need one.
+            if (!intent.address && intent.ensName) {
+                this.displayText(`Resolving ${intent.ensName}...`, null);
+                const resolved = await this.resolveEns(intent.ensName);
+                if (!resolved) { this.speak(`I could not resolve ${intent.ensName} to an address.`); return; }
+                intent.address = resolved;
+                intent._resolvedFrom = intent.ensName;
+            }
+
+            const short = intent._resolvedFrom || onchain.shortAddress(intent.address);
             if (intent.kind === 'balance') {
                 this.displayText(`Reading ${short} on ${chainName}...`, null);
                 const r = await window.electronAPI.onchainBalance({ chain: intent.chain, address: intent.address });
@@ -2177,6 +2228,28 @@ class Jarvis {
         const line = v.standard
             ? `${short} on ${chainName} implements ${v.detail}.${sym}`
             : `${short} on ${chainName} — ${v.detail}.${sym}`;
+        this.displayText(line, null); this.speak(line);
+    }
+
+    // "Who is <addr/name>" — ENS identity, the only on-chain-truthful attribution
+    // (no proprietary exchange labels, no LLM guessing). Forward for a name,
+    // reverse for an address; honest "no ENS name" when there is none.
+    async handleWhois(intent) {
+        if (!window.electronAPI?.onchainCall) { this.speak('Identity lookup is not available here.'); return; }
+        if (intent.ensName) {
+            this.displayText(`Resolving ${intent.ensName}...`, null);
+            const addr = await this.resolveEns(intent.ensName);
+            const line = addr
+                ? `${intent.ensName} resolves to ${addr} on Ethereum.`
+                : `${intent.ensName} does not resolve to an address (unregistered or no address record).`;
+            this.displayText(line, null); this.speak(line); return;
+        }
+        const short = onchain.shortAddress(intent.address);
+        this.displayText(`Looking up ${short}...`, null);
+        const name = await this.reverseEns(intent.address);
+        const line = name
+            ? `${short} has the ENS name ${name}.`
+            : `${short} has no primary ENS name set. On-chain data alone cannot tell you who owns it — anything more would be a guess.`;
         this.displayText(line, null); this.speak(line);
     }
 
