@@ -13,6 +13,7 @@ import * as onchain from './services/onchain.js';
 import * as ens from './services/ens.js';
 import { LocalVoiceService } from './services/voiceService.js';
 import { config } from '../config.js';
+import perf from './services/perf.js';
 
 class Jarvis {
     constructor() {
@@ -55,7 +56,7 @@ class Jarvis {
             // forever after an utterance, which would permanently deafen the mic.
             this.ttsActive = false;
             this.localVoice = new LocalVoiceService({
-                onTranscript: (text) => this._handleVoiceTranscript(text),
+                onTranscript: (text, meta) => this._handleVoiceTranscript(text, meta),
                 onVolume: (v) => { window.visualizerVolume = v; },
                 onStatus: (s) => this._onVoiceStatus(s),
                 isTtsSpeaking: () => this.ttsActive,
@@ -1263,7 +1264,12 @@ class Jarvis {
             this.commandInput.disabled = false;
         }
 
+        // Per-stage profiling starts before intent detection so the routing cost
+        // itself is measured, not assumed.
+        perf.startTurn();
+        const _intentT0 = Date.now();
         const intent = this.detectIntent(command);
+        perf.stage('intent', Date.now() - _intentT0);
         console.log('Intent:', intent);
 
         // Interaction-log bookkeeping: reset this turn's response buffer (filled
@@ -2739,6 +2745,9 @@ class Jarvis {
         // Accumulate this turn's spoken output for the interaction log. Both
         // speak() and _speakQueued() (the streaming path) funnel through here, so
         // this is the one place that sees every word Jarvis says.
+        // First words out is the latency the user actually perceives; everything
+        // after this lands while they are already listening.
+        perf.markFirstWord();
         this._turnResponse = ((this._turnResponse || '') + ' ' + text).trim();
     }
 
@@ -2750,6 +2759,7 @@ class Jarvis {
             if (!window.electronAPI?.logInteraction) return;
             const name = (intent && intent.intent) || 'AI';
             if (name === 'SET_KEY' || name === 'LIST_KEYS' || /^\s*(store|set)\s+key\s+/i.test(input)) return;
+            const profile = perf.endTurn();
             window.electronAPI.logInteraction({
                 source: this._lastInputWasVoice ? 'voice' : 'text',
                 input: String(input || '').slice(0, 500),
@@ -2757,6 +2767,11 @@ class Jarvis {
                 latencyMs: Date.now() - startedAt,
                 ok: ok !== false,
                 response: String(this._turnResponse || '').slice(0, 500),
+                // Per-stage breakdown: which command is slow was already
+                // answerable; this says where inside it the time went.
+                stages: profile ? profile.stages : undefined,
+                firstWordMs: profile ? profile.firstWordMs : undefined,
+                sttMs: this._lastSttMs || undefined,
             });
         } catch { /* logging must never affect the turn */ }
     }
@@ -2792,7 +2807,10 @@ class Jarvis {
         return false;
     }
 
-    _handleVoiceTranscript(text) {
+    _handleVoiceTranscript(text, meta) {
+        // Carried into the interaction log so a voice turn's profile shows the
+        // transcription cost alongside the stages this process controls.
+        this._lastSttMs = meta && meta.sttMs ? Math.round(meta.sttMs) : null;
         const t = String(text).trim();
         if (!t) {
             this._showTranscript('(silence - nothing recognized)', 'ambient', 'HEARD', 2500);

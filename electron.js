@@ -8,6 +8,7 @@ const axios = require('axios');
 const QRCode = require('qrcode');
 const { CompanionBridge, WS_PORT: COMPANION_WS_PORT } = require('./companionBridge');
 const adbService = require('./adbService');
+const { hedgedRace, createStickyOrder } = require('./rpcHedge');
 
 /* =========================
    UNLIMITED-OCR CONFIG
@@ -620,13 +621,15 @@ function parseNetshInterface(out) {
 
 // Real, measured network + device intelligence — no fabricated numbers.
 // Everything here comes from netsh / Get-NetIPConfiguration / live pings.
-ipcMain.handle('wifi-info', async () => {
-    const iface = parseNetshInterface(await runNetsh(['wlan', 'show', 'interfaces']));
-    if (iface.state !== 'connected') {
-        return { success: true, connected: false };
-    }
+const PING_PROBES = 2; // probes per target; all loss arithmetic derives from this
 
-    // IP config + gateway/DNS via PowerShell (structured, reliable)
+ipcMain.handle('wifi-info', async () => {
+    /* MEASURED: this handler averaged 12.1s in the interaction log. The work is
+       three powershell.exe spawns (~300-800ms of startup EACH on 5.1) plus
+       three-count pings, and it ran almost entirely in series — most damningly,
+       the 8.8.8.8 ping waited for BOTH the netsh call and Get-NetIPConfiguration
+       despite depending on neither. Only the gateway ping genuinely needs the IP
+       config, so everything else is started at once. */
     const ipScript = `
 $c = Get-NetIPConfiguration -InterfaceAlias 'Wi-Fi' -ErrorAction SilentlyContinue
 [PSCustomObject]@{
@@ -634,29 +637,47 @@ $c = Get-NetIPConfiguration -InterfaceAlias 'Wi-Fi' -ErrorAction SilentlyContinu
   gateway = $c.IPv4DefaultGateway.NextHop
   dns = ($c.DNSServer | Where-Object { $_.AddressFamily -eq 2 } | Select-Object -ExpandProperty ServerAddresses) -join ','
 } | ConvertTo-Json -Compress`;
-    let ip = {};
-    try { ip = JSON.parse((await runPowerShell(ipScript, 8000)) || '{}'); } catch { /* keep {} */ }
 
-    // Live latency + packet loss to the gateway and to the internet (8.8.8.8)
+    // Live latency + packet loss. Two probes rather than three: one fewer
+    // second of waiting, and two still distinguish "up", "lossy" and "down".
     const measure = async (target) => {
-        const s = `$p = Test-Connection '${target}' -Count 3 -ErrorAction SilentlyContinue
-if ($p) { "$([math]::Round(($p | Measure-Object ResponseTime -Average).Average)):$(3 - $p.Count)" } else { "x:3" }`;
-        const r = await runPowerShell(s, 12000);
-        if (!r || r.startsWith('x')) return { latencyMs: null, lossOf3: 3 };
+        const s = `$p = Test-Connection '${target}' -Count ${PING_PROBES} -ErrorAction SilentlyContinue
+if ($p) { "$([math]::Round(($p | Measure-Object ResponseTime -Average).Average)):$(${PING_PROBES} - $p.Count)" } else { "x:${PING_PROBES}" }`;
+        const r = await runPowerShell(s, 8000);
+        // Loss is reported against the probe count rather than a hardcoded 3:
+        // the count is a tuning knob, and every verdict below is derived from
+        // it, so baking "3" into the arithmetic would silently produce wrong
+        // percentages and an unreachable "no internet" branch.
+        if (!r || r.startsWith('x')) return { latencyMs: null, lost: PING_PROBES, probes: PING_PROBES };
         const [lat, loss] = r.split(':');
-        return { latencyMs: Number(lat), lossOf3: Number(loss) };
+        return { latencyMs: Number(lat), lost: Number(loss), probes: PING_PROBES };
     };
-    const [gw, net] = ip.gateway
-        ? await Promise.all([measure(ip.gateway), measure('8.8.8.8')])
-        : [{ latencyMs: null, lossOf3: 3 }, await measure('8.8.8.8')];
+
+    const ifacePromise = runNetsh(['wlan', 'show', 'interfaces']).then(parseNetshInterface);
+    const ipPromise = runPowerShell(ipScript, 8000)
+        .then((r) => { try { return JSON.parse(r || '{}'); } catch { return {}; } });
+    const netPromise = measure('8.8.8.8'); // independent of everything above
+
+    const iface = await ifacePromise;
+    if (iface.state !== 'connected') {
+        // Let the in-flight probes finish rather than leaving them dangling.
+        await Promise.allSettled([ipPromise, netPromise]);
+        return { success: true, connected: false };
+    }
+
+    const ip = await ipPromise;
+    const [gw, net] = await Promise.all([
+        ip.gateway ? measure(ip.gateway) : Promise.resolve({ latencyMs: null, lost: PING_PROBES, probes: PING_PROBES }),
+        netPromise,
+    ]);
 
     // Derive a plain-language quality verdict from measured internet latency/loss
     let quality = 'unknown';
-    if (net.latencyMs != null && net.lossOf3 === 0) {
+    if (net.latencyMs != null && net.lost === 0) {
         quality = net.latencyMs < 40 ? 'excellent' : net.latencyMs < 100 ? 'good' : net.latencyMs < 250 ? 'fair' : 'poor';
-    } else if (net.lossOf3 >= 3) {
+    } else if (net.lost >= net.probes) {
         quality = 'no internet';
-    } else if (net.lossOf3 > 0) {
+    } else if (net.lost > 0) {
         quality = 'unstable';
     }
 
@@ -676,8 +697,8 @@ if ($p) { "$([math]::Round(($p | Measure-Object ResponseTime -Average).Average))
         dns: ip.dns ? ip.dns.split(',') : [],
         gatewayLatencyMs: gw.latencyMs,
         internetLatencyMs: net.latencyMs,
-        packetLossPct: Math.round((net.lossOf3 / 3) * 100),
-        internetReachable: net.lossOf3 < 3,
+        packetLossPct: Math.round((net.lost / net.probes) * 100),
+        internetReachable: net.lost < net.probes,
         quality,
     };
 });
@@ -1441,30 +1462,40 @@ const RPC_URLS = {
 // service can never be steered into a write/signing call.
 const RPC_READ_METHODS = new Set(['eth_getBalance', 'eth_gasPrice', 'eth_call', 'eth_getTransactionCount', 'eth_blockNumber', 'eth_getTransactionReceipt', 'eth_getTransactionByHash']);
 
+/* Endpoints are RACED, not queued. Sequential failover with a 10s timeout each
+   is what put a 30.0s worst case in the interaction log: three dead endpoints
+   cost three full timeouts before the user heard anything. See rpcHedge.js. */
+const RPC_HEDGE_MS = 1200;    // how long a healthy endpoint has before we hedge
+const RPC_TIMEOUT_MS = 4000;  // a JSON-RPC read has no business taking longer
+const rpcSticky = createStickyOrder();
+
 async function rpcCall(chainKey, method, params = []) {
     if (!RPC_READ_METHODS.has(method)) throw new Error(`method not allowed: ${method}`);
     const urls = RPC_URLS[chainKey];
     if (!urls) throw new Error(`unknown chain: ${chainKey}`);
-    let lastErr = 'none';
-    for (const url of urls) {
-        try {
+
+    const { value, item } = await hedgedRace(
+        rpcSticky.order(chainKey, urls),
+        async (url, signal) => {
             const res = await fetch(url, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', 'User-Agent': 'Jarvis/1.0' },
                 body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
-                signal: AbortSignal.timeout(10000),
+                signal,
             });
             if (!res.ok) throw new Error(`http ${res.status}`);
             const j = await res.json();
             if (j.error) throw new Error(j.error.message || 'rpc error');
             if (j.result === undefined) throw new Error('empty result');
             return j.result;
-        } catch (e) {
-            lastErr = `${url}: ${e.message}`;
-            console.warn(`rpc fell through — ${lastErr}`);
-        }
-    }
-    throw new Error(`all RPCs failed (${lastErr})`);
+        },
+        { hedgeAfterMs: RPC_HEDGE_MS, timeoutMs: RPC_TIMEOUT_MS },
+    );
+
+    // Keep using whichever endpoint actually answered, so a chain that failed
+    // over once stops paying the hedge delay on every later query.
+    rpcSticky.remember(chainKey, item);
+    return value;
 }
 
 const ADDR_RE = /^0x[0-9a-fA-F]{40}$/;

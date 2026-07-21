@@ -1,5 +1,6 @@
 import { GoogleGenAI } from "@google/genai";
 import { config } from "../config.js";
+import perf from "./services/perf.js";
 
 // Initialize standard client for tool execution
 let genAI = null;
@@ -83,6 +84,11 @@ export async function describeImageLocal(imageInput, question) {
 
 export async function generateContentLocal(messages, onChunk) {
     const { url, model } = getLocalConfig();
+    // Time to FIRST token is the number that matters for perceived speed: the
+    // streaming TTS path starts speaking on the first completed sentence, so
+    // total generation time is largely hidden behind Jarvis already talking.
+    const _t0 = Date.now();
+    let _firstTokenAt = null;
     const response = await fetch(`${url}/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -118,6 +124,10 @@ export async function generateContentLocal(messages, onChunk) {
                 const data = JSON.parse(line);
                 const piece = data.message?.content;
                 if (piece) {
+                    if (_firstTokenAt === null) {
+                        _firstTokenAt = Date.now();
+                        perf.stage('llm.firstToken', _firstTokenAt - _t0);
+                    }
                     fullText += piece;
                     if (onChunk) onChunk(piece);
                 }
@@ -127,6 +137,7 @@ export async function generateContentLocal(messages, onChunk) {
         }
     }
 
+    perf.stage('llm.total', Date.now() - _t0);
     return fullText;
 }
 

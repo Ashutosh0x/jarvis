@@ -66,7 +66,10 @@ export class LocalVoiceService {
                 const msg = JSON.parse(e.data);
                 if (msg.type === 'final' && msg.text) {
                     console.log(`LocalVoice: [${msg.ms}ms] "${msg.text}"`);
-                    this.onTranscript(msg.text);
+                    // The server already reports how long transcription took;
+                    // pass it on so the turn profile can attribute it rather
+                    // than leaving STT as an unmeasured gap.
+                    this.onTranscript(msg.text, { sttMs: msg.ms });
                 }
             } catch { /* ignore malformed frames */ }
         };

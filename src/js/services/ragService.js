@@ -45,6 +45,7 @@
 
 import { adaptiveFusionWeights } from './adaptiveWeights.js';
 import { buildNeighborGraphAsync, expandCandidates } from './docGraph.js';
+import perf from './perf.js';
 
 const STOPWORDS = new Set(['a', 'an', 'the', 'is', 'are', 'was', 'were', 'be', 'been', 'to', 'of', 'in', 'on', 'at', 'for', 'with', 'and', 'or', 'not', 'it', 'its', 'this', 'that', 'i', 'my', 'me', 'you', 'your', 'we', 'do', 'does', 'did', 'have', 'has', 'had', 'what', 'which', 'who', 'when', 'where', 'how', 'about', 'from', 'by', 'as', 'so']);
 
@@ -704,15 +705,19 @@ class RagService {
             return { context: '', results: [] };
         }
 
+        const _t0 = Date.now();
         const queryTokens = tokenize(query);
         const sparseRanks = this._bm25(queryTokens);
 
         // PRF: a second lexical list from feedback terms.
         const prfTokens = this._prfTokens(sparseRanks, queryTokens);
         const prfRanks = prfTokens.length ? this._bm25(prfTokens) : [];
+        perf.stage('rag.lexical', Date.now() - _t0);
 
         let denseRanks = [];
+        const _tEmbed = Date.now();
         const qVec = (await this._embed([query]))?.[0];
+        perf.stage('rag.embed', Date.now() - _tEmbed);
         if (qVec) {
             denseRanks = this.chunks
                 .map((c, i) => ({ i, score: c.vector ? cosine(qVec, c.vector) : 0 }))
@@ -775,7 +780,8 @@ class RagService {
         if (opts.rerank === true && this._needsRerank(top)) {
             const before = top[0]?.text;
             const pool = this._expandPool(top);
-            const ranked = await this._rerank(query, pool, RERANK_EXPANDED_CANDIDATES);
+            const ranked = await perf.time('rag.rerank',
+                () => this._rerank(query, pool, RERANK_EXPANDED_CANDIDATES));
             // _rerank returns its input unchanged on every failure path. If it
             // did, drop the expanded passages: unjudged neighbours have no place
             // in the context, since nothing has vouched for them but similarity.
