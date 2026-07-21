@@ -117,3 +117,97 @@ export function traceFunds(edges, source, opts = {}) {
     const scores = personalizedPageRank(graph, source, opts);
     return topRanked(scores, source, opts.limit ?? 20);
 }
+
+// ---------------------------------------------------------------------------
+// Structural pattern detection (from the ST Engineering survey's transaction
+// typology + Clue2Group's SACC structural enhancement). These are DETERMINISTIC
+// graph patterns, NOT an ML verdict: they say "this shape is present", never
+// "this is money laundering" — that classification needs a trained model, a
+// labeled dataset, and a human analyst, none of which live here.
+// ---------------------------------------------------------------------------
+
+/** Coefficient of variation of a list of amounts (Clue2Group Eq. 11):
+ *  std/mean. Low CV along a path => the "same money" plausibly flowed through
+ *  (a layering signal); high CV => amounts don't line up. Returns Infinity for
+ *  a zero mean so it never falsely reads as consistent. */
+export function coefficientOfVariation(amounts) {
+    const xs = (amounts || []).map(Number).filter((x) => Number.isFinite(x));
+    if (xs.length < 2) return 0;
+    const mean = xs.reduce((s, x) => s + x, 0) / xs.length;
+    if (mean === 0) return Infinity;
+    const variance = xs.reduce((s, x) => s + (x - mean) ** 2, 0) / xs.length;
+    return Math.sqrt(variance) / Math.abs(mean);
+}
+
+/**
+ * Find cycles that return to `source` within `maxLen` hops — the survey's
+ * round-trip / U-turn typology (funds sent out and routed back). Pure DFS over
+ * the forward graph. Returns arrays of nodes, each starting and ending at source.
+ */
+export function detectCycles(graph, source, maxLen = 6) {
+    const cycles = [];
+    const path = [source];
+    const onPath = new Set([source]);
+    const seenKeys = new Set();
+
+    const dfs = (u) => {
+        if (path.length > maxLen) return;
+        for (const { to } of graph.out.get(u) || []) {
+            if (to === source && path.length >= 2) {
+                const key = [...path].sort().join('>');
+                if (!seenKeys.has(key)) { seenKeys.add(key); cycles.push([...path, source]); }
+            } else if (!onPath.has(to) && path.length < maxLen) {
+                path.push(to); onPath.add(to);
+                dfs(to);
+                path.pop(); onPath.delete(to);
+            }
+        }
+    };
+    dfs(source);
+    return cycles;
+}
+
+/**
+ * Enumerate simple forward chains from `source` (length in [minLen, maxLen])
+ * whose hop amounts are amount-consistent (CV <= cvThreshold) — SACC's
+ * "self-consistent fund-flow explanation along a path". Each result carries the
+ * node path and its CV, so a caller can rank the most convincing layering paths.
+ */
+export function detectConsistentChains(graph, source, opts = {}) {
+    const minLen = opts.minLen ?? 2;
+    const maxLen = opts.maxLen ?? 5;
+    const cvThreshold = opts.cvThreshold ?? 0.15;
+    const out = [];
+
+    const path = [source];
+    const amounts = [];
+    const onPath = new Set([source]);
+
+    const dfs = (u) => {
+        if (path.length - 1 >= minLen) {
+            const cv = coefficientOfVariation(amounts);
+            if (cv <= cvThreshold) out.push({ path: [...path], amounts: [...amounts], cv });
+        }
+        if (path.length - 1 >= maxLen) return;
+        for (const { to, amount } of graph.out.get(u) || []) {
+            if (onPath.has(to)) continue;
+            path.push(to); amounts.push(amount); onPath.add(to);
+            dfs(to);
+            path.pop(); amounts.pop(); onPath.delete(to);
+        }
+    };
+    dfs(source);
+    // Most amount-consistent (lowest CV), then longest, first.
+    return out.sort((a, b) => a.cv - b.cv || b.path.length - a.path.length);
+}
+
+/** One-call structural report for a source: ranked leads + detected patterns. */
+export function structuralReport(edges, source, opts = {}) {
+    const graph = buildGraph(edges);
+    const scores = personalizedPageRank(graph, source, opts);
+    return {
+        leads: topRanked(scores, source, opts.limit ?? 20),
+        cycles: detectCycles(graph, source, opts.maxCycleLen ?? 6),
+        consistentChains: detectConsistentChains(graph, source, opts),
+    };
+}
