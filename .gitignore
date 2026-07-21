@@ -2,6 +2,10 @@ node_modules
 dist
 release
 src/config.js
+# Secrets: real keys live here, .env.example is the committed template.
+.env
+.env.local
+.env.*.local
 .parcel-cache
 .DS_Store
 *.log
@@ -10,3 +14,9 @@ search_test.*
 puter_test.html
 temp_genai_repo
 docs.md
+
+# Local working files: source data downloads and scaffolding archives. The
+# registry generated from the Ondo CSV is committed; the raw export is not.
+*.zip
+# Brackets are a character class in gitignore patterns, so they are escaped.
+\[EXTERNAL\]*.csv
