@@ -54,6 +54,7 @@ extends the same interface and control surface to a paired phone over Wi-Fi.
 - [Feature reference](#feature-reference)
 - [On-chain intelligence](#on-chain-intelligence)
 - [Retrieval engine](#retrieval-engine)
+- [Evaluation](#evaluation)
 - [Android companion](#android-companion)
 - [Installation](#installation)
 - [Running](#running)
@@ -529,13 +530,63 @@ flowchart TB
 | --- | --- | --- |
 | Sparse | BM25 over a persistent inverted index, incremental on ingest | Re-tokenising the corpus per query measured 94ms at 5k chunks on the render thread |
 | Dense | nomic-embed-text through Ollama, cosine similarity | Degrades to BM25-only when no embedder is present |
-| Fusion | Reciprocal Rank Fusion, k=60 | Hybrid beat dense-only and sparse-only for every embedding model in PubHealthBench |
+| Fusion | Reciprocal Rank Fusion, k=60 | Derived from PubHealthBench, where hybrid beat both single-retriever modes. **This did not reproduce locally — see [Retrieval accuracy](#retrieval-accuracy)** |
 | Expansion | PRF: top 4 chunks, top 6 non-query terms, fused as a separate list at weight 0.5 | Kept separate so a poor feedback pool can dilute but not corrupt the original ranking |
 | Entities | Normalised Levenshtein, threshold 0.25, after exact-match miss | Input is speech-to-text, so names arrive mangled |
 | Selection | Late sentence selection, IDF-weighted overlap with lead bias, budget 10 | LongEval's winning system paired plain passages with late sentence selection |
 | Reranking | Ambiguity-gated LLM rerank, opt-in | See below |
 
-### Measured results
+### Retrieval accuracy
+
+Speed was measured long before accuracy was, which is backwards: a fast ranker
+that ranks the wrong passage first is worse than a slow one that does not.
+`eval/` now carries a labelled benchmark — 29 questions over 30 documents,
+driving the shipped module through ablation switches rather than a
+reimplementation of it. Full numbers and method in
+[eval/RESULTS.md](eval/RESULTS.md).
+
+| Configuration | P@1 | P@3 | MRR | ms/query |
+| --- | ---: | ---: | ---: | ---: |
+| lexical only (BM25) | 69.0% | 79.3% | 0.737 | <1 |
+| **dense only** | **89.7%** | **100%** | **0.948** | 60 |
+| hybrid, as shipped | 72.4% | 93.1% | 0.825 | 61 |
+| hybrid + rerank | 72.4% | 93.1% | 0.825 | 3,243 |
+
+**Dense-only beats the shipped hybrid by 17 points at rank 1.** The rationale
+for hybrid fusion came from the literature and did not reproduce on this corpus
+with this embedding model. Lexical retrieval is in the stack to catch rare
+proper nouns; dense matched it there (5/5) and beat it on every other question
+type, so its weight in the fusion is diluting a better ranking rather than
+protecting against a weakness.
+
+The default has not been changed on that basis, for reasons stated in full in
+the results: the benchmark's author also wrote its questions, 29 questions makes
+anything under ~7 points a single labelling choice, and BM25 is the only thing
+that still works when the embedder is down. But the shipped weighting is
+currently **unsupported by the only measurement that exists**, and saying so is
+more useful than citing the paper it came from.
+
+Reranking changed no answer on this set while costing 3.2 seconds per query.
+
+### Memory accuracy
+
+The belief store's claims, measured by replaying 12 scripted observations over
+6 simulated days (`node eval/memory-eval.mjs`):
+
+| Claim | Result |
+| --- | --- |
+| A repeated genuine preference becomes durable | 3/3 held |
+| A one-off speech mangling never does | 0/2 admitted |
+| A changed fact replaces the old value | VS Code durable, Sublime archived |
+| Confidence bounded and reported | 83% after 3 observations |
+| Provenance retained | 3 records, sources voice and text |
+
+This exercises the state machine — corroboration, decay, competition, revision.
+It does not measure how well a 4B model distils facts from real conversation,
+nor whether durable beliefs improve the final answer. Both need labelled real
+data, and neither is claimed here.
+
+### Measured performance
 
 Inverted index against the previous implementation, top-10 rankings verified
 bit-identical at every size:
@@ -581,6 +632,29 @@ Benchmarked on this hardware, Gemma 3 routes queries to the correct source with
 planning call costs about 3 seconds, and the published agent loops use 5 to 20
 steps. That is 15 to 60 seconds of silence before the first word, which does not
 work for a voice interface.
+
+---
+
+## Evaluation
+
+```bash
+node eval/retrieval-eval.mjs   # ranking accuracy across configurations
+node eval/memory-eval.mjs      # belief store: corroboration, revision, garble rejection
+```
+
+Both harnesses drive the shipped modules. Results, method, and the caveats that
+bound them are in [eval/RESULTS.md](eval/RESULTS.md); the headline numbers are
+in [Retrieval accuracy](#retrieval-accuracy) and [Memory accuracy](#memory-accuracy)
+above.
+
+The benchmark corpus is synthetic and labelled. It supports comparison between
+configurations, since each sees identical data; it does not predict accuracy on
+a real user's memory, and it is not presented as doing so.
+
+**What is still unmeasured, and should be:** whether retrieved context and
+durable beliefs improve the final *answer*, as opposed to the ranking. That
+needs answer-level labels and a judge. The rankings are now measured; the
+answers are not, and no claim is made about them.
 
 ---
 

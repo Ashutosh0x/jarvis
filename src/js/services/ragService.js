@@ -705,18 +705,28 @@ class RagService {
             return { context: '', results: [] };
         }
 
+        /* Ablation switches, for the evaluation harness in eval/. They exist so
+           a benchmark can measure THIS pipeline rather than a reimplementation
+           of it: claims like "hybrid beats lexical" should be measured on the
+           code that ships, not on a copy written to agree with them. All default
+           to on, so normal callers are unaffected. */
+        const ab = opts.ablate || {};
+        const useSparse = ab.sparse !== false;
+        const useDense = ab.dense !== false;
+        const usePrf = ab.prf !== false;
+
         const _t0 = Date.now();
         const queryTokens = tokenize(query);
-        const sparseRanks = this._bm25(queryTokens);
+        const sparseRanks = useSparse ? this._bm25(queryTokens) : [];
 
         // PRF: a second lexical list from feedback terms.
-        const prfTokens = this._prfTokens(sparseRanks, queryTokens);
+        const prfTokens = usePrf ? this._prfTokens(sparseRanks, queryTokens) : [];
         const prfRanks = prfTokens.length ? this._bm25(prfTokens) : [];
         perf.stage('rag.lexical', Date.now() - _t0);
 
         let denseRanks = [];
         const _tEmbed = Date.now();
-        const qVec = (await this._embed([query]))?.[0];
+        const qVec = useDense ? (await this._embed([query]))?.[0] : null;
         perf.stage('rag.embed', Date.now() - _tEmbed);
         if (qVec) {
             denseRanks = this.chunks
@@ -738,7 +748,11 @@ class RagService {
            (dilute-but-never-corrupt); equal confidence yields exactly
            {1, 1, 0.5} — the proven baseline. Pure arithmetic on scores already
            computed: no added latency. */
-        const { sparse: wSparse, dense: wDense, prf: wPrf } = adaptiveFusionWeights(sparseRanks, denseRanks, prfRanks);
+        // opts.weights is an evaluation hook (see eval/): it lets the harness
+        // sweep fusion weights against a labelled set instead of arguing about
+        // them. Unset in normal operation, where the adaptive weights decide.
+        const { sparse: wSparse, dense: wDense, prf: wPrf } = opts.weights
+            || adaptiveFusionWeights(sparseRanks, denseRanks, prfRanks);
         const rrf = {};
         const fuse = (list, weight = 1) => {
             list.forEach((s, rank) => {
