@@ -1460,7 +1460,7 @@ const RPC_URLS = {
 };
 // Only these JSON-RPC methods may ever be sent — a hard allowlist so the
 // service can never be steered into a write/signing call.
-const RPC_READ_METHODS = new Set(['eth_getBalance', 'eth_gasPrice', 'eth_call', 'eth_getTransactionCount', 'eth_blockNumber', 'eth_getTransactionReceipt', 'eth_getTransactionByHash']);
+const RPC_READ_METHODS = new Set(['eth_getBalance', 'eth_gasPrice', 'eth_call', 'eth_getTransactionCount', 'eth_blockNumber', 'eth_getTransactionReceipt', 'eth_getTransactionByHash', 'eth_getBlockByNumber']);
 
 /* Endpoints are RACED, not queued. Sequential failover with a 10s timeout each
    is what put a 30.0s worst case in the interaction log: three dead endpoints
@@ -1562,6 +1562,222 @@ ipcMain.handle('onchain-token', async (event, { chain, token, data }) => {
         const raw = await rpcCall(chain, 'eth_call', [{ to: token, data }, 'latest']);
         return { success: true, raw };
     } catch (e) { return { success: false, error: e.message }; }
+});
+
+/* =========================
+   REAL-TIME CHAIN STREAMER + ADDRESS WATCHLIST
+   Push-based on-chain awareness: eth_subscribe(newHeads) over keyless
+   public WebSocket RPC (LIVE-VERIFIED: publicnode serves newHeads without
+   a key on both ethereum and arbitrum), then one hedged
+   eth_getBlockByNumber per head, scanned by the pure chainWatch module.
+
+   Deliberate boundaries, so this stays honest:
+   - Ethereum only by default. Arbitrum produces multiple blocks per
+     second (measured), which would mean hammering getBlockByNumber
+     ~4x/sec forever on a free endpoint.
+   - Native-value whales only. ERC-20 whale detection needs per-block log
+     scanning + per-token pricing — not a keyless streamer's job.
+   - NO built-in entity labels. Who owns an address is not on-chain data;
+     a hardcoded "Binance Hot Wallet" dictionary is unverifiable
+     attribution stated as fact. Labels come from exactly two honest
+     sources: the user's own watchlist labels, and (when the user has
+     stored an arkham_api_key in the vault) Arkham's API with the answer
+     attributed to Arkham. Otherwise the address is spoken shortened.
+   - Mempool (newPendingTransactions) deliberately skipped: most free
+     endpoints reject it, and pending txs can be dropped/replaced — a
+     spoken alert about a tx that never lands is misinformation.
+========================= */
+const WsClient = require('ws');
+const { scanBlockTxs, shortAddr: chainShortAddr } = require('./chainWatch');
+
+const CHAIN_WS_URLS = {
+    ethereum: process.env.JARVIS_ETH_WS || 'wss://ethereum-rpc.publicnode.com',
+};
+const CHAIN_WATCHLIST_FILE = () => path.join(app.getPath('userData'), 'chain-watchlist.json');
+const ENTITY_DB_FILE = () => path.join(app.getPath('userData'), 'entity-labels.json');
+
+let chainStream = null;          // { ws, chain, blocks, alerts, startedAt }
+let chainWatchCache = null;      // watchlist kept in memory, persisted on change
+
+async function loadChainWatchlist() {
+    if (chainWatchCache) return chainWatchCache;
+    try { chainWatchCache = JSON.parse(await fs.readFile(CHAIN_WATCHLIST_FILE(), 'utf-8')); }
+    catch { chainWatchCache = []; }
+    return chainWatchCache;
+}
+async function saveChainWatchlist(list) {
+    chainWatchCache = list;
+    await fs.writeFile(CHAIN_WATCHLIST_FILE(), JSON.stringify(list, null, 2), 'utf-8');
+}
+
+/* ETH/USD context for whale announcements. Best-effort with a 5-minute cache —
+   reuses the existing keyless Yahoo quote path; a missing price simply means
+   the alert speaks ETH amounts only, never a made-up dollar figure. */
+let ethUsdCache = { price: null, at: 0 };
+async function getEthUsd() {
+    if (Date.now() - ethUsdCache.at < 5 * 60 * 1000) return ethUsdCache.price;
+    try {
+        const q = await fetchQuoteYahoo('ETH-USD');
+        ethUsdCache = { price: q?.price || null, at: Date.now() };
+    } catch { ethUsdCache = { price: null, at: Date.now() }; }
+    return ethUsdCache.price;
+}
+
+/* Entity labels — user's own labels first, then optional Arkham (attributed,
+   cached). Returns { name, source } or null; NEVER a guess. */
+let entityCache = null;
+async function lookupEntity(address) {
+    if (!address) return null;
+    const key = String(address).toLowerCase();
+
+    const watch = await loadChainWatchlist();
+    const own = watch.find(w => w.address === key && w.label);
+    if (own) return { name: own.label, source: 'your watchlist' };
+
+    if (!entityCache) {
+        try { entityCache = JSON.parse(await fs.readFile(ENTITY_DB_FILE(), 'utf-8')); }
+        catch { entityCache = {}; }
+    }
+    if (entityCache[key]) return entityCache[key];
+
+    const arkhamKey = await getCredential('arkham_api_key');
+    if (arkhamKey) {
+        try {
+            const res = await fetch(`https://api.arkhamintelligence.com/intelligence/address/${key}`, {
+                headers: { 'API-Key': arkhamKey }, signal: AbortSignal.timeout(5000),
+            });
+            if (res.ok) {
+                const data = await res.json();
+                const name = data?.arkhamEntity?.name;
+                if (name) {
+                    const label = { name, source: 'Arkham' };
+                    entityCache[key] = label;
+                    fs.writeFile(ENTITY_DB_FILE(), JSON.stringify(entityCache), 'utf-8').catch(() => {});
+                    return label;
+                }
+            }
+        } catch { /* Arkham unavailable — fall through to null */ }
+    }
+    return null;
+}
+
+async function describeParty(address) {
+    if (!address) return 'a contract creation';
+    const ent = await lookupEntity(address);
+    return ent ? `${ent.name} (per ${ent.source})` : chainShortAddr(address);
+}
+
+function stopChainStream() {
+    if (!chainStream) return false;
+    try { chainStream.ws.close(); } catch { /* already closed */ }
+    chainStream = null;
+    return true;
+}
+
+function startChainStream(chainKey = 'ethereum') {
+    const url = CHAIN_WS_URLS[chainKey];
+    if (!url) return { success: false, error: `no stream endpoint for ${chainKey}` };
+    if (chainStream?.chain === chainKey) return { success: true, already: true };
+    stopChainStream();
+
+    const state = { ws: null, chain: chainKey, blocks: 0, alerts: 0, startedAt: Date.now() };
+    const connect = () => {
+        if (chainStream !== state || app.isQuittingJarvis) return;
+        const ws = new WsClient(url);
+        state.ws = ws;
+
+        ws.on('open', () => {
+            ws.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_subscribe', params: ['newHeads'] }));
+            console.log(`Chain stream: connected (${chainKey})`);
+        });
+
+        ws.on('message', async (raw) => {
+            try {
+                const msg = JSON.parse(raw);
+                if (msg.method !== 'eth_subscription' || !msg.params?.result?.number) return;
+                const blockHex = msg.params.result.number;
+
+                // Full block via the existing hedged HTTP path — the WS socket
+                // stays a pure notification channel.
+                const block = await rpcCall(chainKey, 'eth_getBlockByNumber', [blockHex, true]).catch(() => null);
+                if (!block?.transactions || chainStream !== state) return;
+                state.blocks++;
+
+                const watch = await loadChainWatchlist();
+                const { whales, watchHits } = scanBlockTxs(block.transactions, {
+                    chain: chainKey,
+                    watch: watch.filter(w => (w.chains || ['ethereum']).includes(chainKey)).map(w => w.address),
+                });
+                if (!whales.length && !watchHits.length) return;
+
+                const price = await getEthUsd();
+                const blockNumber = parseInt(blockHex, 16);
+
+                for (const w of whales.slice(0, 3)) { // cap: a busy block must not queue 20 announcements
+                    state.alerts++;
+                    publishEvent('whale-alert', {
+                        ...w,
+                        blockNumber,
+                        usd: price ? Math.round(parseFloat(w.amount.replace(/,/g, '')) * price) : null,
+                        fromLabel: await describeParty(w.from),
+                        toLabel: await describeParty(w.to),
+                    });
+                }
+                for (const h of watchHits) {
+                    state.alerts++;
+                    const entry = watch.find(x => x.address === h.watched);
+                    publishEvent('chain-watch-hit', {
+                        ...h,
+                        blockNumber,
+                        label: entry?.label || chainShortAddr(h.watched),
+                        counterparty: await describeParty(h.direction === 'out' ? h.to : h.from),
+                        usd: price ? Math.round(parseFloat(h.amount.replace(/,/g, '')) * price) : null,
+                    });
+                }
+            } catch { /* one bad block must not kill the stream */ }
+        });
+
+        ws.on('close', () => {
+            if (chainStream === state && !app.isQuittingJarvis) {
+                console.warn(`Chain stream: disconnected (${chainKey}), reconnecting in 10s`);
+                setTimeout(connect, 10000);
+            }
+        });
+        ws.on('error', (e) => console.warn(`Chain stream error (${chainKey}): ${e.message}`));
+    };
+
+    chainStream = state;
+    connect();
+    return { success: true };
+}
+
+ipcMain.handle('chain-stream-start', async (event, { chain } = {}) => startChainStream(chain || 'ethereum'));
+ipcMain.handle('chain-stream-stop', async () => ({ success: true, wasRunning: stopChainStream() }));
+ipcMain.handle('chain-stream-status', async () => chainStream
+    ? { running: true, chain: chainStream.chain, blocks: chainStream.blocks, alerts: chainStream.alerts, connected: chainStream.ws?.readyState === 1 }
+    : { running: false });
+
+ipcMain.handle('chain-watchlist-add', async (event, { address, label, chains }) => {
+    if (!ADDR_RE.test(String(address || ''))) return { success: false, error: 'invalid address' };
+    const key = address.toLowerCase();
+    const list = await loadChainWatchlist();
+    const existing = list.find(w => w.address === key);
+    if (existing) {
+        if (label) existing.label = label;
+        if (chains) existing.chains = chains;
+    } else {
+        list.push({ address: key, label: label || chainShortAddr(key), chains: chains || ['ethereum'], added: Date.now() });
+    }
+    await saveChainWatchlist(list);
+    return { success: true, count: list.length };
+});
+ipcMain.handle('chain-watchlist-get', async () => loadChainWatchlist());
+ipcMain.handle('chain-watchlist-remove', async (event, { address }) => {
+    const key = String(address || '').toLowerCase();
+    const list = await loadChainWatchlist();
+    const next = list.filter(w => w.address !== key);
+    await saveChainWatchlist(next);
+    return { success: true, removed: list.length - next.length };
 });
 
 /* =========================

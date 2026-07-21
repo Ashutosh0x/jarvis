@@ -87,6 +87,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
     onchainToken: (opts) => ipcRenderer.invoke('onchain-token', opts),
     onchainCall: (opts) => ipcRenderer.invoke('onchain-call', opts),
     onchainTx: (opts) => ipcRenderer.invoke('onchain-tx', opts),
+    // Real-time chain stream + address watchlist (read-only, keyless)
+    chainStreamStart: (opts) => ipcRenderer.invoke('chain-stream-start', opts || {}),
+    chainStreamStop: () => ipcRenderer.invoke('chain-stream-stop'),
+    chainStreamStatus: () => ipcRenderer.invoke('chain-stream-status'),
+    chainWatchlistAdd: (opts) => ipcRenderer.invoke('chain-watchlist-add', opts),
+    chainWatchlistGet: () => ipcRenderer.invoke('chain-watchlist-get'),
+    chainWatchlistRemove: (opts) => ipcRenderer.invoke('chain-watchlist-remove', opts),
     fileOperation: (operation, ...args) => ipcRenderer.invoke('file-operation', operation, ...args),
     openWebsite: (url) => ipcRenderer.send('open-website', url),
     readClipboard: () => ipcRenderer.invoke('read-clipboard'),

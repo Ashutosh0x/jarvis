@@ -2082,6 +2082,30 @@ class Jarvis {
             return { kind: 'whois', address: addr, ensName, chain: 'ethereum' };
         }
 
+        // Cross-chain portfolio — "scan vitalik.eth across all chains",
+        // "portfolio of 0x…", "what does 0x… hold".
+        if ((addr || ensName) && /\b(portfolio|holdings|hold(s)? (on|across)|all chains|cross.?chain|every chain|scan)\b/i.test(text)) {
+            return { kind: 'portfolio', address: addr, ensName, chain: 'ethereum' };
+        }
+
+        // Watch / unwatch an address — checked BEFORE balance fallthrough so
+        // "watch 0x…" never reads as a balance query. "watch vitalik.eth",
+        // "stop watching 0x…", "monitor 0x… for activity".
+        if ((addr || ensName) && /\b(stop|remove|unwatch|don'?t watch|quit watching)\b/i.test(text)) {
+            return { kind: 'unwatch-address', address: addr, ensName, chain: 'ethereum' };
+        }
+        if ((addr || ensName) && /\b(watch|monitor|track|alert me|notify)\b/i.test(text)) {
+            return { kind: 'watch-address', address: addr, ensName, chain: 'ethereum' };
+        }
+
+        // Whale stream control — needs no address. "watch for whales",
+        // "monitor whale transfers", "stop whale alerts", "whale watch status".
+        if (/\b(whales?|large transfers?|big moves?)\b/i.test(text)) {
+            if (/\b(stop|off|disable|end|quit)\b/i.test(text)) return { kind: 'whale-stream', action: 'stop', chain: 'ethereum' };
+            if (/\b(status|running|active)\b/i.test(text)) return { kind: 'whale-stream', action: 'status', chain: 'ethereum' };
+            if (/\b(watch|monitor|alert|track|stream|start|on|live)\b/i.test(text)) return { kind: 'whale-stream', action: 'start', chain: 'ethereum' };
+        }
+
         // Gas needs no address, but must be unambiguously about a chain (a named
         // chain, "gwei", or "gas fee") so it never eats "gas prices at the pump".
         if (!addr && !ensName && /\bgas\b/i.test(text) &&
@@ -2155,6 +2179,10 @@ class Jarvis {
                 await this.handleWhois(intent);
                 return;
             }
+            if (intent.kind === 'whale-stream') {
+                await this.handleWhaleStream(intent.action);
+                return;
+            }
 
             // Resolve an ENS name to an address up front for reads that need one.
             if (!intent.address && intent.ensName) {
@@ -2195,10 +2223,125 @@ class Jarvis {
                 await this.handleClassify(intent.address, intent.chain, chainName, short);
                 return;
             }
+            if (intent.kind === 'portfolio') {
+                await this.handlePortfolio(intent.address, short);
+                return;
+            }
+            if (intent.kind === 'watch-address') {
+                await this.handleWatchAddress(intent.address, short);
+                return;
+            }
+            if (intent.kind === 'unwatch-address') {
+                const r = await window.electronAPI.chainWatchlistRemove({ address: intent.address });
+                this.speak(r?.removed ? `Understood. I have stopped watching ${short}.`
+                    : `${short} was not on the watch list.`);
+                return;
+            }
         } catch (e) {
             console.error('On-chain query error:', e);
             this.speak(`That on-chain read on ${chainName} failed.`);
         }
+    }
+
+    /* Cross-chain portfolio: every chain and every known token queried in
+       PARALLEL over the existing read-only IPC. Deterministic formatting via
+       onchain.js — nothing here is estimated or guessed, and chains that fail
+       are reported as unreadable rather than silently shown as zero. */
+    async handlePortfolio(address, short) {
+        this.displayText(`Scanning ${short} across ${Object.keys(onchain.CHAINS).length} chains...`, null);
+
+        const scanChain = async (chainKey) => {
+            const meta = onchain.CHAINS[chainKey];
+            const [bal, txc] = await Promise.all([
+                window.electronAPI.onchainBalance({ chain: chainKey, address }),
+                window.electronAPI.onchainTxCount({ chain: chainKey, address }),
+            ]);
+            if (!bal?.success) return { chainKey, failed: true };
+
+            const tokens = [];
+            const known = onchain.TOKENS[chainKey] || {};
+            const data = onchain.encodeBalanceOf(address);
+            await Promise.all(Object.entries(known).map(async ([sym, info]) => {
+                const r = await window.electronAPI.onchainToken({ chain: chainKey, token: info.address, data }).catch(() => null);
+                if (!r?.success) return;
+                const raw = onchain.hexToBigInt(r.raw);
+                if (raw > 0n) tokens.push({ sym, amount: onchain.groupThousands(onchain.formatUnits(raw, info.decimals, 2)) });
+            }));
+
+            return {
+                chainKey,
+                name: meta.name,
+                native: meta.native,
+                nativeAmount: onchain.formatEther(bal.wei, 4),
+                nativeWei: bal.wei,
+                txCount: txc?.success ? txc.count : null,
+                tokens: tokens.sort((a, b) => a.sym.localeCompare(b.sym)),
+            };
+        };
+
+        const results = await Promise.all(Object.keys(onchain.CHAINS).map(scanChain));
+        const readable = results.filter(r => !r.failed);
+        const failed = results.filter(r => r.failed);
+
+        const lines = [];
+        const spokenParts = [];
+        for (const r of readable) {
+            const hasNative = onchain.hexToBigInt(r.nativeWei) > 0n;
+            if (!hasNative && !r.tokens.length) continue;
+            const bits = [];
+            if (hasNative) bits.push(`${onchain.groupThousands(r.nativeAmount)} ${r.native}`);
+            for (const t of r.tokens) bits.push(`${t.amount} ${t.sym}`);
+            lines.push(`${r.name}: ${bits.join(', ')}${r.txCount != null ? ` (${onchain.groupThousands(String(r.txCount))} txs)` : ''}`);
+            spokenParts.push(`${bits.join(' and ')} on ${r.name}`);
+        }
+
+        if (!lines.length) {
+            this.speak(failed.length
+                ? `${short} shows no holdings on the chains I could read, Sir. ${failed.length} of ${results.length} chains were unreadable.`
+                : `${short} holds nothing I can see across all ${results.length} chains, Sir.`);
+            return;
+        }
+
+        const display = [`Cross-chain portfolio for ${short}:`, ...lines];
+        if (failed.length) display.push(`Unreadable: ${failed.map(f => f.chainKey).join(', ')}`);
+        this.displayText(display.join('\n'), null);
+
+        let spoken = `Cross-chain scan complete, Sir. ${short} holds ${spokenParts.slice(0, 3).join('; ')}.`;
+        if (spokenParts.length > 3) spoken += ` Plus holdings on ${spokenParts.length - 3} more chains, on screen now.`;
+        if (failed.length) spoken += ` ${failed.length} chains could not be read.`;
+        this.speak(spoken);
+    }
+
+    async handleWatchAddress(address, short) {
+        const r = await window.electronAPI.chainWatchlistAdd({ address, label: short !== onchain.shortAddress(address) ? short : null });
+        if (!r?.success) { this.speak(`I could not add ${short} to the watch list.`); return; }
+        // Watching implies wanting the stream: start it so the promise
+        // "I'll tell you when it moves" is actually kept.
+        const s = await window.electronAPI.chainStreamStart({});
+        this.speak(s?.success
+            ? `Understood, Sir. I am now watching ${short} on Ethereum and will announce any activity.`
+            : `${short} is on the watch list, but the live block stream failed to start — I will not see activity until it does.`);
+    }
+
+    async handleWhaleStream(action) {
+        if (action === 'stop') {
+            const r = await window.electronAPI.chainStreamStop();
+            this._whaleAlertsOn = false;
+            this.speak(r?.wasRunning ? 'Whale monitoring is off, Sir.' : 'The chain stream was not running.');
+            return;
+        }
+        if (action === 'status') {
+            const s = await window.electronAPI.chainStreamStatus();
+            this.speak(s?.running
+                ? `The chain stream is ${s.connected ? 'live' : 'reconnecting'} on ${s.chain}: ${s.blocks} blocks scanned, ${s.alerts} alerts so far.`
+                : 'The chain stream is not running, Sir.');
+            return;
+        }
+        const r = await window.electronAPI.chainStreamStart({});
+        this._whaleAlertsOn = true;
+        this.speak(r?.success
+            ? 'Whale monitoring is live, Sir. I will announce native transfers of one hundred ETH or more as blocks confirm on Ethereum.'
+            : 'I could not start the chain stream.');
     }
 
     // DETERMINISTIC ERC classification via ERC-165 supportsInterface + ERC-20
@@ -2964,6 +3107,34 @@ class Jarvis {
                     case 'active-window': {
                         // Silent context tracking — no announcements, just awareness.
                         this.activeWindow = evt.payload;
+                        break;
+                    }
+
+                    case 'whale-alert': {
+                        // Large native transfer seen in a confirmed block. Only
+                        // spoken while whale monitoring was explicitly asked for;
+                        // amounts are exact, USD is contextual, labels arrive
+                        // pre-attributed from main (user watchlist or Arkham) —
+                        // an unlabeled party is spoken as a shortened address,
+                        // never guessed.
+                        const w = evt.payload;
+                        const usd = w.usd ? `, approximately ${w.usd.toLocaleString('en-US')} dollars,` : '';
+                        const line = `${w.amount} ETH${usd} moved from ${w.fromLabel} to ${w.toLabel} in block ${w.blockNumber}.`;
+                        this.displayText(`Whale alert: ${line}`, null);
+                        if (this._whaleAlertsOn) this.speak(`Sir, significant movement on Ethereum. ${line}`);
+                        break;
+                    }
+
+                    case 'chain-watch-hit': {
+                        // Activity on an address the user asked to watch — always
+                        // announce; that was the whole point of watching it.
+                        const h = evt.payload;
+                        const verb = h.direction === 'out' ? 'sent' : 'received';
+                        const other = h.direction === 'out' ? 'to' : 'from';
+                        const usd = h.usd ? ` — roughly ${h.usd.toLocaleString('en-US')} dollars` : '';
+                        const line = `${h.label} just ${verb} ${h.amount} ETH ${other} ${h.counterparty} in block ${h.blockNumber}${usd}.`;
+                        this.displayText(`Watched address: ${line}`, null);
+                        this.speak(`Sir, your watched wallet has activity. ${line}`);
                         break;
                     }
 
