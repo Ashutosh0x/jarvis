@@ -3441,6 +3441,208 @@ function timeAgo(date) {
 }
 
 /* =========================
+   PREDICTION MARKETS (Polymarket + Kalshi) — READ ONLY
+
+   Both platforms serve market data publicly with no key, verified live before
+   this was written. Nothing here can place an order: there is no wallet, no
+   account, no signing, and no write endpoint is ever called.
+
+   ENDPOINTS CHOSEN BY PROBE, NOT BY DOCUMENTATION:
+     * Polymarket search is /public-search?q=. The commonly cited
+       /events?title= does NOT filter — searching "bitcoin" returned NBA and
+       NFL markets, which would have shipped as a broken search that looked
+       like it worked.
+     * Kalshi is external-api.kalshi.com. api.elections.kalshi.com does not
+       resolve from here, and trading-api returns 401 with a migration notice.
+     * Kalshi quotes in DOLLAR STRINGS on *_dollars fields ("0.0120" = 1.2%),
+       not integer cents. The renderer's parser owns that conversion.
+========================= */
+const POLY_GAMMA = 'https://gamma-api.polymarket.com';
+const POLY_CLOB = 'https://clob.polymarket.com';
+const KALSHI_BASE = 'https://external-api.kalshi.com/trade-api/v2';
+
+/* A short cache so a voice conversation ("what are the odds... and now?")
+   does not hammer either provider. Prices move on a scale of minutes; 45s is
+   the same window the chain portfolio uses. */
+const predictionCache = new Map();
+const PREDICTION_TTL = 45000;
+
+/* KALSHI SEARCH — via the series catalogue, not by scanning events.
+   Kalshi has no full-text search, and the obvious workaround does not work:
+   scanning open events returns an arbitrary slice (428 of the first 800 were
+   Elections) so "bitcoin", "inflation" and "temperature" all found NOTHING
+   while those markets plainly exist. There are 2400+ open events and more.
+   `category=` is worse than useless — it is silently IGNORED, returning World
+   and Elections rows for `category=Economics`, so it looks like it works.
+
+   What does work: /series is the real catalogue (12,083 entries, each with a
+   title and category), and `series_ticker=` genuinely filters events. So the
+   search matches series titles, then fetches live events for the best matches.
+   Verified: temperature -> Phoenix low-temp markets, recession -> NBER and IMF
+   recession markets, fed -> live FOMC-adjacent markets. */
+const KALSHI_CATALOGUE_TTL = 60 * 60 * 1000;   // a catalogue, not a price
+let kalshiCatalogue = { at: 0, series: [] };
+
+async function kalshiSeriesCatalogue() {
+    if (Date.now() - kalshiCatalogue.at < KALSHI_CATALOGUE_TTL && kalshiCatalogue.series.length) return kalshiCatalogue.series;
+    const series = [];
+    let cursor = '';
+    for (let page = 0; page < 15; page++) {
+        const url = `${KALSHI_BASE}/series?limit=1000${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`;
+        const res = await fetch(url, { headers: { 'User-Agent': 'Jarvis/1.0', Accept: 'application/json' }, signal: AbortSignal.timeout(20000) });
+        if (!res.ok) break;
+        const data = await res.json();
+        series.push(...(data?.series || []));
+        cursor = data?.cursor || '';
+        if (!cursor) break;
+    }
+    if (series.length) kalshiCatalogue = { at: Date.now(), series };
+    return kalshiCatalogue.series;
+}
+
+/** Whole-word title match over the catalogue, then live events per series. */
+async function kalshiSearchEvents(query, limit = 8) {
+    const catalogue = await kalshiSeriesCatalogue();
+    /* Whole words, every term. Substring matching returned "Pirates of the
+       Caribbean" for "fed rate" because "pirates" contains "rate" — confident
+       nonsense that looks exactly like a search result. */
+    const terms = String(query).toLowerCase().split(/\s+/).filter(w => w.length > 2)
+        .map(w => new RegExp(`\\b${w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'i'));
+    if (!terms.length) return { events: [], searched: catalogue.length, seriesMatched: 0 };
+
+    const hits = catalogue.filter(s => terms.every(re => re.test(String(s.title || '')) || re.test(String(s.ticker || ''))));
+    // Bounded fan-out: many matching series have no open events right now.
+    const events = [];
+    for (const s of hits.slice(0, 12)) {
+        if (events.length >= limit) break;
+        try {
+            const res = await fetch(
+                `${KALSHI_BASE}/events?status=open&limit=3&with_nested_markets=true&series_ticker=${encodeURIComponent(s.ticker)}`,
+                { headers: { 'User-Agent': 'Jarvis/1.0', Accept: 'application/json' }, signal: AbortSignal.timeout(10000) });
+            if (!res.ok) continue;
+            const data = await res.json();
+            for (const ev of data?.events || []) events.push({ ...ev, category: ev.category || s.category });
+        } catch { /* one dead series must not fail the search */ }
+    }
+    return { events: events.slice(0, limit), searched: catalogue.length, seriesMatched: hits.length };
+}
+
+async function predictionFetch(url, { timeoutMs = 12000, cacheKey = null } = {}) {
+    if (cacheKey) {
+        const hit = predictionCache.get(cacheKey);
+        if (hit && Date.now() - hit.at < PREDICTION_TTL) return hit.data;
+    }
+    const res = await fetch(url, {
+        headers: { 'User-Agent': 'Jarvis/1.0', 'Accept': 'application/json' },
+        signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!res.ok) throw new Error(`http ${res.status}`);
+    const data = await res.json();
+    if (cacheKey) {
+        predictionCache.set(cacheKey, { at: Date.now(), data });
+        // Bounded: this is a voice cache, not a database.
+        if (predictionCache.size > 64) predictionCache.delete(predictionCache.keys().next().value);
+    }
+    return data;
+}
+
+/** Search both platforms. Kalshi has no text search, so it is filtered here. */
+ipcMain.handle('prediction-search', async (event, { query, source = 'both', limit = 8 } = {}) => {
+    const q = String(query || '').trim().slice(0, 120);
+    if (!q) return { success: false, error: 'no query' };
+    const n = Math.min(Math.max(Number(limit) || 8, 1), 20);
+    const out = { success: true, query: q, polymarket: [], kalshi: [], errors: {} };
+
+    const wantPoly = source === 'both' || source === 'polymarket';
+    const wantKalshi = source === 'both' || source === 'kalshi';
+
+    await Promise.all([
+        wantPoly ? (async () => {
+            try {
+                const data = await predictionFetch(
+                    `${POLY_GAMMA}/public-search?q=${encodeURIComponent(q)}&limit_per_type=${n}`,
+                    { cacheKey: `poly:search:${q}:${n}` });
+                out.polymarket = (data?.events || []).slice(0, n);
+            } catch (e) { out.errors.polymarket = e.message; }
+        })() : null,
+        wantKalshi ? (async () => {
+            try {
+                const found = await kalshiSearchEvents(q, n);
+                out.kalshi = found.events;
+                out.kalshiSearched = found.searched;          // series titles examined
+                out.kalshiSeriesMatched = found.seriesMatched;
+            } catch (e) { out.errors.kalshi = e.message; }
+        })() : null,
+    ].filter(Boolean));
+
+    return out;
+});
+
+/** Most active markets by 24h volume. */
+ipcMain.handle('prediction-trending', async (event, { source = 'both', limit = 8 } = {}) => {
+    const n = Math.min(Math.max(Number(limit) || 8, 1), 20);
+    const out = { success: true, polymarket: [], kalshi: [], errors: {} };
+    await Promise.all([
+        (source === 'both' || source === 'polymarket') ? (async () => {
+            try {
+                out.polymarket = await predictionFetch(
+                    `${POLY_GAMMA}/events?limit=${n}&active=true&closed=false&order=volume24hr&ascending=false`,
+                    { cacheKey: `poly:trending:${n}` }) || [];
+            } catch (e) { out.errors.polymarket = e.message; }
+        })() : null,
+        (source === 'both' || source === 'kalshi') ? (async () => {
+            try {
+                /* Trending genuinely is a scan: there is no volume sort, so a
+                   page of open events is ranked locally on the volume the
+                   payload carries. Unlike search, a slice is acceptable here —
+                   "the most active of what I looked at" is still useful, and
+                   the count is returned so the caller can say so. */
+                const data = await predictionFetch(
+                    `${KALSHI_BASE}/events?status=open&limit=200&with_nested_markets=true`,
+                    { cacheKey: 'kalshi:trending-page', timeoutMs: 20000 });
+                out.kalshiScanned = (data?.events || []).length;
+                out.kalshi = (data?.events || [])
+                    .map(ev => ({ ev, vol: (ev.markets || []).reduce((s, m) => s + (Number(m.volume_24h_fp) || 0), 0) }))
+                    .sort((a, b) => b.vol - a.vol)
+                    .slice(0, n)
+                    .map(x => x.ev);
+                out.kalshiRankedLocally = true;
+            } catch (e) { out.errors.kalshi = e.message; }
+        })() : null,
+    ].filter(Boolean));
+    return out;
+});
+
+/** One market in detail, by Polymarket slug or Kalshi ticker. */
+ipcMain.handle('prediction-market', async (event, { id, source } = {}) => {
+    const key = String(id || '').trim().slice(0, 160);
+    if (!key) return { success: false, error: 'no market id' };
+    try {
+        if (source === 'kalshi') {
+            const data = await predictionFetch(`${KALSHI_BASE}/markets/${encodeURIComponent(key)}`, { cacheKey: `kalshi:m:${key}` });
+            return { success: true, source, market: data?.market || null };
+        }
+        const data = await predictionFetch(`${POLY_GAMMA}/events?slug=${encodeURIComponent(key)}`, { cacheKey: `poly:e:${key}` });
+        const ev = Array.isArray(data) ? data[0] : data;
+        return { success: true, source: 'polymarket', event: ev || null };
+    } catch (e) { return { success: false, error: e.message }; }
+});
+
+/** Live orderbook depth. */
+ipcMain.handle('prediction-orderbook', async (event, { id, source } = {}) => {
+    const key = String(id || '').trim().slice(0, 160);
+    if (!key) return { success: false, error: 'no id' };
+    try {
+        if (source === 'kalshi') {
+            const data = await predictionFetch(`${KALSHI_BASE}/markets/${encodeURIComponent(key)}/orderbook`);
+            return { success: true, source, book: data?.orderbook || null };
+        }
+        const data = await predictionFetch(`${POLY_CLOB}/book?token_id=${encodeURIComponent(key)}`);
+        return { success: true, source: 'polymarket', book: data || null };
+    } catch (e) { return { success: false, error: e.message }; }
+});
+
+/* =========================
    PHONE BRIDGE (Wi-Fi notification relay)
    Design follows the cross-device pattern from DevicesWorld (arXiv:2607.13465)
    and WISPA (arXiv:2606.23255): the phone is a lightweight event SOURCE,
@@ -4032,4 +4234,205 @@ ipcMain.handle('get-system-telemetry', () => {
         platform: os.platform(),
         activeWindow: lastActiveWindow
     };
+});
+
+/* =========================
+   PREDICTION MARKETS SERVICE (Polymarket + Kalshi, read-only)
+   Reads public market data from Polymarket (Gamma API + CLOB API) and
+   Kalshi (REST API). All endpoints are keyless and public.
+   AIR-GAP: this module only READS prediction market data. No bet placement,
+   no wallet interaction, no funds movement exists anywhere in this codebase.
+========================= */
+const PREDICTION_WATCHLIST_FILE = () => path.join(app.getPath('userData'), 'prediction-watchlist.json');
+const predictionAlertCooldowns = new Map(); // `${id}:${dir}` -> ts
+const PREDICTION_CACHE_TTL = PREDICTION_TTL;    // shared with the section above
+const PREDICTION_ALERT_COOLDOWN = 30 * 60_000; // 30 min
+
+/* --- Polymarket fetchers (Gamma API — public, no auth) ---
+   NOTE the search endpoint. `?title=` was here and DOES NOT FILTER: probed
+   live, searching "bitcoin" returned NBA and NFL markets. It fails silently —
+   results come back, they are simply the wrong ones — which is the worst shape
+   a bug can take in something the user reads as an answer. */
+async function polymarketSearch(query, limit = 10) {
+    const res = await fetch(
+        `${POLY_GAMMA}/public-search?q=${encodeURIComponent(query)}&limit_per_type=${limit}`,
+        { headers: { 'User-Agent': 'Jarvis/1.0' }, signal: AbortSignal.timeout(10000) }
+    );
+    if (!res.ok) throw new Error(`Polymarket search failed: ${res.status}`);
+    const data = await res.json();
+    return data?.events || [];
+}
+
+async function polymarketTrending(limit = 15) {
+    const res = await fetch(
+        `https://gamma-api.polymarket.com/events?limit=${limit}&active=true&order=volume24hr&ascending=false`,
+        { headers: { 'User-Agent': 'Jarvis/1.0' }, signal: AbortSignal.timeout(10000) }
+    );
+    if (!res.ok) throw new Error(`Polymarket trending failed: ${res.status}`);
+    return res.json();
+}
+
+async function polymarketMarket(slugOrId) {
+    const res = await fetch(
+        `https://gamma-api.polymarket.com/events?slug=${encodeURIComponent(slugOrId)}`,
+        { headers: { 'User-Agent': 'Jarvis/1.0' }, signal: AbortSignal.timeout(10000) }
+    );
+    if (!res.ok) throw new Error(`Polymarket market failed: ${res.status}`);
+    const events = await res.json();
+    return events[0] || null;
+}
+
+async function polymarketOrderbook(tokenId) {
+    const res = await fetch(
+        `https://clob.polymarket.com/book?token_id=${encodeURIComponent(tokenId)}`,
+        { signal: AbortSignal.timeout(8000) }
+    );
+    if (!res.ok) throw new Error(`Polymarket orderbook failed: ${res.status}`);
+    return res.json();
+}
+
+// --- Kalshi fetchers (REST API — public market data, no auth needed) ---
+/* Kalshi search goes through the series catalogue (see kalshiSearchEvents
+   above). The obvious approach — fetch a page of open events and filter the
+   titles — was here and is measurably broken: the first 800 open events are
+   428 Elections, so "bitcoin", "inflation" and "temperature" all returned
+   NOTHING while those markets plainly exist. Substring matching also paired
+   "fed rate" with "Pirates of the Caribbean". */
+async function kalshiSearch(query, limit = 10) {
+    const found = await kalshiSearchEvents(query, limit);
+    return found.events;
+}
+
+async function kalshiTrending(limit = 15) {
+    const res = await fetch(
+        `${KALSHI_BASE}/events?status=open&limit=${limit}&with_nested_markets=true`,
+        { headers: { 'User-Agent': 'Jarvis/1.0' }, signal: AbortSignal.timeout(10000) }
+    );
+    if (!res.ok) throw new Error(`Kalshi trending failed: ${res.status}`);
+    const data = await res.json();
+    return data.events || [];
+}
+
+async function kalshiMarket(ticker) {
+    const res = await fetch(
+        `${KALSHI_BASE}/markets/${encodeURIComponent(ticker)}`,
+        { headers: { 'User-Agent': 'Jarvis/1.0' }, signal: AbortSignal.timeout(8000) }
+    );
+    if (!res.ok) throw new Error(`Kalshi market failed: ${res.status}`);
+    return res.json();
+}
+
+async function kalshiOrderbook(ticker) {
+    const res = await fetch(
+        `${KALSHI_BASE}/markets/${encodeURIComponent(ticker)}/orderbook`,
+        { headers: { 'User-Agent': 'Jarvis/1.0' }, signal: AbortSignal.timeout(8000) }
+    );
+    if (!res.ok) throw new Error(`Kalshi orderbook failed: ${res.status}`);
+    return res.json();
+}
+
+// --- Caching layer ---
+function cachedOr(key, fn) {
+    const cached = predictionCache.get(key);
+    if (cached && Date.now() - cached.at < PREDICTION_CACHE_TTL) return Promise.resolve(cached.data);
+    return fn().then(data => { predictionCache.set(key, { data, at: Date.now() }); return data; });
+}
+
+// --- Watchlist persistence ---
+async function loadPredictionWatchlist() {
+    try {
+        const raw = await fs.readFile(PREDICTION_WATCHLIST_FILE(), 'utf-8');
+        return JSON.parse(raw);
+    } catch (e) {
+        if (e.code === 'ENOENT') return [];
+        console.error('Prediction watchlist corrupted:', e.message);
+        throw e; // do NOT silently overwrite (audit finding fix)
+    }
+}
+async function savePredictionWatchlist(list) {
+    const tmp = PREDICTION_WATCHLIST_FILE() + '.tmp';
+    await fs.writeFile(tmp, JSON.stringify(list, null, 2), 'utf-8');
+    await fs.rename(tmp, PREDICTION_WATCHLIST_FILE()); // atomic
+}
+
+/* --- IPC handlers ---
+   search / market / trending / orderbook are registered ONCE, in the section
+   above, against the probe-verified endpoints. Duplicates lived here and would
+   have thrown at registration ("second handler for 'prediction-search'"); they
+   also took positional arguments, which the preload no longer sends. The
+   watchlist handlers below are the part this section uniquely owns. */
+ipcMain.handle('prediction-watchlist-get', async () => {
+    try { return { success: true, watchlist: await loadPredictionWatchlist() }; }
+    catch (e) { return { success: false, error: e.message, watchlist: [] }; }
+});
+
+ipcMain.handle('prediction-watchlist-add', async (event, market) => {
+    try {
+        const list = await loadPredictionWatchlist();
+        const key = `${market.source}:${market.id}`;
+        if (list.some(m => `${m.source}:${m.id}` === key)) {
+            return { success: true, message: 'already watching' };
+        }
+        list.push({ ...market, addedAt: Date.now() });
+        await savePredictionWatchlist(list);
+        return { success: true };
+    } catch (e) { return { success: false, error: e.message }; }
+});
+
+ipcMain.handle('prediction-watchlist-remove', async (event, id) => {
+    try {
+        let list = await loadPredictionWatchlist();
+        list = list.filter(m => `${m.source}:${m.id}` !== id && m.id !== id);
+        await savePredictionWatchlist(list);
+        return { success: true };
+    } catch (e) { return { success: false, error: e.message }; }
+});
+
+// --- Background watchlist poller (60s, checks probability alerts) ---
+let predictionPollInterval = null;
+async function pollPredictionWatchlist() {
+    try {
+        const list = await loadPredictionWatchlist();
+        if (!list.length) return;
+        const now = Date.now();
+        for (const entry of list) {
+            try {
+                let currentProb = null;
+                if (entry.source === 'kalshi') {
+                    const data = await cachedOr(`kalshi-market:${entry.id}`, () => kalshiMarket(entry.id));
+                    const mkt = data?.market || data;
+                    currentProb = parseFloat(mkt?.last_price_dollars || mkt?.yes_bid_dollars || '0');
+                } else {
+                    const data = await cachedOr(`poly-market:${entry.id}`, () => polymarketMarket(entry.id));
+                    const mkt = data?.markets?.[0];
+                    if (mkt?.outcomePrices) {
+                        const prices = JSON.parse(mkt.outcomePrices);
+                        currentProb = parseFloat(prices[0]);
+                    }
+                }
+                if (currentProb === null) continue;
+                // Check thresholds
+                if (entry.alertAbove && currentProb >= entry.alertAbove / 100) {
+                    const coolKey = `${entry.id}:above`;
+                    if (!predictionAlertCooldowns.has(coolKey) || now - predictionAlertCooldowns.get(coolKey) > PREDICTION_ALERT_COOLDOWN) {
+                        predictionAlertCooldowns.set(coolKey, now);
+                        publishEvent('prediction-alert', { ...entry, currentProb, direction: 'above', threshold: entry.alertAbove });
+                    }
+                }
+                if (entry.alertBelow && currentProb <= entry.alertBelow / 100) {
+                    const coolKey = `${entry.id}:below`;
+                    if (!predictionAlertCooldowns.has(coolKey) || now - predictionAlertCooldowns.get(coolKey) > PREDICTION_ALERT_COOLDOWN) {
+                        predictionAlertCooldowns.set(coolKey, now);
+                        publishEvent('prediction-alert', { ...entry, currentProb, direction: 'below', threshold: entry.alertBelow });
+                    }
+                }
+            } catch (e) { console.warn(`Prediction poll error for ${entry.id}:`, e.message); }
+        }
+    } catch (e) { console.warn('Prediction watchlist poll error:', e.message); }
+}
+
+// Start polling once the app is ready
+app.whenReady().then(() => {
+    predictionPollInterval = setInterval(pollPredictionWatchlist, 60_000);
+    console.log('[prediction] watchlist poller started (60s interval)');
 });

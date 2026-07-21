@@ -83,6 +83,23 @@ routes('who is vitalik.eth', 'whois');
 routes('balance of 0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045', 'balance');
 routes('portfolio of vitalik.eth', 'portfolio');
 
+/* --- prediction markets --------------------------------------------------------
+   "What are the odds bitcoin hits 200k" must NOT become a spot-price query:
+   the market's probability and the coin's price are different answers to
+   different questions. */
+routes('what are the odds of a fed rate cut', 'prediction-search');
+routes('polymarket odds on the election', 'prediction-search');
+routes('kalshi markets for inflation', 'prediction-search');
+routes('show me trending prediction markets', 'prediction-trending');
+routes('what are the most active prediction markets', 'prediction-trending');
+routes('compare polymarket and kalshi on the fed decision', 'prediction-compare');
+routes('what are the chances of a recession', 'prediction-search');
+routes('prediction market for the world cup', 'prediction-search');
+// Must not be stolen by the prediction parser:
+routes('price of bitcoin', null);
+routes('gas on ethereum', 'gas');
+routes('balance of vitalik.eth', 'balance');
+
 /* --- provider capability + solana reads --------------------------------------- */
 routes('which chains can you read', 'chain-capabilities');
 routes('solana wallet vines1vzrYbzLMRdu58ou5XTby4qAqVRLmqo36NKPTg', 'solana-assets');

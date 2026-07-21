@@ -107,6 +107,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
     getNews: (opts) => ipcRenderer.invoke('get-news', opts),
     // Historical daily closes for the quant analytics engine
     getHistory: (opts) => ipcRenderer.invoke('get-history', opts),
+    // Prediction markets (Polymarket + Kalshi). Read-only: no order placement
+    // exists on either platform anywhere in this project.
+    predictionSearch: (opts) => ipcRenderer.invoke('prediction-search', opts),
+    predictionTrending: (opts) => ipcRenderer.invoke('prediction-trending', opts || {}),
+    predictionMarket: (opts) => ipcRenderer.invoke('prediction-market', opts),
+    predictionOrderbook: (opts) => ipcRenderer.invoke('prediction-orderbook', opts),
     // On-chain reads (keyless public RPC, read-only — no signing exists)
     onchainBalance: (opts) => ipcRenderer.invoke('onchain-balance', opts),
     onchainGas: (opts) => ipcRenderer.invoke('onchain-gas', opts),
@@ -140,6 +146,15 @@ contextBridge.exposeInMainWorld('electronAPI', {
     solanaActivity: (opts) => ipcRenderer.invoke('solana-activity', opts),
     solanaAssets: (opts) => ipcRenderer.invoke('solana-assets', opts),
     solanaCall: (opts) => ipcRenderer.invoke('solana-call', opts),
+    // Prediction markets (read-only, keyless public APIs — NO betting/trading exists)
+    predictionSearch: (query, source) => ipcRenderer.invoke('prediction-search', query, source),
+    predictionMarket: (id, source) => ipcRenderer.invoke('prediction-market', id, source),
+    predictionTrending: (source) => ipcRenderer.invoke('prediction-trending', source),
+    predictionOrderbook: (id, source) => ipcRenderer.invoke('prediction-orderbook', id, source),
+    predictionWatchlistGet: () => ipcRenderer.invoke('prediction-watchlist-get'),
+    predictionWatchlistAdd: (market) => ipcRenderer.invoke('prediction-watchlist-add', market),
+    predictionWatchlistRemove: (id) => ipcRenderer.invoke('prediction-watchlist-remove', id),
+    onPredictionAlert: createSafeListener('prediction-alert'),
     fileOperation: (operation, ...args) => ipcRenderer.invoke('file-operation', operation, ...args),
     openWebsite: (url) => ipcRenderer.send('open-website', url),
     readClipboard: () => ipcRenderer.invoke('read-clipboard'),

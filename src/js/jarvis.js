@@ -12,6 +12,7 @@ import * as quant from './services/quant.js';
 import * as onchain from './services/onchain.js';
 import * as ens from './services/ens.js';
 import * as chainIntel from './services/chainIntel.js';
+import * as prediction from './services/predictionMarkets.js';
 import { parseOndoQuery, ONDO_COUNT, HOT_LIST as ONDO_HOT_LIST } from './services/ondoRegistry.js';
 import * as netInspect from './services/netInspect.js';
 import * as netDiscovery from './services/netDiscovery.js';
@@ -2274,6 +2275,35 @@ class Jarvis {
     parseOnchainQuery(cmd) {
         const text = String(cmd || '');
 
+        /* PREDICTION MARKETS. Checked first among chain intents because "odds"
+           and "prediction market" are unambiguous, and because a question like
+           "what are the odds bitcoin hits 200k" would otherwise be read as a
+           crypto price query and answered with a spot price — a different
+           question with a different answer. */
+        // `markets?` — the third time a missing plural has sent a whole feature
+        // to the model instead of its handler ("whale alerts", "usdc burns").
+        if (/\b(prediction markets?|polymarket|kalshi)\b/i.test(text) ||
+            /\b(odds|chances?|probability|likelihood)\b.*\b(of|on|that|for)\b/i.test(text)) {
+            if (/\b(trending|most active|popular|what'?s hot|top market)/i.test(text)) {
+                return { kind: 'prediction-trending', chain: 'ethereum' };
+            }
+            if (/\b(compare|versus|vs\b|both platforms|difference between)/i.test(text)) {
+                return { kind: 'prediction-compare', query: text, chain: 'ethereum' };
+            }
+            // Everything left is a search: strip the scaffolding, keep the subject.
+            const q = text
+                .replace(/\b(hey )?jarvis\b/gi, '')
+                .replace(/\b(what (are|is) the|show me|find|search|get|tell me)\b/gi, '')
+                .replace(/\b(odds|chances?|probability|likelihood|prediction markets?|markets?)\b/gi, '')
+                .replace(/\b(on|of|for|that|about|in)\b/gi, ' ')
+                .replace(/\b(polymarket|kalshi)\b/gi, '')
+                .replace(/[?.!]+$/, '').replace(/\s+/g, ' ').trim();
+            const source = /\bpolymarket\b/i.test(text) ? 'polymarket'
+                : /\bkalshi\b/i.test(text) ? 'kalshi' : 'both';
+            if (q.length > 2) return { kind: 'prediction-search', query: q, source, chain: 'ethereum' };
+            return { kind: 'prediction-trending', chain: 'ethereum' };
+        }
+
         // Transaction decode — a 0x…(64 hex) hash. "explain/what happened in tx 0x…".
         const txMatch = text.match(/0x[0-9a-fA-F]{64}/);
         if (txMatch) return { kind: 'tx', hash: txMatch[0], chain: onchain.resolveChain(text, 'ethereum') };
@@ -2471,6 +2501,9 @@ class Jarvis {
             }
             // Keyed-provider reads. Checked before ENS resolution: a Solana
             // address is not an EVM address and has no ENS name to resolve.
+            if (intent.kind === 'prediction-search') { await this.handlePredictionSearch(intent.query, intent.source); return; }
+            if (intent.kind === 'prediction-trending') { await this.handlePredictionTrending(); return; }
+            if (intent.kind === 'prediction-compare') { await this.handlePredictionCompare(intent.query); return; }
             if (intent.kind === 'chain-capabilities') { await this.handleChainCapabilities(); return; }
             if (intent.kind === 'whale-unsupported') { await this.handleWhaleUnsupported(intent.askedChain); return; }
             if (intent.kind === 'whale-window') { await this.handleWhaleWindow(intent.text); return; }
@@ -3701,6 +3734,111 @@ class Jarvis {
         }
         this.displayText(lines.join('\n'), null);
         this.speak(chainIntel.describeSolanaActivity(items));
+    }
+
+    /* PREDICTION MARKETS. Read-only: nothing in this project can take a
+       position, and the answers say what each venue is quoting, never what to
+       do about it. Every probability comes from the tested parser, because a
+       number a user might act on is the last place to accept a model's guess. */
+    async handlePredictionSearch(query, source = 'both') {
+        if (!window.electronAPI?.predictionSearch) { this.speak('Prediction markets are not available here, Sir.'); return; }
+        this.displayText(`Searching prediction markets for "${query}"...`, null);
+        const r = await window.electronAPI.predictionSearch({ query, source, limit: 6 }).catch(() => null);
+        if (!r?.success) { this.speak(`I could not reach the prediction markets, Sir.`); return; }
+
+        const poly = (r.polymarket || []).map(prediction.parsePolymarketEvent).filter(e => e && !e.closed);
+        const kalshi = (r.kalshi || []).map(prediction.parseKalshiEvent).filter(Boolean);
+        const all = [...poly, ...kalshi].filter(m => m.probability !== null);
+
+        if (!all.length) {
+            const failed = Object.keys(r.errors || {});
+            if (failed.length) {
+                this.speak(`I could not reach ${failed.join(' or ')}, Sir, so I have nothing on "${query}".`);
+                return;
+            }
+            /* State the search that was actually performed. "I found nothing"
+               and "I searched 12,000 series titles and 3 matched but none have
+               an open market right now" are different claims, and the second is
+               the one that is true. */
+            const searched = Number.isFinite(r.kalshiSearched) ? r.kalshiSearched : null;
+            const matched = Number.isFinite(r.kalshiSeriesMatched) ? r.kalshiSeriesMatched : null;
+            let why = '';
+            if (searched && matched) {
+                why = ` On Kalshi I matched ${matched} market series out of ${searched.toLocaleString('en-US')}, but none has an open event trading right now.`;
+            } else if (searched) {
+                why = ` I searched ${searched.toLocaleString('en-US')} Kalshi series titles and nothing matched, so it may exist under different wording.`;
+            }
+            this.speak(`I found no open market matching "${query}", Sir.${why}`);
+            return;
+        }
+
+        // Loudest first: a market with volume is a market with an opinion.
+        all.sort((a, b) => (b.volume24hr ?? b.volume ?? 0) - (a.volume24hr ?? a.volume ?? 0));
+        const lines = all.slice(0, 8).map(m => {
+            const where = m.platform === 'kalshi' ? 'Kalshi' : 'Polymarket';
+            const prob = prediction.formatProb(m.probability);
+            const vol = prediction.formatVolume(m.volume24hr ?? m.volume);
+            const closes = prediction.timeUntil(m.closeTime || m.endDate);
+            return `${prob ? prob.padStart(4) : '  ? '}  ${m.title || m.question}  [${where}${vol !== '$0' ? `, ${vol}` : ''}${closes && closes !== 'ended' ? `, closes in ${closes}` : ''}]`;
+        });
+        this.displayText([`Prediction markets — "${query}"`, ...lines].join('\n'), null);
+        this.speak(prediction.describeMarket(all[0]) +
+            (all.length > 1 ? ` I found ${all.length - 1} other market${all.length - 1 === 1 ? '' : 's'}, on screen now.` : ''));
+    }
+
+    async handlePredictionTrending() {
+        if (!window.electronAPI?.predictionTrending) { this.speak('Prediction markets are not available here, Sir.'); return; }
+        this.displayText('Reading the most active prediction markets...', null);
+        const r = await window.electronAPI.predictionTrending({ source: 'both', limit: 6 }).catch(() => null);
+        if (!r?.success) { this.speak('I could not reach the prediction markets, Sir.'); return; }
+
+        const poly = (r.polymarket || []).map(prediction.parsePolymarketEvent).filter(Boolean);
+        const kalshi = (r.kalshi || []).map(prediction.parseKalshiEvent).filter(Boolean);
+        const all = [...poly, ...kalshi].sort((a, b) => (b.volume24hr ?? b.volume ?? 0) - (a.volume24hr ?? a.volume ?? 0));
+        if (!all.length) { this.speak('Neither platform returned an active market, Sir.'); return; }
+
+        const lines = all.slice(0, 10).map(m => {
+            const where = m.platform === 'kalshi' ? 'Kalshi' : 'Polymarket';
+            const prob = prediction.formatProb(m.probability);
+            return `${prob ? prob.padStart(4) : '  ? '}  ${m.title}  [${where}, ${prediction.formatVolume(m.volume24hr ?? m.volume)}]`;
+        });
+        this.displayText(['Most active prediction markets', ...lines].join('\n'), null);
+        this.speak(prediction.describeTrending(all, { limit: 3 }));
+    }
+
+    /* The same question on both venues. Titles are matched on token overlap and
+       anything below the threshold is reported as NOT matched — a forced pairing
+       would invent a spread between two different questions. */
+    async handlePredictionCompare(text) {
+        if (!window.electronAPI?.predictionSearch) { this.speak('Prediction markets are not available here, Sir.'); return; }
+        const query = String(text)
+            .replace(/\b(compare|versus|vs|between|on both platforms|polymarket|kalshi|odds|prediction markets?)\b/gi, '')
+            .replace(/[?.!]+$/, '').replace(/\s+/g, ' ').trim();
+        this.displayText(`Comparing venues on "${query}"...`, null);
+        const r = await window.electronAPI.predictionSearch({ query, source: 'both', limit: 10 }).catch(() => null);
+        if (!r?.success) { this.speak('I could not reach both platforms, Sir.'); return; }
+
+        const poly = (r.polymarket || []).map(prediction.parsePolymarketEvent).filter(e => e && e.probability !== null);
+        const kalshi = (r.kalshi || []).map(prediction.parseKalshiEvent).filter(e => e && e.probability !== null);
+        const pairs = prediction.matchMarkets(poly, kalshi);
+
+        if (!pairs.length) {
+            this.displayText([
+                `No matching pair for "${query}".`,
+                `Polymarket had ${poly.length} candidate${poly.length === 1 ? '' : 's'}, Kalshi ${kalshi.length}.`,
+                'Titles below the match threshold are left unpaired on purpose.',
+            ].join('\n'), null);
+            this.speak(`I could not confidently match that question across both venues, Sir. ` +
+                `Polymarket had ${poly.length} candidate${poly.length === 1 ? '' : 's'} and Kalshi ${kalshi.length}, but none matched closely enough to compare without guessing.`);
+            return;
+        }
+        const best = pairs[0];
+        this.displayText([
+            `Cross-venue comparison (title match ${Math.round(best.similarity * 100)}%)`,
+            `Polymarket: ${prediction.formatProb(best.polymarket.probability)}  ${best.polymarket.title}`,
+            `Kalshi:     ${prediction.formatProb(best.kalshi.probability)}  ${best.kalshi.title}`,
+        ].join('\n'), null);
+        this.speak(prediction.describeComparison(best.polymarket, best.kalshi));
     }
 
     /* What can honestly be said about an address, in descending order of
