@@ -9,6 +9,7 @@ import { routePhoneCommand, targetsPhone, executePhoneTool } from './services/ph
 import ragService from './services/ragService.js';
 import reflectionService from './services/reflectionService.js';
 import * as quant from './services/quant.js';
+import * as onchain from './services/onchain.js';
 import { LocalVoiceService } from './services/voiceService.js';
 import { config } from '../config.js';
 
@@ -1145,6 +1146,14 @@ class Jarvis {
             return { intent: 'WATCHLIST_SHOW' };
         }
 
+        // On-chain reads — "balance of 0x… on arbitrum", "gas on arbitrum",
+        // "USDC balance of 0x…", "how many transactions has 0x… made". Answered
+        // from live public RPC and formatted by the DETERMINISTIC onchain engine
+        // (BigInt/decimals) — never estimated by the model. Checked early because
+        // a 0x address (or a bare "gas on <chain>") is an unambiguous signal.
+        const chainQ = this.parseOnchainQuery(cmd);
+        if (chainQ) return { intent: 'CHAIN_QUERY', ...chainQ };
+
         // Quant analytics — "sharpe ratio of Apple", "volatility of Tesla",
         // "how risky is Nvidia", "max drawdown of Bitcoin", "beta of Tesla",
         // "analyze Apple". Computed by the DETERMINISTIC quant engine over real
@@ -1399,6 +1408,9 @@ class Jarvis {
                     break;
                 case 'QUANT_QUERY':
                     await this.handleQuantQuery(intent.metric, intent.entity);
+                    break;
+                case 'CHAIN_QUERY':
+                    await this.handleOnchainQuery(intent);
                     break;
                 case 'PRICE_QUERY':
                     await this.handlePriceQuery(intent.entity);
@@ -1880,7 +1892,7 @@ class Jarvis {
         };
         let m;
         // "<metric> of <entity>" / "<metric> for <entity>"
-        if ((m = cmd.match(/\b(sharpe( ratio)?|sortino( ratio)?|volatility|beta|alpha|max(imum)? drawdown|drawdown|annual(ized)? return|cagr)\s+(?:of|for)\s+(.+)/i))) {
+        if ((m = cmd.match(/\b(sharpe( ratio)?|sortino( ratio)?|volatility|beta|alpha|max(imum)? drawdown|drawdown|annual(ized)? return|cagr)\s+(?:of|for|on)\s+(.+)/i))) {
             const entity = clean(m[m.length - 1]);
             if (entity) return { metric: this._metricOf(m[1], METRIC), entity };
         }
@@ -1933,7 +1945,7 @@ class Jarvis {
         // are general headlines, not news about "the". Filler words are peeled
         // off the FRONT repeatedly until only a subject (or nothing) remains.
         if ((m = cmd.match(/^(.*?)\s+(?:news|headlines)\b/i))) {
-            const FILLER = /^(?:what's|whats|what|is|are|has|do|does|the|a|an|of|about|on|any|some|latest|recent|top|breaking|world|local|more|good|bad|great|big|tell|me|give|show|get|read|here's|heres|there|please|us|'s)\b/i;
+            const FILLER = /^(?:what's|whats|what|is|are|has|do|does|the|a|an|of|about|on|any|some|latest|recent|top|breaking|world|local|more|good|bad|great|big|tell|me|give|show|get|read|catch|up|today|todays|here's|heres|there|please|us|'s)\b/i;
             let head = clean(m[1]);
             let prev;
             do { prev = head; head = head.replace(FILLER, '').trim(); } while (head && head !== prev);
@@ -2040,6 +2052,186 @@ class Jarvis {
                 if (a.beta != null) spoken += ` Its beta to the market is ${num(a.beta)}.`;
         }
         this.speak(spoken);
+    }
+
+    // Parse an on-chain read into { kind, chain, address?, token? }, or null.
+    //   kind: 'gas' | 'balance' | 'token' | 'txcount'
+    // A 0x address is the primary trigger; "gas on <chain>" needs no address.
+    parseOnchainQuery(cmd) {
+        const text = String(cmd || '');
+
+        // Transaction decode — a 0x…(64 hex) hash. "explain/what happened in tx 0x…".
+        const txMatch = text.match(/0x[0-9a-fA-F]{64}/);
+        if (txMatch) return { kind: 'tx', hash: txMatch[0], chain: onchain.resolveChain(text, 'ethereum') };
+
+        const addr = onchain.extractAddress(text);
+
+        // Gas needs no address, but must be unambiguously about a chain (a named
+        // chain, "gwei", or "gas fee") so it never eats "gas prices at the pump".
+        if (!addr && /\bgas\b/i.test(text) &&
+            (/\b(arbitrum|arb|ethereum|eth|mainnet|base|optimism|\bop\b|polygon|matic|chain|network|l1|l2|gwei)\b/i.test(text) || /\bgas fees?\b/i.test(text))) {
+            return { kind: 'gas', chain: onchain.resolveChain(text, 'ethereum') };
+        }
+        if (!addr) return null; // every other on-chain read needs an address
+
+        const chain = onchain.resolveChain(text, 'ethereum');
+        // Contract classification — "what kind of token is 0x…", "is 0x… an NFT /
+        // ERC-721", "what standard does 0x… implement". Deterministic (ERC-165).
+        if (/\b(what (kind|type|standard)|which standard|classify|is (it|this|that)?\s*an?\s*(erc|nft|token)|is 0x[0-9a-fA-F]{40} an?|erc-?165|nft contract|token standard)\b/i.test(text)) {
+            return { kind: 'classify', address: addr, chain };
+        }
+        if (/\b(how many (transactions|txs?|transfers)|transaction count|number of transactions|nonce)\b/i.test(text)) {
+            return { kind: 'txcount', address: addr, chain };
+        }
+        const token = onchain.resolveToken(text, chain);
+        if (token) return { kind: 'token', address: addr, chain, token };
+        return { kind: 'balance', address: addr, chain };
+    }
+
+    async handleOnchainQuery(intent) {
+        if (!window.electronAPI?.onchainGas) {
+            this.speak('On-chain reads are not available in this environment.');
+            return;
+        }
+        const meta = onchain.CHAINS[intent.chain];
+        const chainName = meta?.name || intent.chain;
+        try {
+            if (intent.kind === 'gas') {
+                this.displayText(`Reading gas on ${chainName}...`, null);
+                const r = await window.electronAPI.onchainGas({ chain: intent.chain });
+                if (!r.success) { this.speak(`I could not read the gas price on ${chainName}.`); return; }
+                const line = `Gas on ${chainName} is ${onchain.formatGwei(r.wei)} gwei.`;
+                this.displayText(line, null); this.speak(line); return;
+            }
+            if (intent.kind === 'tx') {
+                await this.handleTx(intent.hash, intent.chain, chainName);
+                return;
+            }
+
+            const short = onchain.shortAddress(intent.address);
+            if (intent.kind === 'balance') {
+                this.displayText(`Reading ${short} on ${chainName}...`, null);
+                const r = await window.electronAPI.onchainBalance({ chain: intent.chain, address: intent.address });
+                if (!r.success) { this.speak(`I could not read that address on ${chainName}.`); return; }
+                const eth = onchain.groupThousands(onchain.formatEther(r.wei, 6));
+                const line = `${short} holds ${eth} ${meta?.native || 'ETH'} on ${chainName}.`;
+                this.displayText(line, null); this.speak(line); return;
+            }
+            if (intent.kind === 'token') {
+                const { token } = intent;
+                this.displayText(`Reading ${token.symbol} balance of ${short} on ${chainName}...`, null);
+                const data = onchain.encodeBalanceOf(intent.address);
+                const r = await window.electronAPI.onchainToken({ chain: intent.chain, token: token.address, data });
+                if (!r.success) { this.speak(`I could not read the ${token.symbol} balance on ${chainName}.`); return; }
+                const amt = onchain.groupThousands(onchain.formatUnits(onchain.hexToBigInt(r.raw), token.decimals, 4));
+                const line = `${short} holds ${amt} ${token.symbol} on ${chainName}.`;
+                this.displayText(line, null); this.speak(line); return;
+            }
+            if (intent.kind === 'txcount') {
+                this.displayText(`Reading transaction count of ${short}...`, null);
+                const r = await window.electronAPI.onchainTxCount({ chain: intent.chain, address: intent.address });
+                if (!r.success) { this.speak(`I could not read the transaction count on ${chainName}.`); return; }
+                const line = `${short} has made ${onchain.groupThousands(String(r.count))} transactions on ${chainName}.`;
+                this.displayText(line, null); this.speak(line); return;
+            }
+            if (intent.kind === 'classify') {
+                await this.handleClassify(intent.address, intent.chain, chainName, short);
+                return;
+            }
+        } catch (e) {
+            console.error('On-chain query error:', e);
+            this.speak(`That on-chain read on ${chainName} failed.`);
+        }
+    }
+
+    // DETERMINISTIC ERC classification via ERC-165 supportsInterface + ERC-20
+    // metadata probing (inspired by SymGPT's sound interface-conformance subset).
+    // No LLM, no vulnerability claims — it reports which token standard a
+    // contract implements, nothing about whether it is safe.
+    async handleClassify(address, chain, chainName, short) {
+        if (!window.electronAPI?.onchainCall) { this.speak('Contract introspection is not available here.'); return; }
+        this.displayText(`Inspecting ${short} on ${chainName}...`, null);
+        const call = async (data) => {
+            const r = await window.electronAPI.onchainCall({ chain, to: address, data }).catch(() => null);
+            return r && r.success ? r.raw : null;
+        };
+        const supports = async (id) => {
+            const raw = await call(onchain.encodeSupportsInterface(id));
+            return raw != null && onchain.decodeBool(raw);
+        };
+
+        // ERC-165 NFT interfaces first (definitive), then ERC-20 metadata probe.
+        const [is721, is1155] = await Promise.all([
+            supports(onchain.INTERFACE_IDS.erc721),
+            supports(onchain.INTERFACE_IDS.erc1155),
+        ]);
+        let is721Meta = false, is1155Meta = false, decimalsRaw = null, symbol = null;
+        if (is721) is721Meta = await supports(onchain.INTERFACE_IDS.erc721Metadata);
+        else if (is1155) is1155Meta = await supports(onchain.INTERFACE_IDS.erc1155MetadataURI);
+        else decimalsRaw = await call(onchain.SELECTORS.decimals); // ERC-20 tell
+        const symRaw = await call(onchain.SELECTORS.symbol);
+        if (symRaw) symbol = onchain.decodeAbiString(symRaw) || null;
+
+        const v = onchain.classifyContract({ is721, is1155, is721Meta, is1155Meta, decimalsRaw, symbol });
+        const sym = v.symbol ? ` Symbol: ${v.symbol}.` : '';
+        const line = v.standard
+            ? `${short} on ${chainName} implements ${v.detail}.${sym}`
+            : `${short} on ${chainName} — ${v.detail}.${sym}`;
+        this.displayText(line, null); this.speak(line);
+    }
+
+    // DETERMINISTIC transaction decode: what token transfers actually happened in
+    // one tx. Amounts come straight from the receipt logs (BigInt), never the LLM.
+    // Honest scope: this one transaction only — no provenance, no entity labels.
+    async handleTx(hash, chain, chainName) {
+        if (!window.electronAPI?.onchainTx) { this.speak('Transaction decoding is not available here.'); return; }
+        const shortHash = `${hash.slice(0, 10)}…${hash.slice(-6)}`;
+        this.displayText(`Decoding ${shortHash} on ${chainName}...`, null);
+        const r = await window.electronAPI.onchainTx({ chain, hash }).catch(() => null);
+        if (!r || !r.success) { this.speak(`I could not decode that transaction on ${chainName}${r?.error ? ` (${r.error})` : ''}.`); return; }
+
+        const status = r.receipt.status === '0x1' ? 'succeeded' : (r.receipt.status === '0x0' ? 'FAILED' : 'unknown');
+        const transfers = (r.receipt.logs || []).map(onchain.decodeTransferLog).filter(Boolean);
+
+        // Resolve decimals/symbol per unique token: known map first, else on-chain.
+        const tokenInfo = new Map();
+        for (const t of transfers) {
+            if (t.isNft || tokenInfo.has(t.token)) continue;
+            const known = onchain.resolveTokenByAddress(chain, t.token);
+            if (known) { tokenInfo.set(t.token, known); continue; }
+            const decRaw = await window.electronAPI.onchainCall({ chain, to: t.token, data: onchain.SELECTORS.decimals }).catch(() => null);
+            const symRaw = await window.electronAPI.onchainCall({ chain, to: t.token, data: onchain.SELECTORS.symbol }).catch(() => null);
+            tokenInfo.set(t.token, {
+                decimals: decRaw?.success ? Number(onchain.hexToBigInt(decRaw.raw)) : 18,
+                symbol: symRaw?.success ? (onchain.decodeAbiString(symRaw.raw) || 'tokens') : 'tokens',
+            });
+        }
+
+        const fmt = (t) => {
+            if (t.isNft) return `NFT #${t.amount} (${onchain.shortAddress(t.token)})`;
+            const info = tokenInfo.get(t.token) || { decimals: 18, symbol: 'tokens' };
+            return `${onchain.groupThousands(onchain.formatUnits(t.amount, info.decimals, 4))} ${info.symbol}`;
+        };
+
+        const lines = [`Tx ${shortHash} on ${chainName} ${status}.`];
+        const nativeWei = r.tx?.value ? onchain.hexToBigInt(r.tx.value) : 0n;
+        if (nativeWei > 0n) lines.push(`Native: ${onchain.formatEther(nativeWei, 6)} ${onchain.CHAINS[chain]?.native || 'ETH'} from ${onchain.shortAddress(r.tx.from)} to ${onchain.shortAddress(r.tx.to)}.`);
+        if (transfers.length) {
+            lines.push(`${transfers.length} token transfer${transfers.length === 1 ? '' : 's'}:`);
+            for (const t of transfers.slice(0, 6)) {
+                lines.push(`  ${fmt(t)}: ${onchain.shortAddress(t.from)} → ${onchain.shortAddress(t.to)}`);
+            }
+            if (transfers.length > 6) lines.push(`  …and ${transfers.length - 6} more.`);
+        } else if (nativeWei === 0n) {
+            lines.push('No token or native-value transfers (likely a contract call).');
+        }
+
+        this.displayText(lines.join('\n'), null);
+        // Spoken: concise headline (the full breakdown is on screen).
+        const headline = transfers.length
+            ? `Transaction ${status}. ${fmt(transfers[0])} from ${onchain.shortAddress(transfers[0].from)} to ${onchain.shortAddress(transfers[0].to)}${transfers.length > 1 ? `, plus ${transfers.length - 1} more transfer${transfers.length - 1 === 1 ? '' : 's'}` : ''}.`
+            : (nativeWei > 0n ? `Transaction ${status}: ${onchain.formatEther(nativeWei, 4)} ${onchain.CHAINS[chain]?.native || 'ETH'} transferred.` : `Transaction ${status}, with no token transfers.`);
+        this.speak(headline);
     }
 
     async handleNewsQuery(topic) {

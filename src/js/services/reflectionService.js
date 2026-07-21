@@ -1,6 +1,15 @@
 import ragService from './ragService.js';
-import factStore, { factsMatch } from './factStore.js';
+import factStore, { factsMatch, evidenceStats } from './factStore.js';
 import { distillFacts } from '../toolService.js';
+
+/** Human phrasing of a belief's provenance ("3 confirmations: 2 voice, 1 text,
+ *  last on <date>") for explainable memory and spoken summaries. */
+function provenance(fact) {
+    const s = evidenceStats(fact);
+    const bits = Object.entries(s.bySource).map(([src, n]) => `${n} ${src}`);
+    const last = s.lastTs ? new Date(s.lastTs).toLocaleDateString() : 'unknown';
+    return `${s.count} confirmation${s.count === 1 ? '' : 's'}${bits.length ? ` (${bits.join(', ')})` : ''}, last ${last}`;
+}
 
 // Two RAG facts are "the same" if their token sets overlap enough — used to
 // evict a demoted fact from the RAG regardless of exact phrasing.
@@ -118,16 +127,19 @@ class ReflectionService {
                 const { facts } = await distillFacts(toTranscript(useful));
                 const { promoted, demoted } = factStore.observe(facts, { source });
 
-                // Promote corroborated WINNING candidates into semantic memory.
+                // Promote corroborated WINNING candidates into semantic memory,
+                // and record each change in the audit log (version history).
                 for (const f of promoted) {
                     const r = await ragService.ingest(f.statement, { source: 'reflection' });
                     f.inRag = true;
                     if (r && r.stored > 0) learned.push(f.statement);
+                    this._audit('promote', f);
                 }
                 // Evict demoted/archived facts (incl. revised-away values) from RAG.
                 for (const f of demoted) {
                     await ragService.forget((c) => c.source === 'reflection' && sameFact(c.text, f.statement));
                     f.inRag = false;
+                    this._audit(f.status === 'archived' ? 'archive' : 'revise', f);
                 }
                 await factStore.save();
                 provisional = factStore.stats().provisional;
@@ -175,6 +187,22 @@ class ReflectionService {
         }
     }
 
+    /** Append a belief change to the memory audit log (version history). */
+    _audit(action, fact) {
+        try {
+            const s = evidenceStats(fact);
+            window.electronAPI?.logMemoryEvent?.({
+                action, // promote | revise | archive
+                attribute: fact.attribute,
+                value: fact.value,
+                statement: fact.statement,
+                confidence: +fact.confidence.toFixed(3),
+                confirmations: s.count,
+                sources: s.bySource,
+            });
+        } catch { /* audit is best-effort */ }
+    }
+
     /**
      * Sleep-like auto-consolidation: run at most once per DAY, only when there
      * is genuinely new experience. Called at startup so knowledge compounds
@@ -204,10 +232,11 @@ class ReflectionService {
             await factStore.load();
             const durable = factStore.durableFacts();
             if (durable.length) {
-                // Highest-confidence first — the things Jarvis is surest of.
+                // Highest-confidence first, WITH provenance — the things Jarvis is
+                // surest of, and why it believes them.
                 const top = durable.sort((a, b) => b.confidence - a.confidence).slice(0, 4)
-                    .map((f) => `${f.statement} (${Math.round(f.confidence * 100)}% sure)`);
-                return `Here is what I am most confident I have learned about you: ${top.join('; ')}.`;
+                    .map((f) => `${f.statement} — ${Math.round(f.confidence * 100)}% sure, from ${provenance(f)}`);
+                return `Here is what I am most confident I have learned about you: ${top.join('. ')}.`;
             }
             const s = factStore.stats();
             if (s.provisional > 0) {

@@ -88,6 +88,7 @@ function noisyOr(p, delta) {
 }
 
 const MATCH_THRESHOLD = 0.7;   // overlap to count as the SAME value
+const EVIDENCE_CAP = 12;       // keep the most recent N observations backing a belief
 const COMPETE_DECAY = 0.7;     // a competing observation erodes rival candidates ×0.7
 const DECAY_STEP = 0.10;       // per pass a fact goes unconfirmed (after grace)
 const DECAY_GRACE_DAYS = 2;
@@ -150,6 +151,11 @@ class FactStore {
                 same.timesObserved++;
                 same.lastConfirmed = now;
                 same.source = same.source || source;
+                // PROVENANCE: record which observation backed this belief so it
+                // can be explained ("confirmed 3x via voice, last on <date>") and
+                // audited. Capped to the most recent N to bound storage.
+                (same.evidence = same.evidence || []).push({ source, ts: now, delta });
+                if (same.evidence.length > EVIDENCE_CAP) same.evidence = same.evidence.slice(-EVIDENCE_CAP);
                 if (statement.length > same.statement.length) same.statement = statement;
                 if (same.status === 'archived') same.status = 'provisional';
                 touched.add(same.id);
@@ -167,6 +173,7 @@ class FactStore {
                     confidence: delta, timesObserved: 1,
                     firstSeen: now, lastConfirmed: now,
                     status: 'provisional', source, inRag: false,
+                    evidence: [{ source, ts: now, delta }],
                 };
                 this.facts.push(f);
                 touched.add(f.id);
@@ -245,6 +252,20 @@ class FactStore {
         s.attributes = s.attributes.size;
         return s;
     }
+}
+
+/** Provenance summary for a belief: how many times it was confirmed, by which
+ *  sources, and when last. Powers explainable memory ("I believe this because
+ *  you told me 3 times by voice, last on <date>") and the audit trail. */
+export function evidenceStats(fact) {
+    const ev = fact.evidence || [];
+    const bySource = {};
+    let lastTs = 0;
+    for (const e of ev) {
+        bySource[e.source] = (bySource[e.source] || 0) + 1;
+        if (e.ts > lastTs) lastTs = e.ts;
+    }
+    return { count: fact.timesObserved || ev.length, bySource, lastTs, firstSeen: fact.firstSeen || 0 };
 }
 
 const factStore = new FactStore();

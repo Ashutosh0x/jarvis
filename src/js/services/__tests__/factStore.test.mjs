@@ -1,7 +1,7 @@
 // Behavioral tests for the belief store, driving the REAL FactStore.observe()
 // (class exported; observe is pure). Documents the named behaviors the belief
 // model must exhibit. Complements factStore.fuzz.mjs (invariants under load).
-import { FactStore, noisyOr, evidence, normAttr, factsMatch } from '../factStore.js';
+import { FactStore, noisyOr, evidence, normAttr, factsMatch, evidenceStats } from '../factStore.js';
 
 let pass = 0, fail = 0;
 const approx = (a, b, t = 1e-6) => Math.abs(a - b) <= t;
@@ -62,6 +62,31 @@ check('short value matches longer phrasing', factsMatch('Chrome', 'Google Chrome
     check('revision: Firefox is now the durable winner', firefox.inRag && firefox.status === 'durable');
     check('revision: Chrome evicted from durable memory', !chrome.inRag);
     check('revision: at most one durable value for the attribute', s.durableFacts().filter((f) => f.attribute === firefox.attribute).length === 1);
+}
+
+// --- behavior 5: evidence/provenance is recorded and bounded ---
+{
+    const s = store();
+    let now = Date.now();
+    // 3 voice + 1 text confirmations of the same fact
+    apply(s.observe([{ attribute: 'os', value: 'Linux', statement: 'uses Linux', prob: 0.9 }], { source: 'voice', now }));
+    apply(s.observe([{ attribute: 'os', value: 'Linux', statement: 'uses Linux', prob: 0.9 }], { source: 'voice', now: now + DAY }));
+    apply(s.observe([{ attribute: 'os', value: 'Linux', statement: 'uses Linux', prob: 0.9 }], { source: 'text', now: now + 2 * DAY }));
+    const f = s.facts.find((x) => /linux/i.test(x.value));
+    const st = evidenceStats(f);
+    check('evidence: count matches observations', st.count === 3);
+    check('evidence: sources tracked (voice+text)', st.bySource.voice === 2 && st.bySource.text === 1);
+    check('evidence: lastTs is the most recent', st.lastTs === now + 2 * DAY);
+    check('evidence: array stored on the fact', Array.isArray(f.evidence) && f.evidence.length === 3);
+}
+// --- behavior 6: evidence array is capped (bounded storage) ---
+{
+    const s = store();
+    let now = Date.now();
+    for (let i = 0; i < 30; i++) { now += 3600000; apply(s.observe([{ attribute: 'editor', value: 'Vim', statement: 'uses Vim', prob: 0.9 }], { source: 'voice', now })); }
+    const f = s.facts.find((x) => /vim/i.test(x.value));
+    check('evidence: capped at 12 entries', f.evidence.length <= 12);
+    check('evidence: timesObserved still counts all', f.timesObserved === 30);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

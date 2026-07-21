@@ -38,6 +38,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
     // Confidence ledger for consolidated facts (corroboration gate + decay)
     loadFactStore: () => ipcRenderer.invoke('load-fact-store'),
     saveFactStore: (data) => ipcRenderer.invoke('save-fact-store', data),
+    // Memory audit log — version history of belief changes
+    logMemoryEvent: (entry) => ipcRenderer.invoke('log-memory-event', entry),
+    getMemoryAudit: (opts) => ipcRenderer.invoke('get-memory-audit', opts),
     // Phone bridge (Wi-Fi notification relay)
     onPhoneNotification: createSafeListener('phone-notification'),
     getPhoneBridgeInfo: () => ipcRenderer.invoke('get-phone-bridge-info'),
@@ -77,6 +80,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
     getNews: (opts) => ipcRenderer.invoke('get-news', opts),
     // Historical daily closes for the quant analytics engine
     getHistory: (opts) => ipcRenderer.invoke('get-history', opts),
+    // On-chain reads (keyless public RPC, read-only — no signing exists)
+    onchainBalance: (opts) => ipcRenderer.invoke('onchain-balance', opts),
+    onchainGas: (opts) => ipcRenderer.invoke('onchain-gas', opts),
+    onchainTxCount: (opts) => ipcRenderer.invoke('onchain-txcount', opts),
+    onchainToken: (opts) => ipcRenderer.invoke('onchain-token', opts),
+    onchainCall: (opts) => ipcRenderer.invoke('onchain-call', opts),
+    onchainTx: (opts) => ipcRenderer.invoke('onchain-tx', opts),
     fileOperation: (operation, ...args) => ipcRenderer.invoke('file-operation', operation, ...args),
     openWebsite: (url) => ipcRenderer.send('open-website', url),
     readClipboard: () => ipcRenderer.invoke('read-clipboard'),

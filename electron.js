@@ -877,6 +877,43 @@ ipcMain.handle('save-reflection', async (event, entry) => {
 // and archived facts must never be retrievable, only durable ones live in RAG.
 const FACT_STORE_FILE = () => path.join(app.getPath('userData'), 'fact-store.json');
 
+// Memory audit log — an append-only version history of every belief change
+// (promote / revise / archive), with attribution (what, which value, resulting
+// confidence, when). This is the "version history" of the Dreaming design: it
+// makes the memory's evolution inspectable and reversible in review, rather than
+// a silent black box.
+const MEMORY_AUDIT_FILE = () => path.join(app.getPath('userData'), 'memory-audit.jsonl');
+const MEMORY_AUDIT_MAX = 2 * 1024 * 1024;
+
+ipcMain.handle('log-memory-event', async (event, entry) => {
+    try {
+        try {
+            const st = await fs.stat(MEMORY_AUDIT_FILE());
+            if (st.size > MEMORY_AUDIT_MAX) await fs.rename(MEMORY_AUDIT_FILE(), MEMORY_AUDIT_FILE() + '.1');
+        } catch { /* first write */ }
+        await fs.appendFile(MEMORY_AUDIT_FILE(), JSON.stringify({ ts: Date.now(), ...entry }) + '\n', 'utf-8');
+        return { success: true };
+    } catch (error) {
+        console.warn('Memory audit log error:', error.message);
+        return { success: false };
+    }
+});
+
+ipcMain.handle('get-memory-audit', async (event, opts) => {
+    try {
+        const limit = Math.min(Math.max(Number(opts?.limit) || 20, 1), 200);
+        let lines = [];
+        try { lines = (await fs.readFile(MEMORY_AUDIT_FILE(), 'utf-8')).trim().split('\n'); }
+        catch { return { success: true, events: [] }; }
+        const events = lines.filter(Boolean)
+            .map((l) => { try { return JSON.parse(l); } catch { return null; } })
+            .filter(Boolean);
+        return { success: true, events: events.slice(-limit) };
+    } catch (error) {
+        return { success: false, error: error.message, events: [] };
+    }
+});
+
 ipcMain.handle('load-fact-store', async () => {
     try { return JSON.parse(await fs.readFile(FACT_STORE_FILE(), 'utf-8')); }
     catch { return { facts: [] }; }
@@ -1283,37 +1320,217 @@ function decodeEntities(s) {
         .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/<[^>]+>/g, '');
 }
 
-ipcMain.handle('web-search', async (event, query) => {
-    try {
-        const q = encodeURIComponent(String(query).slice(0, 200));
-        const res = await fetch(`https://html.duckduckgo.com/html/?q=${q}`, {
-            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
-            signal: AbortSignal.timeout(12000)
-        });
-        if (!res.ok) throw new Error(`ddg ${res.status}`);
-        const html = await res.text();
+// Keyless web search with a FAILOVER CHAIN. No single free endpoint is
+// reliable: the DuckDuckGo HTML scrape gives the richest results (real titles +
+// snippets) but, once an IP is flagged, returns an HTTP 202 CAPTCHA interstitial
+// ("select all squares containing a duck") instead of results — which silently
+// broke search. When that happens we fall through to DuckDuckGo's official
+// Instant Answer JSON API and then Wikipedia's REST API; both are proper APIs
+// that are not bot-blocked, so factual questions still get grounded answers.
 
-        const results = [];
-        const titleRe = /class="result__a"[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/g;
-        const snippetRe = /class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
-        const titles = [...html.matchAll(titleRe)];
-        const snippets = [...html.matchAll(snippetRe)];
-
-        for (let i = 0; i < Math.min(titles.length, 5); i++) {
-            // DDG wraps URLs in a redirect: extract the real target from uddg=
-            let url = titles[i][1];
-            const uddg = url.match(/uddg=([^&]+)/);
-            if (uddg) { try { url = decodeURIComponent(uddg[1]); } catch { /* keep raw */ } }
-            results.push({
-                title: decodeEntities(titles[i][2]).trim(),
-                snippet: decodeEntities(snippets[i]?.[1] || '').trim().slice(0, 300),
-                url
-            });
-        }
-        return { success: true, results };
-    } catch (error) {
-        return { success: false, error: error.message, results: [] };
+async function ddgHtmlSearch(query) {
+    const q = encodeURIComponent(String(query).slice(0, 200));
+    const res = await fetch(`https://html.duckduckgo.com/html/?q=${q}`, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
+        signal: AbortSignal.timeout(12000)
+    });
+    // 202 (or any non-200) is the anomaly/CAPTCHA page, not results — fail over.
+    if (res.status !== 200) throw new Error(`ddg http ${res.status}`);
+    const html = await res.text();
+    if (/bots use DuckDuckGo|complete the following challenge/i.test(html)) {
+        throw new Error('ddg captcha');
     }
+    const results = [];
+    const titleRe = /class="result__a"[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/g;
+    const snippetRe = /class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
+    const titles = [...html.matchAll(titleRe)];
+    const snippets = [...html.matchAll(snippetRe)];
+    for (let i = 0; i < Math.min(titles.length, 5); i++) {
+        // DDG wraps URLs in a redirect: extract the real target from uddg=
+        let url = titles[i][1];
+        const uddg = url.match(/uddg=([^&]+)/);
+        if (uddg) { try { url = decodeURIComponent(uddg[1]); } catch { /* keep raw */ } }
+        results.push({
+            title: decodeEntities(titles[i][2]).trim(),
+            snippet: decodeEntities(snippets[i]?.[1] || '').trim().slice(0, 300),
+            url
+        });
+    }
+    if (!results.length) throw new Error('ddg empty');
+    return results;
+}
+
+async function ddgInstantAnswer(query) {
+    const res = await fetch(
+        `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`,
+        { headers: { 'User-Agent': 'Jarvis/1.0' }, signal: AbortSignal.timeout(10000) }
+    );
+    if (!res.ok) throw new Error(`ddg-ia ${res.status}`);
+    const j = await res.json();
+    const results = [];
+    if (j.AbstractText) results.push({ title: j.Heading || query, snippet: j.AbstractText.slice(0, 300), url: j.AbstractURL || '' });
+    else if (j.Answer && typeof j.Answer === 'string') results.push({ title: query, snippet: j.Answer.slice(0, 300), url: j.AbstractURL || '' });
+    for (const t of (j.RelatedTopics || [])) {
+        if (results.length >= 5) break;
+        if (t && t.Text) results.push({ title: t.Text.split(' - ')[0] || query, snippet: t.Text.slice(0, 300), url: t.FirstURL || '' });
+    }
+    if (!results.length) throw new Error('ddg-ia empty');
+    return results;
+}
+
+async function wikipediaSearch(query) {
+    const s = await fetch(
+        `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(query)}&format=json&srlimit=3`,
+        { headers: { 'User-Agent': 'Jarvis/1.0 (local assistant)' }, signal: AbortSignal.timeout(10000) }
+    );
+    if (!s.ok) throw new Error(`wiki ${s.status}`);
+    const sj = await s.json();
+    const hits = (sj?.query?.search || []).slice(0, 3);
+    if (!hits.length) throw new Error('wiki no hits');
+    // Fetch the clean intro summaries in parallel to keep failover latency low.
+    const results = await Promise.all(hits.map(async (h) => {
+        const sum = await fetch(
+            `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(h.title)}`,
+            { headers: { 'User-Agent': 'Jarvis/1.0 (local assistant)' }, signal: AbortSignal.timeout(8000) }
+        ).then((r) => (r.ok ? r.json() : null)).catch(() => null);
+        return {
+            title: h.title,
+            snippet: (sum?.extract || String(h.snippet || '').replace(/<[^>]+>/g, '')).slice(0, 300),
+            url: sum?.content_urls?.desktop?.page || `https://en.wikipedia.org/wiki/${encodeURIComponent(h.title)}`,
+        };
+    }));
+    return results.filter((r) => r.snippet);
+}
+
+ipcMain.handle('web-search', async (event, query) => {
+    const providers = [
+        ['duckduckgo', ddgHtmlSearch],
+        ['duckduckgo-instant', ddgInstantAnswer],
+        ['wikipedia', wikipediaSearch],
+    ];
+    let lastErr = 'none';
+    for (const [name, fn] of providers) {
+        try {
+            const results = await fn(query);
+            if (results && results.length) return { success: true, provider: name, results };
+        } catch (e) {
+            lastErr = `${name}: ${e.message}`;
+            console.warn(`web-search fell through — ${lastErr}`);
+        }
+    }
+    return { success: false, error: `all providers failed (${lastErr})`, results: [] };
+});
+
+/* =========================
+   ON-CHAIN DATA SERVICE (read-only)
+   Live blockchain reads over keyless public JSON-RPC. Per-chain endpoint
+   failover because free RPCs rate-limit and go down (verified: llamarpc/
+   polygon-rpc were failing, publicnode/drpc were up). The renderer does all
+   number formatting via the tested onchain.js module — main only fetches and
+   returns raw hex. AIR-GAP: only read methods are ever sent; there is no
+   signing, no eth_sendTransaction, no key handling anywhere in this service.
+========================= */
+const RPC_URLS = {
+    ethereum: ['https://ethereum-rpc.publicnode.com', 'https://eth.drpc.org', 'https://1rpc.io/eth'],
+    arbitrum: ['https://arb1.arbitrum.io/rpc', 'https://arbitrum-one-rpc.publicnode.com', 'https://arbitrum.drpc.org'],
+    base: ['https://mainnet.base.org', 'https://base-rpc.publicnode.com', 'https://base.drpc.org'],
+    optimism: ['https://mainnet.optimism.io', 'https://optimism-rpc.publicnode.com', 'https://optimism.drpc.org'],
+    polygon: ['https://polygon-bor-rpc.publicnode.com', 'https://polygon.drpc.org', 'https://1rpc.io/matic'],
+};
+// Only these JSON-RPC methods may ever be sent — a hard allowlist so the
+// service can never be steered into a write/signing call.
+const RPC_READ_METHODS = new Set(['eth_getBalance', 'eth_gasPrice', 'eth_call', 'eth_getTransactionCount', 'eth_blockNumber', 'eth_getTransactionReceipt', 'eth_getTransactionByHash']);
+
+async function rpcCall(chainKey, method, params = []) {
+    if (!RPC_READ_METHODS.has(method)) throw new Error(`method not allowed: ${method}`);
+    const urls = RPC_URLS[chainKey];
+    if (!urls) throw new Error(`unknown chain: ${chainKey}`);
+    let lastErr = 'none';
+    for (const url of urls) {
+        try {
+            const res = await fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'User-Agent': 'Jarvis/1.0' },
+                body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+                signal: AbortSignal.timeout(10000),
+            });
+            if (!res.ok) throw new Error(`http ${res.status}`);
+            const j = await res.json();
+            if (j.error) throw new Error(j.error.message || 'rpc error');
+            if (j.result === undefined) throw new Error('empty result');
+            return j.result;
+        } catch (e) {
+            lastErr = `${url}: ${e.message}`;
+            console.warn(`rpc fell through — ${lastErr}`);
+        }
+    }
+    throw new Error(`all RPCs failed (${lastErr})`);
+}
+
+const ADDR_RE = /^0x[0-9a-fA-F]{40}$/;
+
+ipcMain.handle('onchain-balance', async (event, { chain, address }) => {
+    try {
+        if (!ADDR_RE.test(String(address || ''))) return { success: false, error: 'invalid address' };
+        const wei = await rpcCall(chain, 'eth_getBalance', [address, 'latest']);
+        return { success: true, wei };
+    } catch (e) { return { success: false, error: e.message }; }
+});
+
+ipcMain.handle('onchain-gas', async (event, { chain }) => {
+    try {
+        const wei = await rpcCall(chain, 'eth_gasPrice', []);
+        return { success: true, wei };
+    } catch (e) { return { success: false, error: e.message }; }
+});
+
+ipcMain.handle('onchain-txcount', async (event, { chain, address }) => {
+    try {
+        if (!ADDR_RE.test(String(address || ''))) return { success: false, error: 'invalid address' };
+        const hex = await rpcCall(chain, 'eth_getTransactionCount', [address, 'latest']);
+        return { success: true, count: Number(BigInt(hex)) };
+    } catch (e) { return { success: false, error: e.message }; }
+});
+
+const TXHASH_RE = /^0x[0-9a-fA-F]{64}$/;
+
+// Decode a transaction: fetch its receipt (logs, status, gas) + the tx itself
+// (native value, from/to). The renderer decodes the Transfer logs with the
+// tested onchain.js decoder — main just returns the raw receipt/tx.
+ipcMain.handle('onchain-tx', async (event, { chain, hash }) => {
+    try {
+        if (!TXHASH_RE.test(String(hash || ''))) return { success: false, error: 'invalid transaction hash' };
+        const [receipt, tx] = await Promise.all([
+            rpcCall(chain, 'eth_getTransactionReceipt', [hash]),
+            rpcCall(chain, 'eth_getTransactionByHash', [hash]),
+        ]);
+        if (!receipt) return { success: false, error: 'transaction not found (or not yet mined)' };
+        return { success: true, receipt, tx };
+    } catch (e) { return { success: false, error: e.message }; }
+});
+
+// Generic read-only eth_call for contract introspection (supportsInterface,
+// decimals, symbol, …). Still an eth_call — a pure read, never a state change.
+// `to` is the contract; `data` is calldata built by the renderer's tested
+// encoders. Returns raw hex for the renderer to decode deterministically.
+ipcMain.handle('onchain-call', async (event, { chain, to, data }) => {
+    try {
+        if (!ADDR_RE.test(String(to || ''))) return { success: false, error: 'invalid contract address' };
+        if (!/^0x[0-9a-fA-F]+$/.test(String(data || ''))) return { success: false, error: 'invalid calldata' };
+        const raw = await rpcCall(chain, 'eth_call', [{ to, data }, 'latest']);
+        return { success: true, raw };
+    } catch (e) { return { success: false, error: e.message }; }
+});
+
+// ERC-20 balance: eth_call balanceOf(owner). `data` is built by the renderer's
+// tested encodeBalanceOf; `token` is the contract address to call.
+ipcMain.handle('onchain-token', async (event, { chain, token, data }) => {
+    try {
+        if (!ADDR_RE.test(String(token || ''))) return { success: false, error: 'invalid token address' };
+        if (!/^0x[0-9a-fA-F]+$/.test(String(data || ''))) return { success: false, error: 'invalid calldata' };
+        const raw = await rpcCall(chain, 'eth_call', [{ to: token, data }, 'latest']);
+        return { success: true, raw };
+    } catch (e) { return { success: false, error: e.message }; }
 });
 
 /* =========================
