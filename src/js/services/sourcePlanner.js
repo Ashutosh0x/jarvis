@@ -22,24 +22,58 @@
    prefer a fast source when two would answer equally — a real tradeoff only
    visible because the numbers were taken rather than guessed. */
 export const SOURCES = {
-    'cisa': { terms: /\b(cisa|advisor(y|ies)|exploited|kev|ics|critical infrastructure)\b/i, domain: 'security', ms: 65 },
-    'chrome': { terms: /\b(chrome|chromium|browser|desktop update)\b/i, domain: 'security', ms: 1650 },
-    'google-sec': { terms: /\b(google security|android|pixel|zero.?day)\b/i, domain: 'security', ms: 1010 },
-    'nvd': { terms: /\bCVE-\d{4}-\d{4,7}\b|\b(vulnerabilit(y|ies)|cvss|severity)\b/i, domain: 'security', ms: 400 },
-    'sec-8k': { terms: /\b(sec|8-?k|10-?[kq]|filing|edgar|earnings|disclosure)\b/i, domain: 'finance', ms: 24 },
-    'fed': { terms: /\b(fed|federal reserve|fomc|rate|monetary|inflation)\b/i, domain: 'finance', ms: 18 },
-    'arxiv-cr': { terms: /\b(arxiv|paper|preprint)\b.*\b(security|crypto)\b|\bcs\.CR\b/i, domain: 'research', ms: 71 },
-    'arxiv-ai': { terms: /\b(arxiv|paper|preprint|research)\b/i, domain: 'research', ms: 238 },
-    'chain': { terms: /\b(gas|balance|wallet|0x[0-9a-f]{6,}|whale|on.?chain|ethereum|arbitrum|base|bsc|solana)\b/i, domain: 'chain', ms: 300 },
-    'prediction': { terms: /\b(odds|prediction market|polymarket|kalshi|probability)\b/i, domain: 'markets', ms: 500 },
+    'cisa': { terms: /\b(cisa|advisor(y|ies)|exploited|kev|ics|critical infrastructure)\b/i, domain: 'security', ms: 65, ok: 1 },
+    'chrome': { terms: /\b(chrome|chromium|browser|desktop update)\b/i, domain: 'security', ms: 1650, ok: 1 },
+    'google-sec': { terms: /\b(google security|android|pixel|zero.?day)\b/i, domain: 'security', ms: 1010, ok: 1 },
+    'nvd': { terms: /\bCVE-\d{4}-\d{4,7}\b|\b(vulnerabilit(y|ies)|cvss|severity)\b/i, domain: 'security', ms: 400, ok: 1 },
+    'sec-8k': { terms: /\b(sec|8-?k|10-?[kq]|filing|edgar|earnings|disclosure)\b/i, domain: 'finance', ms: 24, ok: 1 },
+    'fed': { terms: /\b(fed|federal reserve|fomc|rate|monetary|inflation)\b/i, domain: 'finance', ms: 18, ok: 1 },
+    'arxiv-cr': { terms: /\b(arxiv|paper|preprint)\b.*\b(security|crypto)\b|\bcs\.CR\b/i, domain: 'research', ms: 71, ok: 1 },
+    'arxiv-ai': { terms: /\b(arxiv|paper|preprint|research)\b/i, domain: 'research', ms: 238, ok: 1 },
+    'chain': { terms: /\b(gas|balance|wallet|0x[0-9a-f]{6,}|whale|on.?chain|ethereum|arbitrum|base|bsc|solana)\b/i, domain: 'chain', ms: 300, ok: 1 },
+    'prediction': { terms: /\b(odds|prediction market|polymarket|kalshi|probability)\b/i, domain: 'markets', ms: 500, ok: 1 },
 };
+
+
+/* OBSERVED, NOT ASSERTED.
+   The ms values above are seeds from one run on one network. Left frozen they
+   become exactly the kind of guess-map this project has a standing rule against
+   — a table that keeps being right about the past. observe() replaces each seed
+   with an exponentially weighted moving average of what actually happened, so a
+   feed that degrades is demoted without anyone editing a constant.
+
+   ALPHA 0.2: a single slow response should nudge the estimate, not redefine it,
+   since one timeout on a flaky network is noise rather than a new normal. */
+export const ALPHA = 0.2;
+
+export function observe(stats, source, { ms, ok }) {
+    const prev = stats?.[source] || { ms: SOURCES[source]?.ms ?? 500, ok: 1, n: 0 };
+    return {
+        ...(stats || {}),
+        [source]: {
+            // A failure carries no latency information — it tells us the source
+            // was unreachable, not that it was slow.
+            ms: ok ? Math.round(ALPHA * ms + (1 - ALPHA) * prev.ms) : prev.ms,
+            ok: +(ALPHA * (ok ? 1 : 0) + (1 - ALPHA) * prev.ok).toFixed(3),
+            n: prev.n + 1,
+        },
+    };
+}
+
+/* Utility, not speed. Optimizing latency alone would rank a fast source that
+   rarely answers above a slow one that always does. relevance x reliability
+   discounted by cost keeps a 1650ms source in the plan when it is the ONLY one
+   that can answer — which for a Chrome advisory it is. */
+export function utility({ score, ms, ok }) {
+    return +(score * (ok ?? 1) / Math.log2(2 + (ms ?? 500) / 100)).toFixed(4);
+}
 
 export const SCORE_FLOOR = 1;
 
 /**
  * @returns {{plan, skipped, estimatedMs, sequentialMs}} — plan is scored, highest first.
  */
-export function planSources(query, { max = 4 } = {}) {
+export function planSources(query, { max = 4, stats = null } = {}) {
     const q = String(query || '');
     const scored = [];
     for (const [name, s] of Object.entries(SOURCES)) {
@@ -47,9 +81,13 @@ export function planSources(query, { max = 4 } = {}) {
         if (!m) continue;
         // Score by how much of the query the match explains, so a passing
         // mention loses to a query that is about this source.
-        scored.push({ name, domain: s.domain, ms: s.ms, score: +(m[0].length / Math.max(q.length, 1) * 10).toFixed(3) });
+        const live = stats?.[name];
+        const ms = live?.ms ?? s.ms;
+        const ok = live?.ok ?? s.ok ?? 1;
+        const score = +(m[0].length / Math.max(q.length, 1) * 10).toFixed(3);
+        scored.push({ name, domain: s.domain, ms, ok, score, utility: utility({ score, ms, ok }) });
     }
-    scored.sort((a, b) => b.score - a.score || a.ms - b.ms);
+    scored.sort((a, b) => b.utility - a.utility || a.ms - b.ms);
 
     const plan = scored.filter(s => s.score >= SCORE_FLOOR / 10).slice(0, max);
     const skipped = Object.keys(SOURCES).filter(n => !plan.some(p => p.name === n));
@@ -102,4 +140,4 @@ export function describePlan(p, failures = []) {
     return s;
 }
 
-export default { SOURCES, planSources, mergeResults, describePlan };
+export default { SOURCES, ALPHA, observe, utility, planSources, mergeResults, describePlan };

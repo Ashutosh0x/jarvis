@@ -4,7 +4,7 @@
 // 1652ms (3.97x) — but parallel came within 2ms of the slowest single source,
 // so NOT FETCHING is the bigger lever. sec+fed alone measured 24ms.
 
-import { SOURCES, planSources, mergeResults, describePlan } from '../sourcePlanner.js';
+import { SOURCES, planSources, mergeResults, describePlan, observe, utility, ALPHA } from '../sourcePlanner.js';
 
 let pass = 0, fail = 0;
 const check = (n, c, d = '') => { c ? pass++ : fail++; console.log(`${c ? 'PASS' : 'FAIL'}  ${n}${d ? ` — ${d}` : ''}`); };
@@ -70,6 +70,36 @@ const names = p => p.plan.map(x => x.name);
         /incomplete/.test(describePlan(p, ['chrome'])));
     check('no matching source admits it rather than guessing',
         /would be guessing/.test(describePlan(planSources('tell me a joke'))));
+}
+
+/* --- observed latency replaces the seed table ------------------------------------
+   The seeded ms values are one run on one network. Frozen, they become the kind
+   of guess-map this project has a standing rule against. */
+{
+    let st = null;
+    for (let i = 0; i < 8; i++) st = observe(st, 'fed', { ms: 900, ok: true });
+    check('a source that degrades is demoted without editing a constant', st.fed.ms > 500, st.fed.ms + 'ms from seed ' + SOURCES.fed.ms);
+    check('one slow response only nudges the estimate', observe(null, 'fed', { ms: 900, ok: true }).fed.ms < 250);
+    check('alpha keeps history dominant', ALPHA < 0.5);
+
+    let f = null;
+    for (let i = 0; i < 5; i++) f = observe(f, 'chrome', { ms: 0, ok: false });
+    check('a failure does not corrupt the latency estimate', f.chrome.ms === SOURCES.chrome.ms);
+    check('but reliability falls', f.chrome.ok < 0.4, String(f.chrome.ok));
+    check('observation count is kept', f.chrome.n === 5);
+    check('the seed table is never mutated', SOURCES.fed.ms === 18);
+    check('the planner uses the observed number, not the seed', planSources('fed rate decision', { stats: st }).plan[0].ms === st.fed.ms);
+}
+
+/* --- utility, not raw speed -------------------------------------------------------- */
+{
+    const fastFlaky = utility({ score: 1, ms: 20, ok: 0.2 });
+    const slowSolid = utility({ score: 1, ms: 1650, ok: 1.0 });
+    check('a reliable slow source beats a flaky fast one', slowSolid > fastFlaky, slowSolid + ' vs ' + fastFlaky);
+    check('at equal reliability, faster wins', utility({ score: 1, ms: 20, ok: 1 }) > utility({ score: 1, ms: 1650, ok: 1 }));
+    check('at equal cost, more relevant wins', utility({ score: 2, ms: 100, ok: 1 }) > utility({ score: 1, ms: 100, ok: 1 }));
+    check('latency is discounted logarithmically, so a slow sole source survives', planSources('latest chrome desktop update').plan.some(p => p.name === 'chrome'));
+    check('missing stats fall back rather than throwing', utility({ score: 1 }) > 0);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);
