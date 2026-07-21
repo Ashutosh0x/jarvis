@@ -36,6 +36,14 @@ const O = (origin, originId) => ({ origin, originId });
         classify('Apple Inc. has a beta of 0.87 to the S&P 500') === null);
     check('a gas reading is not a benchmark',
         classify('gas on arbitrum is 0.ed 12 gwei'.replace('ed ', '')) === null);
+    // Found by running the gate over the real log, not by unit tests: a wifi scan
+    // result was promoted as a benchmark because the pattern read "network found"
+    // while the log said "found 1 network".
+    check('a wifi scan result is not a benchmark',
+        classify('I found 1 network, Sir. Temple tree 2nd 25G at 100 percent.') === null);
+    check('either word order is caught',
+        classify('2 networks found at 100 percent') === null);
+
     check('a market probability is not a benchmark',
         classify('the odds are 62 percent on Polymarket') === null);
 

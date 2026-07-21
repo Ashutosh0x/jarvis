@@ -67,8 +67,12 @@ const TRANSIENT_SUBJECTS = [
     /\b(odds|probability)\b/i,                                                // prediction markets
     // Live telemetry. The log promoted "You are on Redmi Note 10 Pro, signal
     // 100%, 72.2 megabits" three times — a reading of this moment, not knowledge.
-    /\b(signal|megabits|latency|battery|cpu|ram|disk|ghz|networks? found)\b/i,
+    /\b(signal|megabits|latency|battery|cpu|ram|disk|ghz)\b/i,
     /\bhandled \d+ commands?\b/i,
+    // Order-independent. The log said "I found 1 network", not "network found";
+    // a fixed word order missed it — the same bug class as the quant pattern,
+    // found the same way, by running the gate over real turns rather than tests.
+    /\bnetworks?\b[\s\S]{0,40}\bfound\b|\bfound\b[\s\S]{0,20}\bnetworks?\b/i,
 ];
 
 /** Order-independent: the number may precede the subject ("returned 55.2
