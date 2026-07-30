@@ -34,8 +34,19 @@ jobs:
       # arrive the same way. All three are runtime dependencies, so --omit=dev
       # installs everything the tests touch while skipping Electron, a ~100MB
       # download that nothing under test uses.
+      #
+      # `npm install`, not `npm ci`. KNOWN DEFECT: package-lock.json is out of
+      # sync with package.json on Linux — it is missing the platform-gated
+      # electron-builder packages (electron-builder-squirrel-windows,
+      # electron-winstaller and their trees), so `npm ci` refuses with EUSAGE.
+      # Windows npm reports the same lockfile as up to date, which is why this
+      # went unnoticed: it breaks `npm ci` for every contributor not on
+      # Windows. Regenerating it needs a clean checkout on Linux; doing it from
+      # Windows dropped ~3,700 lines of the dev tree and would have broken
+      # `npm run electron`. Left as a deliberate follow-up rather than a
+      # blind rewrite of a lockfile.
       - name: Install runtime dependencies
-        run: npm ci --omit=dev
+        run: npm install --omit=dev --no-audit --no-fund
 
       - name: Run the deterministic suite
         run: node scripts/run-tests.mjs
