@@ -91,6 +91,7 @@ const toc = [
   { id: "memory", label: "Cognitive memory" },
   { id: "evaluation", label: "Evaluation" },
   { id: "finance", label: "Finance & quant" },
+  { id: "portfolio", label: "Peer & portfolio risk" },
   { id: "onchain", label: "On-chain reads" },
   { id: "whales", label: "Real-time whale stream" },
   { id: "issuance", label: "Stablecoin issuance" },
@@ -401,6 +402,11 @@ sharpeRatio(returns, riskFree)   // (CAGR - rf) / annualized vol
 annualizedReturn(returns)        // geometric CAGR, not arithmetic
 maxDrawdown(prices)              // largest peak-to-trough decline
 betaAlpha(asset, benchmark)      // vs the S&P 500
+rSquared(asset, benchmark)       // how much of that fit to believe
+historicalVaR(returns, 0.95)     // simulation, not a Gaussian
+expectedShortfall(returns, 0.95) // the average loss once VaR breaks
+informationRatio(asset, bench)   // active return / tracking error
+upDownCapture(asset, bench)      // asymmetry a single beta hides
 blackScholes(S, K, T, sigma, r)  // price + delta/gamma/vega/theta`}</Code>
             <p>
               Live quotes and history come from a keyless endpoint; the numbers are computed
@@ -410,9 +416,61 @@ blackScholes(S, K, T, sigma, r)  // price + delta/gamma/vega/theta`}</Code>
               exists: the model gave the wrong number, and the deterministic math gave the
               right one.
             </p>
+            <p>
+              <strong className="text-foreground">VaR is historical simulation, never
+              parametric.</strong> The Gaussian form is one line shorter and wrong in exactly
+              the situation the number exists for: returns have fat tails, so it understates
+              the 99th percentile precisely when that matters. It also refuses fewer than 30
+              observations rather than resting a 99% loss estimate on one bad day.
+            </p>
+            <p>
+              <strong className="text-foreground">R² gates the reading of beta and
+              alpha.</strong> Measured against the S&amp;P over 250 sessions, Micron&apos;s R² is
+              0.283 — the benchmark explains 28% of its variance, so a beta of 3.29 and an
+              alpha of 170% are reported as weakly determined rather than quoted plainly.
+              Without that gate the assistant would speak a 170% alpha as though it meant
+              something.
+            </p>
           </Section>
 
-          <Section id="onchain" eyebrow="09" title="On-chain reads">
+          <Section id="portfolio" eyebrow="09" title="Peer & portfolio risk">
+            <p>
+              Two questions single-security metrics cannot answer. The first is how much of a
+              move belongs to the sector and how much to the company; the second is where the
+              risk actually sits in a book of holdings that move together.
+            </p>
+            <p>
+              <strong className="text-foreground">Dollar weight is not risk weight.</strong> A
+              60/40 portfolio is roughly a 94% equity-risk portfolio — arithmetic, not
+              opinion, and checked against exactly that case in the tests. Correlation is the
+              whole difference: five names at r ≈ 0.8 are much closer to one position than to
+              five.
+            </p>
+            <Code>{`riskContributions(weights, cov)  // where the risk actually is
+riskParityWeights(cov)           // equal risk share, not equal dollars
+minVarianceWeights(cov)          // needs no return estimate
+maxSharpeWeights(cov, mu, rf)    // tangency — unstable by nature
+diversificationRatio(w, cov)     // 1.0 means it is one position
+portfolioTailRisk(w, returns)    // the book's own VaR, not a sum`}</Code>
+            <p>
+              Measured on the memory complex, 29 July 2026: Micron fell 9.94% while its peer
+              group fell 4.96%; with a beta of 0.91 that leaves −5.40% as company-specific,
+              while Western Digital&apos;s flat day was +4.77% of relative strength. Group mode
+              ranks members by that residual, because the largest faller is often just the
+              highest beta.
+            </p>
+            <p>
+              Holdings are aligned by date, never by index — two venues do not share a
+              trading calendar. The covariance inverse refuses a singular matrix instead of
+              returning the enormous offsetting weights a collinear book produces, and a
+              short in the minimum-variance solution is surfaced rather than clipped:
+              &quot;hold none&quot; and &quot;sell short&quot; are different instructions. When a
+              recently-listed holding truncates every other series, the analysis names it and
+              says dropping it would widen the window.
+            </p>
+          </Section>
+
+          <Section id="onchain" eyebrow="10" title="On-chain reads">
             <p>
               The same rule applies to blockchain data: converting a wei balance to ETH, or
               a raw token amount to a human figure, is exact BigInt arithmetic — never an
@@ -453,7 +511,7 @@ blackScholes(S, K, T, sigma, r)  // price + delta/gamma/vega/theta`}</Code>
             </p>
           </Section>
 
-          <Section id="whales" eyebrow="10" title="Real-time whale stream">
+          <Section id="whales" eyebrow="11" title="Real-time whale stream">
             <p>
               A websocket subscription to new block headers. Every confirmed block is
               scanned for large movements, and every figure announced is read out of that
@@ -511,7 +569,7 @@ blackScholes(S, K, T, sigma, r)  // price + delta/gamma/vega/theta`}</Code>
             </p>
           </Section>
 
-          <Section id="issuance" eyebrow="11" title="Stablecoin issuance">
+          <Section id="issuance" eyebrow="12" title="Stablecoin issuance">
             <p>
               A mint is a transfer <em>from</em> the zero address; a burn is a transfer{" "}
               <em>to</em> it. That makes supply changes one of the few pieces of market
@@ -531,7 +589,7 @@ blackScholes(S, K, T, sigma, r)  // price + delta/gamma/vega/theta`}</Code>
             </p>
           </Section>
 
-          <Section id="providers" eyebrow="12" title="Provider keys">
+          <Section id="providers" eyebrow="13" title="Provider keys">
             <p>
               Every key is optional. Without any, JARVIS reads public endpoints and says so;
               with them, it sees more and still says exactly what it can and cannot reach.
@@ -568,7 +626,7 @@ blackScholes(S, K, T, sigma, r)  // price + delta/gamma/vega/theta`}</Code>
             </p>
           </Section>
 
-          <Section id="tracer" eyebrow="13" title="Fund-flow tracer">
+          <Section id="tracer" eyebrow="14" title="Fund-flow tracer">
             <p>
               A deterministic fund-tracing engine implements the core of TRacer (KDD &apos;22):
               Approximate Personalized PageRank, forward-biased to follow where money goes.
@@ -589,7 +647,7 @@ detectConsistentChains(...)   // structurally coherent paths`}</Code>
             </p>
           </Section>
 
-          <Section id="companion" eyebrow="14" title="Android companion">
+          <Section id="companion" eyebrow="15" title="Android companion">
             <p>
               The companion pairs over Wi-Fi and mirrors the same voice interface to a
               phone. Discovery is by mDNS; the link is a token-authenticated WebSocket with a
@@ -603,7 +661,7 @@ detectConsistentChains(...)   // structurally coherent paths`}</Code>
             </p>
           </Section>
 
-          <Section id="ports" eyebrow="15" title="Network ports">
+          <Section id="ports" eyebrow="16" title="Network ports">
             <p>
               Every listener binds locally or to the LAN. None is exposed to the internet.
             </p>
@@ -619,7 +677,7 @@ detectConsistentChains(...)   // structurally coherent paths`}</Code>
             />
           </Section>
 
-          <Section id="privacy" eyebrow="16" title="Privacy model">
+          <Section id="privacy" eyebrow="17" title="Privacy model">
             <p>
               Privacy is the architecture, not a setting. Your microphone, screen captures,
               and conversations stay on local disk because there is no provider server to
@@ -642,7 +700,7 @@ detectConsistentChains(...)   // structurally coherent paths`}</Code>
             </p>
           </Section>
 
-          <Section id="install" eyebrow="17" title="Install & run">
+          <Section id="install" eyebrow="18" title="Install & run">
             <p>
               Clone the repository, install dependencies, and pull two local models. The
               whole assistant boots from one command.

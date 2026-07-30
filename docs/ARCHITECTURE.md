@@ -134,7 +134,8 @@ All renderer-to-main communication passes through `preload.js` under
 | ADB | `adb-command` | Curated methods only |
 | Vault | `secure-cred-set`, `secure-cred-list`, `secure-cred-delete` | No read channel exists |
 | Network | `wifi-scan`, `wifi-connect`, `wifi-disconnect`, `wifi-info`, `web-search` | |
-| Finance | `watchlist-get`, `watchlist-add`, `watchlist-remove` | Read-only |
+| Finance | `watchlist-get`, `watchlist-add`, `watchlist-remove`, `get-quote`, `get-history`, `get-sector-move`, `get-portfolio-series` | Read-only. No order-placement channel exists |
+| SEC | `sec-company-feed`, `sec-document`, `sec-tickers`, `edgar-search` | Host, port, path and credentials pinned in `edgarGuard.js` |
 
 ### Listener hygiene
 
@@ -224,20 +225,48 @@ overlap by chance.
 `jarvis.js` `detectIntent()` matches in a deliberate order. Order is behaviour.
 
 ```
-1. Phone-targeted        targetsPhone() && routePhoneCommand()
-2. Companion status      /(phone|mobile|companion)/ && /(status|online|why)/
-3. Companion pairing     "connect to my mobile"
-4. System control        open app, shutdown, volume, brightness
-5. Wi-Fi                 scan, connect, info
-6. Memory                remember, recall
-7. Screen                read screen, what is on my display
-8. Calendar              reminders, schedule
-9. Fallthrough           handleLocalAICommand()
+ 1. Phone-targeted        targetsPhone() && routePhoneCommand()
+ 2. Companion status      /(phone|mobile|companion)/ && /(status|online|why)/
+ 3. Companion pairing     "connect to my mobile"
+ 4. System control        open app, shutdown, volume, brightness
+ 5. Wi-Fi                 scan, connect, info
+ 6. Memory                remember, recall
+ 7. Screen                read screen, what is on my display
+ 8. Calendar              reminders, schedule
+ 9. Portfolio risk        parsePortfolioQuery()  -- a BOOK, not a security
+10. Watchlist             add / remove / show
+11. On-chain              parseOnchainQuery()
+12. Peer decomposition    parseSectorQuery()     -- sector vs own move
+13. Single-security quant parseQuantQuery()
+14. Price                 parsePriceQuery()
+15. Fallthrough           handleLocalAICommand()
 ```
 
 Phone routing is checked first because "open chrome on my phone" must not match
 the desktop application launcher. The suffix carries the target, so a matcher
 that runs earlier and ignores it will silently do the wrong thing.
+
+The finance block, 9 to 14, is ordered by how specific the question is, and
+every step of that ordering was forced by a real misroute:
+
+- **Portfolio before watchlist.** "How risky is my watchlist" contains the word
+  *watchlist*, so the watchlist block claimed it and answered with a list of
+  prices. The portfolio parser requires a risk word and rejects add/remove
+  wording, so "what's on my watchlist" and "add micron to my watchlist" still
+  fall through to it.
+- **On-chain before price.** "What are the odds bitcoin hits 200k" is a
+  prediction-market question, not a spot price. A parser that reads the ticker
+  first answers a different question with a confident number.
+- **Sector before quant.** "Decompose Micron's move" carries no metric word, so
+  the single-security parser took it as a plain risk summary and answered an
+  absolute move to a relative question.
+
+Each parser is anchored so a verb appearing mid-sentence cannot capture the rest
+of the line as a ticker — the log entry that forced this shows *"investigate
+what might be his future plans next move analyze and tell me"* becoming a quant
+query for the ticker "and tell me". Every phrase in the published command
+reference is now an assertion in `routing.test.mjs` (145 checks), so the
+documentation cannot drift from the parser without the suite failing.
 
 ### The local model path
 

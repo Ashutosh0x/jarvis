@@ -360,10 +360,63 @@ model is never asked to calculate a financial figure, because it cannot be
 trusted with one and a wrong figure stated confidently is worse than no answer.
 
 - Live quotes with day change, resolved name to ticker
-- Deterministic risk analytics in `src/js/services/quant.js`: annualised return,
+- **Single security** — `src/js/services/quant.js`: annualised return,
   volatility, Sharpe, Sortino, maximum drawdown, beta and alpha against a
-  benchmark, correlation, and Black-Scholes pricing with greeks
+  benchmark, correlation, R², historical VaR, expected shortfall, information
+  ratio, tracking error, up/down capture, and Black-Scholes pricing with greeks
+- **A book of holdings** — `src/js/services/portfolio.js`: covariance,
+  risk contribution, risk parity, minimum variance, maximum Sharpe,
+  diversification ratio, and portfolio-level VaR and expected shortfall
+- **A name against its peers** — `sectorMove.js`: how much of a move the sector
+  explains and how much belongs to the company
+- SEC filings through a pinned fetch guard, `edgarGuard.js`
 - Headlines from Google News with Bing failover, keyless
+
+Three choices in here are load-bearing rather than incidental.
+
+**VaR is historical simulation, never parametric.** The Gaussian form
+(`mu - z*sigma`) is one line shorter and wrong in exactly the situation the
+number exists for: return distributions have fat tails, so it understates the
+99th percentile precisely when that matters. The implementation reads the
+quantile off the observed returns and refuses fewer than 30 observations rather
+than resting a 99% loss estimate on a single bad day.
+
+**R² gates the interpretation of beta and alpha.** Measured against the S&P 500
+over 250 sessions, Micron's R² is 0.283 — the benchmark explains 28% of its
+variance, so its beta of 3.29 and alpha of 170% are weakly determined and are
+reported as such. Without that gate the assistant would speak a 170% alpha as
+though it meant something.
+
+**Dollar weight is not risk weight.** A 60/40 book is roughly a 94% equity-risk
+book, which is arithmetic rather than opinion: it is what `riskContributions()`
+returns for those weights, and it is checked against that case in the tests.
+
+---
+
+### Peer and portfolio analysis
+
+Two questions the single-security metrics cannot answer, each with its own
+module and voice intent.
+
+`SECTOR_QUERY` — *"decompose Micron's move"*, *"break down the memory sector"*.
+The move is split into the part the peer group explains (beta times the sector's
+move) and the part that belongs to the company. Measured 29 July 2026: Micron
+fell 9.94% while its peer group fell 4.96%; with a beta of 0.91 that leaves
+-5.40% as its own, while Western Digital's flat day was +4.77% of relative
+strength. Group mode ranks every member by that residual, because the largest
+faller is often just the highest beta.
+
+`PORTFOLIO_QUERY` — *"how risky is my watchlist"*, *"what would risk parity
+do"*, *"minimum variance weights for MU, SNDK, WDC"*. Holdings are aligned by
+date, never by index, because two venues do not share a trading calendar. The
+covariance inverse refuses a singular matrix rather than returning the enormous
+offsetting weights that a collinear book produces, and a short position in the
+minimum-variance solution is surfaced rather than clipped — "hold none" and
+"sell short" are different instructions.
+
+Both modules state their limits instead of implying them with a null. A holding
+that only listed three weeks ago truncates every other series to match; the
+analysis names it and says that dropping it would widen the window.
 
 ---
 
@@ -961,6 +1014,8 @@ All listeners bind locally or to the LAN. None are exposed to the internet.
 | 8765 | Phone bridge HTTP | `0.0.0.0` | Bearer token, except the pairing routes |
 | 8766 | Companion WebSocket | `0.0.0.0` | Token in `X-Jarvis-Token`, constant-time compare |
 | 8770 | faster-whisper STT | `127.0.0.1` | Loopback only |
+| 8771 | Local TTS | `127.0.0.1` | Loopback only |
+| 8772 | Vision `llama-server`, optional | `127.0.0.1` | Loopback only |
 | 11434 | Ollama | `127.0.0.1` | Loopback only |
 | 10000 | Unlimited-OCR, optional | `127.0.0.1` | Loopback only |
 | 5173 | Vite dev server | `127.0.0.1` | Development only |
@@ -983,6 +1038,9 @@ chainWatch.js            Whale, token flow, issuance and aggregation logic
 rpcHedge.js              Hedged endpoint racing with sticky last-good ordering
 streamGuard.js           Backoff, dedup, block-gap tracking, alert priority
 metricStore.js           Telemetry persistence, rollups, threshold events
+sectorMove.js            Peer-relative decomposition: sector move vs own move
+edgarGuard.js            SEC fetch pinning, allowed forms, non-filer registry
+visionRouter.js          Which vision backend parses a document, page reassembly
 
 src/
   index.html             HUD markup, GLSL shaders, styles

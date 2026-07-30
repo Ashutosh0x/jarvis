@@ -50,7 +50,7 @@ function AnimatedCounter({ end, suffix = "", prefix = "" }: { end: number; suffi
    which is the opposite of what this section claims to be. */
 const metrics = [
   {
-    value: 987,
+    value: 2115,
     suffix: "",
     prefix: "",
     label: "Checks on the deterministic core (npm test)",
