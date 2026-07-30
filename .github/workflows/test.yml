@@ -18,6 +18,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+          cache: npm
 
       # src/config.js holds real credentials and is gitignored, but
       # toolService.js imports it at module load, so two suites cannot even be
@@ -28,9 +29,14 @@ jobs:
       - name: Seed the placeholder config
         run: cp src/config.example.js src/config.js
 
-      # The suites import only source files, so a full install is not needed to
-      # run them. Electron alone is a ~100MB download and nothing under test
-      # touches it.
+      # The suites do reach node_modules: routing.test.mjs imports jarvis.js,
+      # which pulls in toolService.js and @google/genai. dat.gui and three
+      # arrive the same way. All three are runtime dependencies, so --omit=dev
+      # installs everything the tests touch while skipping Electron, a ~100MB
+      # download that nothing under test uses.
+      - name: Install runtime dependencies
+        run: npm ci --omit=dev
+
       - name: Run the deterministic suite
         run: node scripts/run-tests.mjs
 
@@ -48,8 +54,13 @@ jobs:
           cache: npm
           cache-dependency-path: webapp/package-lock.json
 
+      # The scaffolding this app came from pulls in expo and react-native
+      # alongside React 19, and their peer ranges genuinely conflict. Vercel
+      # builds it fine because its installer is not strict about peers; npm ci
+      # is, so it needs to be told. Nothing here imports react-native — it is
+      # unused scaffolding, and removing it is the real fix.
       - name: Install
-        run: npm ci
+        run: npm ci --legacy-peer-deps
 
       # Typecheck only. The Next build is what Vercel already runs on every
       # push, so repeating it here would buy nothing but minutes.
