@@ -3538,6 +3538,34 @@ ipcMain.handle('get-quote', async (event, text) => {
 // architecture: prices are queried, not remembered). Returns closes + the
 // currency/name so the caller can present real numbers, not model guesses.
 const HISTORY_RANGES = new Set(['5d', '1mo', '3mo', '6mo', '1y', '2y', '5y', 'ytd', 'max']);
+
+/* WHICH PRICE SERIES EVERY METRIC IS COMPUTED FROM.
+ *
+ * Yahoo returns two parallel series. `quote[0].close` is already SPLIT-adjusted
+ * — verified against NVDA's 10:1 on 2024-06-10, which reads as a +0.7% day and
+ * not a -90% crash, so the split hazard this guards against does not exist
+ * here. It is NOT dividend-adjusted. `adjclose[0].adjclose` is both.
+ *
+ * Price-only returns therefore understate total return, and the error is not
+ * academic. Measured over one year on 30 Jul 2026, close vs adjclose:
+ *
+ *     O    (Realty Income)  15.5% -> 22.0%   Sharpe 0.699 -> 1.089
+ *     VZ   (Verizon)        10.9% -> 18.6%   Sharpe 0.277 -> 0.588
+ *     XLU  (utilities)       5.5% ->  8.4%   Sharpe 0.097 -> 0.294
+ *     KO                    29.8% -> 33.5%   Sharpe 1.371 -> 1.581
+ *     MU / NVDA                        no meaningful change
+ *
+ * A utility ETF's Sharpe was wrong by a factor of three. That is exactly the
+ * confidently-wrong number this project exists to prevent, so the adjusted
+ * series is preferred wherever one exists. Crypto and some indices have no
+ * adjclose at all, hence the fallback rather than a hard requirement.
+ */
+function adjustedCloses(result) {
+    const adj = result?.indicators?.adjclose?.[0]?.adjclose;
+    const raw = result?.indicators?.quote?.[0]?.close;
+    if (Array.isArray(adj) && adj.some((x) => x != null && x > 0)) return adj;
+    return Array.isArray(raw) ? raw : [];
+}
 ipcMain.handle('get-history', async (event, opts) => {
     try {
         const symbol = await resolveSymbol(opts?.text || opts?.symbol);
@@ -3549,7 +3577,7 @@ ipcMain.handle('get-history', async (event, opts) => {
         );
         if (!res.ok) throw new Error(`yahoo history ${res.status}`);
         const r = (await res.json())?.chart?.result?.[0];
-        const rawCloses = r?.indicators?.quote?.[0]?.close || [];
+        const rawCloses = adjustedCloses(r);
         // Yahoo interpolates nulls on non-trading days; drop them so returns are
         // computed on real observations only.
         const closes = rawCloses.filter((x) => x != null && x > 0);
@@ -3588,7 +3616,7 @@ async function fetchDatedCloses(symbol, range = '6mo') {
     if (!res.ok) throw new Error(`yahoo history ${res.status}`);
     const r = (await res.json())?.chart?.result?.[0];
     const ts = r?.timestamp || [];
-    const closes = r?.indicators?.quote?.[0]?.close || [];
+    const closes = adjustedCloses(r);
     return {
         symbol,
         currency: r?.meta?.currency || 'USD',

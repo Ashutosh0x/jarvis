@@ -276,7 +276,7 @@ export default function DocumentationPage() {
             <Table
               head={["Stage", "Implementation", "Why"]}
               rows={[
-                ["Sparse", "BM25 over a persistent inverted index (k1 1.5, b 0.75)", "Re-tokenizing per query cost 105ms at 5k chunks"],
+                ["Sparse", "BM25 over a persistent inverted index (k1 1.5, b 0.75)", "Re-tokenizing per query cost 104.8ms at 5k chunks"],
                 ["Dense", "nomic-embed-text via Ollama, cosine, cutoff 0.3", "Falls back to BM25-only with no embedder"],
                 ["Fusion", "Reciprocal Rank Fusion, k = 60", "Hybrid beat dense- and sparse-only in benchmarks"],
                 ["Expansion", "Pseudo-relevance feedback, fused at weight 0.5", "A poor feedback pool can dilute but not corrupt"],

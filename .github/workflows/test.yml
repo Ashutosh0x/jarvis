@@ -1,0 +1,48 @@
+name: tests
+
+# The deterministic core is 2,115 assertions and nothing was running them on
+# push. Every suite is pure — no network, no clock, no device, no Electron — so
+# the whole thing runs on a plain Node runner in seconds and needs no services.
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # The suites import only source files, so a full install is not needed to
+      # run them. Electron alone is a ~100MB download and nothing under test
+      # touches it.
+      - name: Run the deterministic suite
+        run: node scripts/run-tests.mjs
+
+  webapp:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: webapp
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: webapp/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      # Typecheck only. The Next build is what Vercel already runs on every
+      # push, so repeating it here would buy nothing but minutes.
+      - name: Typecheck
+        run: npx tsc --noEmit

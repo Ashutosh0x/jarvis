@@ -56,7 +56,7 @@ latency-coupled to the conversation loop, and crossing the IPC boundary per
 query would add serialisation cost to a path already measured in milliseconds.
 The tradeoff is that BM25 scoring runs on the render thread, which is why the
 inverted index matters: the previous implementation blocked the visualizer for
-94ms per query at 5,000 chunks.
+104.8ms per query at 5,000 chunks.
 
 Persistence still crosses IPC, because the renderer has no filesystem access.
 Writes are debounced by 2 seconds.

@@ -581,7 +581,7 @@ flowchart TB
 
 | Stage | Implementation | Rationale |
 | --- | --- | --- |
-| Sparse | BM25 over a persistent inverted index, incremental on ingest | Re-tokenising the corpus per query measured 94ms at 5k chunks on the render thread |
+| Sparse | BM25 over a persistent inverted index, incremental on ingest | Re-tokenising the corpus per query measured 104.8ms at 5k chunks on the render thread |
 | Dense | nomic-embed-text through Ollama, cosine similarity | Degrades to BM25-only when no embedder is present |
 | Fusion | Reciprocal Rank Fusion, k=60 | Derived from PubHealthBench, where hybrid beat both single-retriever modes. **This did not reproduce locally — see [Retrieval accuracy](#retrieval-accuracy)** |
 | Expansion | PRF: top 4 chunks, top 6 non-query terms, fused as a separate list at weight 0.5 | Kept separate so a poor feedback pool can dilute but not corrupt the original ranking |
