@@ -53,6 +53,7 @@ extends the same interface and control surface to a paired phone over Wi-Fi.
 - [Architecture](#architecture)
 - [Feature reference](#feature-reference)
 - [On-chain intelligence](#on-chain-intelligence)
+- [Web search](#web-search)
 - [Retrieval engine](#retrieval-engine)
 - [Evaluation](#evaluation)
 - [Android companion](#android-companion)
@@ -570,6 +571,172 @@ which public RPC cannot enumerate, so it awaits an Etherscan-family key.
 
 ---
 
+## Web search
+
+`webSearch.js` (main process) and `src/js/services/webSearchIntent.js`
+(renderer) answer questions from the live internet. Split along the process
+boundary, not by topic: the renderer cannot fetch these origins because CORS
+blocks it, and Rollup cannot take named imports from a CommonJS module.
+
+### Why it exists
+
+There was no web search. `search about elon musk` was classified `TYPE_TEXT` —
+the dictation intent — so asking for a search typed the words into whatever
+window had focus. Anything that instead reached `AI_COMMAND` was answered by
+the local model, which has no network access. It did not decline; it invented:
+
+```
+"search about elon musk"       -> "...recognized as a trillionaire in US dollars ."
+"list latest vulnerabilities"  -> "According to OpenCVE, Google released Chrome 151
+                                   with patches for 382 vulnerabilities"
+"latest cve number of chrome"  -> "According to Google's Chrome Releases,
+                                   CVE-2026-15905 is the latest critical vulnerability"
+```
+
+Those citations are fabricated. A fabricated CVE number is worse than a refusal.
+
+### Pipeline
+
+```mermaid
+flowchart TB
+    Q(["Question"]):::io --> INT["detectIntents<br/>code / academic / security /<br/>discuss / book / news / general"]:::prep
+    INT --> CACHE{{"SearchCache<br/>3 min TTL"}}:::fuse
+    CACHE -->|hit| OUT
+    CACHE -->|miss| PLAN["buildProviders<br/>intent-gated"]:::prep
+
+    PLAN --> GEN["duckduckgo-instant<br/>wikipedia<br/>google-news"]:::sparse
+    PLAN --> SPEC["github / npm / crates<br/>arxiv / nvd / stackoverflow<br/>hackernews / openlibrary"]:::dense
+    PLAN --> LOCAL["local index<br/>BM25 over crawled feeds"]:::prf
+
+    GEN --> GATHER["gatherAll<br/>2s budget, minProviders 3"]:::fuse
+    SPEC --> GATHER
+    LOCAL --> RRF
+    GATHER --> RRF{{"rrfFuse<br/>k = 60, provider weights"}}:::fuse
+
+    RRF --> ANS["extractAnswer<br/>+ verifyAnswer"]:::prep
+    ANS --> OUT(["Spoken answer + sources"]):::io
+
+    CORR["suggestCorrection<br/>runs concurrently"]:::prf -.->|"only if < 3 results"| RRF
+
+    classDef io fill:#1f2937,stroke:#111827,color:#f9fafb
+    classDef prep fill:#eef2ff,stroke:#4338ca,color:#1e1b4b
+    classDef sparse fill:#ecfdf5,stroke:#047857,color:#064e3b
+    classDef dense fill:#fef3c7,stroke:#b45309,color:#451a03
+    classDef prf fill:#fae8ff,stroke:#a21caf,color:#4a044e
+    classDef fuse fill:#e0f2fe,stroke:#0369a1,color:#082f49
+```
+
+### Providers are measured, not assumed
+
+HTML scraping was tried first and does not work:
+
+| Endpoint | Result |
+| --- | --- |
+| `html.duckduckgo.com` | HTTP 202 + challenge page, 0 results |
+| `lite.duckduckgo.com` | HTTP 202 + challenge page, 0 results |
+| `mojeek.com` | HTTP 200, body is an altcha CAPTCHA |
+| `searx.be` | HTTP 200, JSON output disabled |
+
+The first DuckDuckGo query of a session usually succeeds, which makes this
+especially deceptive: it looks like it works until it is used twice.
+
+Keyless general open-web search is not available in 2026. Google's Custom Search
+JSON API closed to new signups in 2025 and shuts down on 1 Jan 2027; Bing's
+Search APIs were retired on 11 Aug 2025; Brave withdrew its free tier. So the
+providers below are the keyless endpoints that **are** official, each measured
+before being added:
+
+| Provider | Measured | Intent |
+| --- | --- | --- |
+| DuckDuckGo Instant Answer | 361 ms | general (sourced abstract) |
+| Wikipedia | 541 ms | general (encyclopedic) |
+| Google News RSS | 642 ms | news, anything current |
+| Hacker News (Algolia) | 831 ms | discuss |
+| crates.io | 1147 ms | code (Rust) |
+| Open Library | 1259 ms | book |
+| NVD | 1462 ms | security |
+| GitHub repos | 1523 ms | code |
+| Stack Overflow | 1555 ms | code, discuss |
+| arXiv | 1973 ms | academic |
+| npm | 2078 ms | code (JS) |
+| Brave | — | general, only with `BRAVE_API_KEY` |
+
+Probed and **rejected**: GitHub code search (HTTP 401, needs auth), Semantic
+Scholar (HTTP 429), Reddit (HTTP 403 to datacentre traffic).
+
+### Gather, don't race
+
+Providers here are complementary rather than interchangeable — a Rust question
+wants the crates.io entry *and* the GitHub repo *and* the Stack Overflow thread
+— so `gatherAll` collects everything that arrives inside the budget instead of
+resolving on the first success.
+
+The early exit counts **providers, not results**. Counting results was tried
+first and silently destroyed the feature: Google News alone returns six, which
+satisfied a result quota instantly and ended the query before any other source
+replied — measured as `answered 1: google-news` on every single query, a
+first-wins race wearing a gather's clothes.
+
+`rrfFuse` merges the ranked lists by position only (k=60), because GitHub stars,
+Stack Overflow votes and news recency cannot be normalised against each other.
+Provider weights are derived from the query, after plain RRF put npm's
+`uniffi-bindgen-react-native` first for *"best rust crate for async runtime"* —
+an off-target index's rank-1 beating a relevant index's rank-2.
+
+### Query understanding
+
+Spelling and entity correction run **concurrently** with the search, so they
+cost nothing when nothing needs correcting, and the corrected query is only
+re-run when the original returned fewer than three results — and only kept if
+it did better. A bad suggestion cannot make results worse.
+
+No hardcoded dictionary. Learning entities from the local corpus was tried and
+measured useless: 721 feed items yield 2652 "entities" that are almost entirely
+SEC filing boilerplate (`Filer`, `Filed`, `AccNo`, `Financial Statements`), and
+it knows none of `situational`, `dimon`, `nvidia` or `aschenbrenner`.
+
+Wikipedia's search API knows all of them, live:
+
+| Said | Became | Kind |
+| --- | --- | --- |
+| `situtational awareness` | situational awareness | spelling |
+| `reccently` | recently | spelling |
+| `nvdia` | nvidia | spelling |
+| `jamie diamond` | **Jamie Dimon** | entity |
+
+Corrections are always shown; only **entity** corrections are spoken. Reading
+"showing results for situational awareness" aloud after the user typed
+`situtational` is noise, but `jamie diamond` becoming Jamie Dimon is a different
+person, and answering about someone else silently is indistinguishable from
+being wrong.
+
+Suggestions are never applied blindly. `micorn` correctly suggests `micron`, but
+its top Wikipedia article is *2010 Champs Sports Bowl*. The decision is made
+locally on Damerau-Levenshtein distance relative to length.
+
+### Latency
+
+Search returns in **46–956 ms** against 31–51 s for the old path, which ran
+retrieval plus local generation. Repeat queries are **0 ms** (cached).
+
+Connection warmth was measured rather than assumed. Node 22's default dispatcher
+holds pooled connections for at least **120 s** idle — far longer than the ~4 s
+commonly quoted — so no custom `undici` dispatcher is needed and none is added:
+
+```
+cold (first ever fan-out)   7812 ms
+after   0s idle              664 ms
+after  60s idle              690 ms
+after 120s idle              564 ms
+```
+
+Only the cold start is worth removing, so the three **general** origins are
+warmed once, 3 s after launch. The eight specialised providers are intent-gated
+and left cold. There is no repeating warmer: warmth already survives a session,
+and periodic warming would be unsolicited traffic to third parties.
+
+---
+
 ## Retrieval engine
 
 `src/js/services/ragService.js` implements hybrid retrieval. Design choices are
@@ -911,6 +1078,33 @@ inventing outcomes when it had no execution feedback.
 
 ## Installation
 
+### Download a build
+
+Prebuilt installers for every tagged release are on the
+[Releases page](../../releases/latest).
+
+| Platform | Download | Notes |
+| --- | --- | --- |
+| Windows | `Jarvis-Setup-<version>-x64.exe` | Installer. `Jarvis-Portable-*.exe` needs no install. |
+| macOS | `Jarvis-<version>-universal.dmg` | One universal build for Apple Silicon and Intel |
+| Linux | `Jarvis-<version>-x64.AppImage` | `chmod +x` and run. `.deb`, `.rpm` and `.tar.gz` are also published. |
+
+Verify what you downloaded:
+
+```bash
+sha256sum -c SHA256SUMS --ignore-missing
+```
+
+Builds are unsigned unless signing certificates are configured for the
+repository. Windows SmartScreen will warn on first run (**More info → Run
+anyway**); macOS needs **right-click → Open** the first time, or
+`xattr -dr com.apple.quarantine /Applications/Jarvis.app`.
+
+The app checks for updates a minute after launch and every six hours after
+that. It never downloads or installs on its own — a voice assistant should not
+restart itself mid-sentence. See [docs/RELEASE.md](docs/RELEASE.md) for the
+full release process, signing and notarization.
+
 ### Prerequisites
 
 | Requirement | Version | Purpose |
@@ -974,7 +1168,15 @@ on port 5173.
 | `npm run build` | Production bundle into `dist/` |
 | `npm run electron` | Launch against `dist/` |
 | `npm run electron:dev` | Launch against the Vite server |
-| `npm run electron:build` | Build a Windows NSIS installer into `release/` |
+| `npm run icon` | Regenerate `build/icon.png`, the source for every platform icon |
+| `npm run dist` | Package for the current platform into `release/` |
+| `npm run dist:win` | Windows: NSIS installer, portable exe, zip |
+| `npm run dist:mac` | macOS: universal DMG and zip |
+| `npm run dist:linux` | Linux: AppImage, deb, rpm, tar.gz |
+| `npm run checksums` | Write `release/SHA256SUMS` |
+| `npm run checksums:verify` | Re-hash artifacts and fail on any mismatch |
+| `npm run smoke` | Launch the packaged app and assert it starts |
+| `npm run electron:build` | Legacy alias for a plain `electron-builder` run |
 
 ---
 
@@ -1078,6 +1280,9 @@ metricStore.js           Telemetry persistence, rollups, threshold events
 sectorMove.js            Peer-relative decomposition: sector move vs own move
 edgarGuard.js            SEC fetch pinning, allowed forms, non-filer registry
 visionRouter.js          Which vision backend parses a document, page reassembly
+webSearch.js             Providers, parsing, RRF fusion, BM25 local index,
+                         HTML-to-text, answer extraction and verification,
+                         correction gating, search cache
 
 src/
   index.html             HUD markup, GLSL shaders, styles
@@ -1200,6 +1405,22 @@ These are deliberate or platform-imposed, not defects.
 - **No barge-in.** The microphone is gated while speaking. Synthesised audio
   bypasses Chromium's echo cancellation and would otherwise be transcribed as
   user input.
+- **No general open-web index.** Web search federates official keyless APIs
+  plus a BM25 pass over already-crawled feeds. It is not a crawler and does not
+  try to be: Google indexes hundreds of billions of pages, and a personal
+  crawler would spend its time re-fetching what the live providers already
+  return. Where a personal index genuinely wins is the narrow set the user
+  tracks, which is what the feed poller already collects.
+- **Keyless web search has no general provider.** Google's Custom Search JSON
+  API shuts down 1 Jan 2027, Bing's Search APIs were retired 11 Aug 2025, and
+  Brave dropped its free tier. Without `BRAVE_API_KEY`, coverage is DuckDuckGo's
+  abstracts, Wikipedia, Google News and the intent-gated specialised indexes —
+  strong on entities, current events, code, papers and CVEs; weak on arbitrary
+  open-web pages.
+- **Search answers are extractive, never generated.** A spoken answer is a
+  sentence lifted from a fetched page and checked against it before speaking.
+  Nothing is summarised by a model, because a model summarising search results
+  is how the fabricated citations above got in.
 - **Radio toggles need administrator rights.** Wi-Fi scanning and connecting to
   saved profiles work at user level; enabling the adapter does not. JARVIS opens
   the relevant Settings page and says so plainly.

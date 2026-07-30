@@ -15,6 +15,7 @@ Audience: someone modifying the system. For installation and usage, see the
 - [IPC surface](#ipc-surface)
 - [Voice pipeline](#voice-pipeline)
 - [Intent routing](#intent-routing)
+- [Web search](#web-search)
 - [Retrieval engine](#retrieval-engine)
 - [Companion protocol](#companion-protocol)
 - [Security model](#security-model)
@@ -239,8 +240,32 @@ overlap by chance.
 12. Peer decomposition    parseSectorQuery()     -- sector vs own move
 13. Single-security quant parseQuantQuery()
 14. Price                 parsePriceQuery()
-15. Fallthrough           handleLocalAICommand()
+15. News                  parseNewsQuery()       -- RSS, 542-1188ms
+16. Web search            parseWebSearchQuery()  -- live internet
+17. Fallthrough           handleLocalAICommand()
 ```
+
+### The ordering bug that proves the rule
+
+"Order is behaviour" is not an abstraction. `inputControl.parseInputCommand()`
+runs at step 4, and it used to claim `search X`, `google X` and `look up X`,
+converting them to `TYPE_TEXT` — *type this into whatever window has focus, then
+press Enter*. Web search sits at step 16. It was therefore **unreachable**:
+every "search ..." in the interaction log was typed somewhere instead of
+answered, and Jarvis behaved as a keyboard macro.
+
+Only `type` and `dictate` produce keystrokes now. `type search foo` still
+dictates, so explicit dictation is unaffected.
+
+The same failure recurred one step later in the opposite direction. Web search
+at 16 runs *before* `SEARCH_FILE`, so `search my files` was answered by
+Wikipedia. The guard against that (`my files|notes|system|history|...`) had
+lived inside the `inputControl` branch and was lost when the branch was removed;
+it now lives in `parseWebSearchQuery` where the interception happens.
+
+Both were found by running the real router over a table of phrases rather than
+by reading it. `routing.test.mjs` pins the outcomes, including five phrasings of
+`search my *` asserting they never reach the web.
 
 Phone routing is checked first because "open chrome on my phone" must not match
 the desktop application launcher. The suffix carries the target, so a matcher
@@ -318,6 +343,76 @@ actually uses, lacked the filter.
 opened, rows closed." It receives no execution feedback, so it pattern-matched an
 obedient reply. The system prompt now states it cannot act and must never claim
 it did.
+
+---
+
+## Web search
+
+### The process split
+
+`webSearch.js` is CommonJS in the main process; `src/js/services/webSearchIntent.js`
+is an ES module in the renderer. The split is by **process**, not topic, and it
+is forced twice over: the renderer cannot fetch these origins because CORS
+blocks it, and Rollup cannot take named imports from a CommonJS file. Main
+fetches, parses, ranks and fuses; the renderer routes and speaks.
+
+### Gather, not race
+
+`hedgedRace` (used for RPC endpoints) resolves on first success, which is right
+when endpoints are interchangeable. Search providers are complementary — a Rust
+question wants crates.io *and* GitHub *and* Stack Overflow — so `gatherAll`
+keeps everything that lands inside a 2 s budget.
+
+Its early exit counts **providers, not results**. Counting results was
+implemented first and degenerated the feature into a race: Google News alone
+returns six, satisfying a result quota before any other provider replied.
+Measured as `answered 1: google-news` on every query. `webSearch.test.mjs`
+pins this with *"one prolific provider cannot end the gather alone"*.
+
+### Fusion
+
+`rrfFuse` scores by rank position only, `k = 60`. Raw scores across GitHub
+stars, Stack Overflow votes and news recency are not comparable and normalising
+them is where hand-tuned weighting goes wrong.
+
+Provider weights are derived per query, because plain RRF lets an off-target
+index's rank-1 beat a relevant index's rank-2 — measured: npm's
+`uniffi-bindgen-react-native` took first place for *"best rust crate for async
+runtime"*.
+
+### Answers are extractive and verified
+
+`htmlToText` is the `w3m -dump` idea written natively. Order matters: script,
+style, nav and footer **bodies** are removed first, while their delimiters still
+exist. Stripping tags before that leaves raw JavaScript in the output.
+
+`extractAnswer` scores sentences rather than taking the first paragraph, since
+the opening text of a modern page is usually a cookie notice. `verifyAnswer`
+then checks the claim against the text it came from before it is spoken.
+
+Nothing is passed to a model to summarise. A model summarising retrieved results
+is precisely how the fabricated CVE numbers entered the interaction log.
+
+### Guards worth knowing about
+
+- `MAX_PAGE_BYTES` caps input at 1 MB. Every regex is linear in input size; a
+  642 KB Wikipedia article parses in 183 ms.
+- Whitespace collapsing avoids `/ *\n *(?:\n *)+/` — a quantifier inside a
+  quantified group, the shape that backtracks catastrophically. The flat
+  two-pass replacement handles 137 KB of pathological whitespace in 15 ms.
+- The `web-search` IPC channel accepts a bare query **string** as well as
+  `{ query, limit }`. Two renderer call sites use different shapes, and reading
+  only `opts.query` turned every string call into `empty query` — a silently
+  broken feature that still reported success.
+
+### Background work
+
+Indexing search results into RAG is a side effect of answering, never part of
+it. It was six sequential awaited `ragService.ingest()` calls, each an embedding
+round trip, running after the answer had already been spoken: `firstWord` at
+1930 ms with a turn that stayed open for 32 185 ms, holding the microphone gate
+and blocking the follow-up question that indexing exists to support. It is now
+one batched, non-awaited call.
 
 ---
 

@@ -198,8 +198,53 @@ routes('remind me about vines1vzrYbzLMRdu58ou5XTby4qAqVRLmqo36NKPTg', null);
     // "google" is a verb AND a company; the remainder decides which.
     check('"google stock price" quotes the company, does not type a search',
         intentOf('google stock price') === 'PRICE_QUERY', String(intentOf('google stock price')));
-    check('"google quantum computing" is still a search',
-        intentOf('google quantum computing') === 'TYPE_TEXT', String(intentOf('google quantum computing')));
+    /* Now Jarvis's OWN search, not a keystroke macro. This previously expected
+       TYPE_TEXT — "type it into whatever window is focused and press Enter" —
+       which is why every "search ..." in the interaction log was dictated
+       somewhere instead of answered. */
+    check('"google quantum computing" is Jarvis\'s own web search',
+        intentOf('google quantum computing') === 'WEB_SEARCH', String(intentOf('google quantum computing')));
+    check('a bare question is a web search too',
+        intentOf('what is rayleigh scattering') === 'WEB_SEARCH', String(intentOf('what is rayleigh scattering')));
+    check('"google stock price" still quotes the company',
+        intentOf('google stock price') === 'PRICE_QUERY', String(intentOf('google stock price')));
+
+    /* Routing ambiguities worth pinning, because each one is a phrase that
+       previously went somewhere useless. Asking is a search whether or not the
+       user says the word "search". */
+    for (const phrase of [
+        'search quantum computing',
+        'look up quantum computing',
+        'find information about quantum computing',
+        'find Rust ownership',
+        'search Nvidia Blackwell',
+        'who is Jensen Huang',
+        'who founded Google',
+        'what is Rust',
+    ]) {
+        check(`"${phrase}" is a web search`,
+            intentOf(phrase) === 'WEB_SEARCH', String(intentOf(phrase)));
+    }
+
+    // Only "type"/"dictate" produce keystrokes now.
+    check('"type search Nvidia" still dictates',
+        intentOf('type search Nvidia') === 'TYPE_TEXT', String(intentOf('type search Nvidia')));
+    check('"dictate hello world" still dictates',
+        intentOf('dictate hello world') === 'TYPE_TEXT', String(intentOf('dictate hello world')));
+    check('"open Chrome" is still an app launch',
+        intentOf('open Chrome') === 'OPEN_APP', String(intentOf('open Chrome')));
+    check('"latest AI news" stays on the RSS path',
+        intentOf('latest AI news') === 'NEWS_QUERY', String(intentOf('latest AI news')));
+
+    /* The user's own data is not on the web. This router runs BEFORE
+       SEARCH_FILE, so without the local-scope guard "search my files" was
+       answered by Wikipedia. The guard lived in inputControl.js and was lost
+       when that branch was removed. */
+    for (const phrase of ['search my files', 'search my notes', 'look up my bookmarks',
+                          'find my downloads', 'search my history']) {
+        check(`"${phrase}" is NOT sent to the web`,
+            intentOf(phrase) !== 'WEB_SEARCH', String(intentOf(phrase)));
+    }
 }
 
 /* --- pronouns in news queries ------------------------------------------------

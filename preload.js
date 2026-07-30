@@ -106,6 +106,20 @@ contextBridge.exposeInMainWorld('electronAPI', {
     // On-demand live quote (name or ticker) and keyless news headlines
     getQuote: (text) => ipcRenderer.invoke('get-quote', text),
     getNews: (opts) => ipcRenderer.invoke('get-news', opts),
+    // Real web search, raced across keyless providers in the main process
+    // (the renderer cannot fetch these directly — CORS blocks it).
+    webSearch: (opts) => ipcRenderer.invoke('web-search', opts),
+
+    // Auto-update. Download and install are explicit, never automatic, so an
+    // update cannot restart the app mid-conversation.
+    updateStatus: () => ipcRenderer.invoke('update-status'),
+    updateDownload: () => ipcRenderer.invoke('update-download'),
+    updateInstall: () => ipcRenderer.invoke('update-install'),
+    onUpdateStatus: (cb) => {
+        const handler = (_e, state) => cb(state);
+        ipcRenderer.on('update-status', handler);
+        return () => ipcRenderer.removeListener('update-status', handler);
+    },
     // Historical daily closes for the quant analytics engine
     getHistory: (opts) => ipcRenderer.invoke('get-history', opts),
     getSectorMove: (opts) => ipcRenderer.invoke('get-sector-move', opts),

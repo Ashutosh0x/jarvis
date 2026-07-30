@@ -1,4 +1,4 @@
-name: tests
+name: ci
 
 # The deterministic core is 2,115 assertions and nothing was running them on
 # push. Every suite is pure — no network, no clock, no device, no Electron — so
@@ -77,3 +77,79 @@ jobs:
       # push, so repeating it here would buy nothing but minutes.
       - name: Typecheck
         run: npx tsc --noEmit
+
+  # Packaging is where this repo has actually broken before: the old inline
+  # build config listed only [dist, electron.js, preload.js], while electron.js
+  # requires eleven sibling modules and spawns two Python servers. Every unit
+  # test passed and the installed app died on its first require. A pure test
+  # suite cannot catch that, so the package is built and launched here.
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Seed the placeholder config
+        shell: bash
+        run: cp src/config.example.js src/config.js
+
+      # `npm install`, not `npm ci`. package-lock.json is out of sync with
+      # package.json on Linux — it is missing the platform-gated
+      # electron-builder packages — so `npm ci` refuses with EUSAGE there while
+      # Windows reports the same lockfile as fine. Documented in the test job
+      # above; the same defect blocks this job, and a build needs devDeps.
+      - name: Install
+        run: npm install --no-audit --no-fund
+
+      # @napi-rs/canvas (via pdf-to-img) declares 11 platform variants as
+      # optionalDependencies and npm installs only the host's. electron-builder
+      # walks the declared list and dies on the first absent directory.
+      - name: Stub absent platform packages
+        run: node scripts/prepare-native-deps.mjs
+
+      - name: Generate the icon
+        run: npm run icon
+
+      # Unsigned on purpose. A pull request from a fork has no certificate, and
+      # build validation must not depend on one.
+      - name: Build (unsigned)
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: npm run dist
+
+      # Electron needs a display server; the other two runners have a session.
+      - name: Smoke test (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: xvfb-run --auto-servernum node scripts/smoke-test.mjs
+
+      - name: Smoke test
+        if: matrix.os != 'ubuntu-latest'
+        run: node scripts/smoke-test.mjs
+
+      - name: Checksums
+        run: npm run checksums && npm run checksums:verify
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jarvis-${{ matrix.os }}
+          path: |
+            release/*.exe
+            release/*.dmg
+            release/*.zip
+            release/*.AppImage
+            release/*.deb
+            release/*.rpm
+            release/*.tar.gz
+            release/latest*.yml
+            release/SHA256SUMS
+          retention-days: 14
+          if-no-files-found: error

@@ -24,6 +24,7 @@ const suites = [
     path.join(root, 'edgarGuard.test.mjs'),
     path.join(root, 'visionRouter.test.mjs'),
     path.join(root, 'sectorMove.test.mjs'),
+    path.join(root, 'webSearch.test.mjs'),
 ];
 
 /* The answer benchmark's grader is the part of it that can silently lie, so its

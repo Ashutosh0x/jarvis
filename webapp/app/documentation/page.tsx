@@ -88,6 +88,7 @@ const toc = [
   { id: "voice", label: "Voice pipeline" },
   { id: "supervision", label: "Process supervision" },
   { id: "retrieval", label: "Retrieval engine" },
+  { id: "websearch", label: "Web search" },
   { id: "memory", label: "Cognitive memory" },
   { id: "evaluation", label: "Evaluation" },
   { id: "finance", label: "Finance & quant" },
@@ -307,7 +308,64 @@ export default function DocumentationPage() {
             </p>
           </Section>
 
-          <Section id="memory" eyebrow="06" title="Cognitive memory">
+          <Section id="websearch" eyebrow="06" title="Web search">
+            <p>
+              Questions are answered from the live internet by <Term>webSearch.js</Term> in
+              the main process and <Term>webSearchIntent.js</Term> in the renderer. The
+              split is by process, not topic: the renderer cannot fetch these origins
+              because CORS blocks it, and Rollup cannot take named imports from a CommonJS
+              module.
+            </p>
+            <p>
+              Before this existed, <Term>search about elon musk</Term> was classified as
+              dictation and typed into whatever window had focus, while anything reaching
+              the local model was answered from memory with invented sources &mdash;
+              including a CVE number that does not exist. Answers are now extracted from
+              fetched pages and verified against them before being spoken. Nothing is
+              summarised by a model, because a model summarising results is how those
+              citations got in.
+            </p>
+            <Table
+              head={["Stage", "Implementation", "Why"]}
+              rows={[
+                ["Intent", "Multi-label regex: code, academic, security, discuss, book, news", "A Rust question should not pay for a CVE round trip"],
+                ["Cache", "TTL 3 min for results, 24 h for corrections", "The same query was typed four times in five minutes"],
+                ["Fetch", "gatherAll, 2 s budget, early exit on 3 providers", "Providers are complementary, so a first-wins race discards most of the answer"],
+                ["Local", "BM25 over already-crawled feed items", "721 items were on disk and unsearchable"],
+                ["Fusion", "Reciprocal Rank Fusion, k = 60, query-derived weights", "GitHub stars and news recency are not comparable scores"],
+                ["Answer", "Sentence extraction plus source verification", "Extractive answers cannot fabricate a citation"],
+              ]}
+            />
+            <p>
+              Providers were measured before being added, and HTML scraping was measured
+              and rejected: <Term>html.duckduckgo.com</Term> answers HTTP 202 with a
+              challenge page, and Mojeek serves a CAPTCHA. Keyless general web search does
+              not exist in 2026 &mdash; Google&rsquo;s Custom Search API shuts down on
+              1 Jan 2027 and Bing&rsquo;s was retired in August 2025 &mdash; so the stack
+              federates the official keyless endpoints that do work.
+            </p>
+            <Table
+              head={["Provider", "Measured", "Answers"]}
+              rows={[
+                ["DuckDuckGo Instant Answer", "361 ms", "Entities, definitions"],
+                ["Wikipedia", "541 ms", "Encyclopedic"],
+                ["Google News RSS", "642 ms", "Anything current"],
+                ["Hacker News, Stack Overflow", "831-1555 ms", "Discussion, code"],
+                ["GitHub, npm, crates.io", "1147-2078 ms", "Packages and repositories"],
+                ["arXiv, NVD, Open Library", "1259-1973 ms", "Papers, CVEs, books"],
+              ]}
+            />
+            <p>
+              Search returns in <strong className="text-foreground">46&ndash;956 ms</strong>,
+              against 31&ndash;51&nbsp;s for the old path that ran retrieval plus local
+              generation; repeats are instant from cache. Spelling and entity correction
+              run concurrently with the search, so <Term>jamie diamond</Term> resolves to
+              Jamie Dimon without costing latency, and a correction is only kept if it
+              returned more than the original did.
+            </p>
+          </Section>
+
+          <Section id="memory" eyebrow="07" title="Cognitive memory">
             <p>
               Memory has three layers. The <strong className="text-foreground">episodic</strong>{" "}
               log records every turn verbatim and append-only — the immutable source of
@@ -340,7 +398,7 @@ You use Chrome —
             </p>
           </Section>
 
-          <Section id="evaluation" eyebrow="07" title="Evaluation">
+          <Section id="evaluation" eyebrow="08" title="Evaluation">
             <p>
               Speed was measured here long before accuracy was, which is backwards: a fast
               ranker that puts the wrong passage first is worse than a slow one that does
@@ -390,7 +448,7 @@ You use Chrome —
             </p>
           </Section>
 
-          <Section id="finance" eyebrow="08" title="Deterministic finance & quant">
+          <Section id="finance" eyebrow="09" title="Deterministic finance & quant">
             <p>
               The core rule: <strong className="text-foreground">the language model never
               computes a financial number.</strong> Sharpe ratios, volatility, drawdowns,
@@ -434,7 +492,7 @@ blackScholes(S, K, T, sigma, r)  // price + delta/gamma/vega/theta`}</Code>
             </p>
           </Section>
 
-          <Section id="venues" eyebrow="09" title="Disclosure venues beyond EDGAR">
+          <Section id="venues" eyebrow="10" title="Disclosure venues beyond EDGAR">
             <p>
               The memory industry is mostly not American, so an EDGAR-only assistant answers
               &quot;no filings&quot; for half of it and is wrong every time. A venue registry names
@@ -469,7 +527,7 @@ blackScholes(S, K, T, sigma, r)  // price + delta/gamma/vega/theta`}</Code>
             </p>
           </Section>
 
-          <Section id="portfolio" eyebrow="10" title="Peer & portfolio risk">
+          <Section id="portfolio" eyebrow="11" title="Peer & portfolio risk">
             <p>
               Two questions single-security metrics cannot answer. The first is how much of a
               move belongs to the sector and how much to the company; the second is where the
@@ -506,7 +564,7 @@ portfolioTailRisk(w, returns)    // the book's own VaR, not a sum`}</Code>
             </p>
           </Section>
 
-          <Section id="onchain" eyebrow="11" title="On-chain reads">
+          <Section id="onchain" eyebrow="12" title="On-chain reads">
             <p>
               The same rule applies to blockchain data: converting a wei balance to ETH, or
               a raw token amount to a human figure, is exact BigInt arithmetic — never an
@@ -547,7 +605,7 @@ portfolioTailRisk(w, returns)    // the book's own VaR, not a sum`}</Code>
             </p>
           </Section>
 
-          <Section id="whales" eyebrow="12" title="Real-time whale stream">
+          <Section id="whales" eyebrow="13" title="Real-time whale stream">
             <p>
               A websocket subscription to new block headers. Every confirmed block is
               scanned for large movements, and every figure announced is read out of that
@@ -605,7 +663,7 @@ portfolioTailRisk(w, returns)    // the book's own VaR, not a sum`}</Code>
             </p>
           </Section>
 
-          <Section id="issuance" eyebrow="13" title="Stablecoin issuance">
+          <Section id="issuance" eyebrow="14" title="Stablecoin issuance">
             <p>
               A mint is a transfer <em>from</em> the zero address; a burn is a transfer{" "}
               <em>to</em> it. That makes supply changes one of the few pieces of market
@@ -625,7 +683,7 @@ portfolioTailRisk(w, returns)    // the book's own VaR, not a sum`}</Code>
             </p>
           </Section>
 
-          <Section id="providers" eyebrow="14" title="Provider keys">
+          <Section id="providers" eyebrow="15" title="Provider keys">
             <p>
               Every key is optional. Without any, JARVIS reads public endpoints and says so;
               with them, it sees more and still says exactly what it can and cannot reach.
@@ -662,7 +720,7 @@ portfolioTailRisk(w, returns)    // the book's own VaR, not a sum`}</Code>
             </p>
           </Section>
 
-          <Section id="tracer" eyebrow="15" title="Fund-flow tracer">
+          <Section id="tracer" eyebrow="16" title="Fund-flow tracer">
             <p>
               A deterministic fund-tracing engine implements the core of TRacer (KDD &apos;22):
               Approximate Personalized PageRank, forward-biased to follow where money goes.
@@ -683,7 +741,7 @@ detectConsistentChains(...)   // structurally coherent paths`}</Code>
             </p>
           </Section>
 
-          <Section id="companion" eyebrow="16" title="Android companion">
+          <Section id="companion" eyebrow="17" title="Android companion">
             <p>
               The companion pairs over Wi-Fi and mirrors the same voice interface to a
               phone. Discovery is by mDNS; the link is a token-authenticated WebSocket with a
@@ -697,7 +755,7 @@ detectConsistentChains(...)   // structurally coherent paths`}</Code>
             </p>
           </Section>
 
-          <Section id="ports" eyebrow="17" title="Network ports">
+          <Section id="ports" eyebrow="18" title="Network ports">
             <p>
               Every listener binds locally or to the LAN. None is exposed to the internet.
             </p>
@@ -713,7 +771,7 @@ detectConsistentChains(...)   // structurally coherent paths`}</Code>
             />
           </Section>
 
-          <Section id="privacy" eyebrow="18" title="Privacy model">
+          <Section id="privacy" eyebrow="19" title="Privacy model">
             <p>
               Privacy is the architecture, not a setting. Your microphone, screen captures,
               and conversations stay on local disk because there is no provider server to
@@ -736,7 +794,7 @@ detectConsistentChains(...)   // structurally coherent paths`}</Code>
             </p>
           </Section>
 
-          <Section id="install" eyebrow="19" title="Install & run">
+          <Section id="install" eyebrow="20" title="Install & run">
             <p>
               Clone the repository, install dependencies, and pull two local models. The
               whole assistant boots from one command.

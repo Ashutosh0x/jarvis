@@ -2,6 +2,7 @@ const { app, BrowserWindow, ipcMain, desktopCapturer, clipboard, shell } = requi
 const path = require('path');
 const { exec, execFile, spawn } = require('child_process');
 const os = require('os');
+const net = require('net');
 const fs = require('fs').promises;
 const fsSync = require('fs');
 const axios = require('axios');
@@ -9,6 +10,7 @@ const QRCode = require('qrcode');
 const { CompanionBridge, WS_PORT: COMPANION_WS_PORT } = require('./companionBridge');
 const adbService = require('./adbService');
 const { hedgedRace, createStickyOrder } = require('./rpcHedge');
+const webSearch = require('./webSearch');
 const chainProviders = require('./chainProviders');
 const {
     BACKENDS: VISION_BACKENDS,
@@ -231,6 +233,19 @@ app.whenReady().then(async () => {
     startVisionServer();
     // Not awaited — readiness polling + model warm must not block the window.
     startOllamaServer();
+    /* Probe-based supervision on top of the per-service respawn handlers, which
+       only fire on 'exit' and so cannot see a service that is up but wedged.
+       Delayed one interval so the cold start above is not diagnosed as a fault. */
+    setTimeout(startWatchdogs, WATCHDOG_INTERVAL_MS);
+    /* Open the search sockets while the window is still painting, so the first
+       query does not pay 450-750ms of DNS/TCP/TLS. Deliberately after the UI
+       work above — this is a latency optimisation, not a startup dependency. */
+    setTimeout(() => { warmSearchConnections().catch(() => {}); }, 3000);
+    // Update check, well after startup so it never competes with first paint.
+    setTimeout(startUpdateChecks, 60000);
+    // Update check, well after startup. Never in development, where there is
+    // no published feed and the check would only log a confusing 404.
+    setTimeout(startUpdateChecks, 60000);
     // Probe which chains the configured keys actually serve. Not awaited and
     // failure-tolerant: until it resolves, chain reads use the keyless pool.
     discoverAlchemyProviders().catch((e) => console.warn('[chain] provider discovery failed:', e.message));
@@ -1911,6 +1926,202 @@ async function startOllamaServer() {
 }
 
 /* =========================
+   AUTO UPDATE
+
+   electron-updater reads the latest*.yml that electron-builder publishes beside
+   each release. Downloads are explicit rather than automatic: this is a voice
+   assistant that may be mid-sentence, and swapping the binary under a running
+   conversation to save one restart is not a trade worth making.
+========================= */
+let updateState = { status: 'idle', version: null, error: null };
+
+function startUpdateChecks() {
+    /* A dev run has no published feed, so a check there produces a 404 and a
+       confusing log line rather than information. app.isPackaged is the only
+       reliable signal — NODE_ENV is not set consistently across the launchers. */
+    if (!app.isPackaged) {
+        console.log('Updates: skipped (not a packaged build)');
+        return;
+    }
+
+    let autoUpdater;
+    try {
+        ({ autoUpdater } = require('electron-updater'));
+    } catch (e) {
+        console.warn('Updates: electron-updater unavailable —', e.message);
+        return;
+    }
+
+    autoUpdater.autoDownload = false;
+    autoUpdater.autoInstallOnAppQuit = true;
+    /* Channel follows the version string: 1.2.3-beta.1 stays on beta and never
+       silently jumps a user to a stable build they did not ask for. */
+    const prerelease = /-(alpha|beta|nightly)/.exec(app.getVersion());
+    if (prerelease) {
+        autoUpdater.channel = prerelease[1];
+        autoUpdater.allowPrerelease = true;
+    }
+
+    const send = (status, extra = {}) => {
+        updateState = { status, version: null, error: null, ...extra };
+        for (const w of BrowserWindow.getAllWindows()) {
+            if (!w.isDestroyed()) w.webContents.send('update-status', updateState);
+        }
+    };
+
+    autoUpdater.on('update-available', (info) => {
+        console.log('Updates: available', info.version);
+        send('available', { version: info.version });
+    });
+    autoUpdater.on('update-not-available', () => send('current'));
+    autoUpdater.on('download-progress', (p) =>
+        send('downloading', { percent: Math.round(p.percent) }));
+    autoUpdater.on('update-downloaded', (info) => {
+        console.log('Updates: downloaded', info.version, '— will install on quit');
+        send('ready', { version: info.version });
+    });
+    autoUpdater.on('error', (e) => {
+        // Never fatal. An unreachable update feed must not affect the session.
+        console.warn('Updates: check failed —', e?.message || e);
+        send('error', { error: String(e?.message || e) });
+    });
+
+    const check = () => autoUpdater.checkForUpdates().catch(() => {});
+    check();
+    setInterval(check, 6 * 3600 * 1000);
+
+    ipcMain.handle('update-status', () => updateState);
+    ipcMain.handle('update-download', async () => {
+        try { await autoUpdater.downloadUpdate(); return { success: true }; }
+        catch (e) { return { success: false, error: e.message }; }
+    });
+    ipcMain.handle('update-install', () => {
+        app.isQuittingJarvis = true;
+        autoUpdater.quitAndInstall();
+        return { success: true };
+    });
+}
+
+/* =========================
+   SERVICE WATCHDOG
+
+   Respawn-on-'exit' only catches a service that DIES. On 30 Jul Ollama stopped
+   answering while its process stayed up: 'exit' never fired, so nothing
+   recovered, and two turns were answered with "the Ollama server is not
+   responding" about a server that was still running. Process liveness is not
+   service liveness, so health is decided by probing the endpoint.
+
+   A probe that fails twice in a row triggers one restart, rate-limited so a
+   service that simply takes 30s to come back is not restarted on top of itself.
+========================= */
+const WATCHDOG_INTERVAL_MS = 30000;
+const watchdogs = [];
+let watchdogTimer = null;
+
+function registerWatchdog({ name, probe, heal, failureThreshold = 2, healCooldownMs = 60000 }) {
+    watchdogs.push({
+        name, probe, heal, failureThreshold, healCooldownMs,
+        failures: 0, healthy: true, lastHealAt: 0, healAttempts: 0,
+    });
+}
+
+async function runWatchdogs() {
+    for (const w of watchdogs) {
+        let ok = false;
+        try { ok = !!(await w.probe()); } catch { ok = false; }
+
+        if (ok) {
+            if (!w.healthy) console.log(`Watchdog: ${w.name} recovered`);
+            w.failures = 0;
+            w.healthy = true;
+            continue;
+        }
+
+        w.failures++;
+        if (w.failures < w.failureThreshold) continue;
+
+        if (w.healthy) console.warn(`Watchdog: ${w.name} is not responding`);
+        w.healthy = false;
+
+        if (Date.now() - w.lastHealAt < w.healCooldownMs) continue;
+        w.lastHealAt = Date.now();
+        w.healAttempts++;
+        console.warn(`Watchdog: restarting ${w.name} (attempt ${w.healAttempts})`);
+        try { await w.heal(); } catch (e) {
+            console.warn(`Watchdog: ${w.name} restart failed:`, e.message);
+        }
+    }
+}
+
+function startWatchdogs() {
+    registerWatchdog({
+        name: 'Ollama',
+        probe: () => ollamaAlive(4000),
+        heal: async () => {
+            /* Only kill what we own. A user's tray Ollama or a second Jarvis is
+               not ours to restart, so an unowned instance is left alone and the
+               respawn below simply reuses it if it comes back on its own. */
+            if (ollamaProcess) {
+                try { ollamaProcess.kill(); } catch { /* already gone */ }
+                ollamaProcess = null;
+            }
+            await startOllamaServer();
+        },
+    });
+
+    registerWatchdog({
+        name: 'TTS server',
+        probe: () => portIsOpen(8771),
+        heal: async () => { if (!ttsProcess) startTtsServer(); },
+    });
+
+    registerWatchdog({
+        name: 'STT server',
+        probe: () => portIsOpen(8770),
+        heal: async () => { if (!sttProcess) startSttServer(); },
+    });
+
+    clearInterval(watchdogTimer);
+    watchdogTimer = setInterval(() => {
+        if (!app.isQuittingJarvis) runWatchdogs();
+    }, WATCHDOG_INTERVAL_MS);
+    console.log(`Watchdog active (${watchdogs.length} services, ${WATCHDOG_INTERVAL_MS / 1000}s cadence)`);
+}
+
+/**
+ * Respawn a socket server only if its port is genuinely unserved.
+ *
+ * The old respawn fired unconditionally every 15s and called that harmless,
+ * because the new process just exits again on the port conflict. It is not
+ * harmless: when another instance owns the port — a second Jarvis, or a server
+ * started by hand — this spawns a `uv` process every 15 seconds forever, and
+ * each one resolves a Python environment before dying. Observed doing exactly
+ * that for the whole of this session. If the port answers, the service exists;
+ * whose process it is does not matter.
+ */
+async function respawnIfPortDead(label, port, getProcess, start) {
+    if (app.isQuittingJarvis || getProcess()) return;
+    if (await portIsOpen(port)) {
+        console.log(`${label}: port ${port} already served — not respawning`);
+        return;
+    }
+    start();
+}
+
+/** Liveness for the socket servers: something is accepting connections. */
+function portIsOpen(port, timeoutMs = 2000) {
+    return new Promise((resolve) => {
+        const sock = new net.Socket();
+        const done = (ok) => { sock.destroy(); resolve(ok); };
+        sock.setTimeout(timeoutMs);
+        sock.once('connect', () => done(true));
+        sock.once('timeout', () => done(false));
+        sock.once('error', () => done(false));
+        sock.connect(port, '127.0.0.1');
+    });
+}
+
+/* =========================
    LOCAL STT SERVER (faster-whisper via uv)
    Auto-spawned so voice input needs zero manual steps. If another
    instance already owns port 8770, this one exits harmlessly.
@@ -1933,10 +2144,8 @@ function startSttServer() {
             console.log('STT server exited with code', code);
             sttProcess = null;
             // AUTO-RESPAWN: voice input must survive server crashes.
-            // (Port-conflict exits also land here; the respawn attempt is
-            // harmless — it exits again while another instance owns 8770.)
             if (!app.isQuittingJarvis) {
-                setTimeout(() => { if (!sttProcess) startSttServer(); }, 15000);
+                setTimeout(() => respawnIfPortDead('STT server', 8770, () => sttProcess, startSttServer), 15000);
             }
         });
         console.log('STT server spawning (faster-whisper, port 8770)');
@@ -1965,7 +2174,7 @@ function startTtsServer() {
             ttsProcess = null;
             // AUTO-RESPAWN: same pattern as STT server.
             if (!app.isQuittingJarvis) {
-                setTimeout(() => { if (!ttsProcess) startTtsServer(); }, 15000);
+                setTimeout(() => respawnIfPortDead('TTS server', 8771, () => ttsProcess, startTtsServer), 15000);
             }
         });
         console.log('TTS server spawning (edge-tts, port 8771)');
@@ -2118,24 +2327,14 @@ async function wikipediaSearch(query) {
     return results.filter((r) => r.snippet);
 }
 
-ipcMain.handle('web-search', async (event, query) => {
-    const providers = [
-        ['duckduckgo', ddgHtmlSearch],
-        ['duckduckgo-instant', ddgInstantAnswer],
-        ['wikipedia', wikipediaSearch],
-    ];
-    let lastErr = 'none';
-    for (const [name, fn] of providers) {
-        try {
-            const results = await fn(query);
-            if (results && results.length) return { success: true, provider: name, results };
-        } catch (e) {
-            lastErr = `${name}: ${e.message}`;
-            console.warn(`web-search fell through — ${lastErr}`);
-        }
-    }
-    return { success: false, error: `all providers failed (${lastErr})`, results: [] };
-});
+/* The 'web-search' handler lives further down, in the WEB SEARCH section.
+   An earlier sequential version lived here and registered the same channel,
+   which crashes Electron outright ("Attempted to register a second handler").
+   It is superseded rather than kept: it tried providers in sequence, so it paid
+   every sick provider's timeout before reaching a healthy one, and its first
+   provider was the DuckDuckGo HTML endpoint — measured answering HTTP 202 with
+   a challenge page and zero results. ddgHtmlSearch/ddgInstantAnswer/
+   wikipediaSearch above are now unused by anything. */
 
 /* =========================
    ON-CHAIN DATA SERVICE (read-only)
@@ -3890,6 +4089,362 @@ async function fetchRss(url) {
     if (!res.ok) throw new Error(`rss ${res.status}`);
     return res.text();
 }
+
+/* =========================
+   WEB SEARCH
+
+   Providers are RACED, not chained. A sequential failover pays the full timeout
+   of every sick provider before reaching a healthy one — which is exactly how
+   the old search path reached 51s. hedgedRace starts the next provider after
+   400ms rather than waiting for the previous one to fail, so the answer arrives
+   at the speed of the FASTEST provider rather than the sum of the slow ones.
+
+   createStickyOrder remembers which provider last worked and tries it first, so
+   a steady state costs one request.
+========================= */
+const searchStickyOrder = createStickyOrder();
+const searchCache = new webSearch.SearchCache({ ttlMs: 180000, max: 50 });
+
+/* Wikipedia asks for a descriptive User-Agent and rate-limits anonymous
+   browser-UA traffic — measured: rapid sequential calls started answering
+   "You are making too many requests" mid-probe. */
+const WIKI_UA = 'Jarvis/1.0 (personal assistant; local use)';
+
+/**
+ * Live spelling/entity correction.
+ *
+ * No hardcoded dictionary. The obvious alternative — learn entities from what
+ * Jarvis has already crawled — was tried and measured useless: the 721-item
+ * feed index yields 2652 "entities" that are almost entirely SEC filing
+ * boilerplate (Filer, Filed, AccNo, Financial Statements), and it knows none of
+ * "situational", "dimon", "nvidia" or "aschenbrenner". A dictionary built from
+ * that would make confident wrong corrections.
+ *
+ * Wikipedia's search API knows all of them, live. Measured on the user's real
+ * typos: "situtational awareness" -> "situational awareness", and "jamie
+ * diamond" -> the article "Jamie Dimon", which is an ENTITY fix rather than a
+ * spelling one.
+ */
+/**
+ * Open a connection to each search origin once, so the first real search does
+ * not pay for DNS, TCP and TLS.
+ *
+ * MEASURED, because the cost is larger than it looks: google-news 768ms cold
+ * against 22ms warm, duckduckgo 484ms against 31ms. Those are per-provider, and
+ * providers run in parallel, so a cold search carries roughly the worst of them
+ * as wall-clock.
+ *
+ * Fired ONCE at startup rather than on a timer. Node's default dispatcher was
+ * measured holding connections for at least 45s idle — much longer than the 4s
+ * commonly quoted — so within an active session the sockets stay warm on their
+ * own, and a repeating warmer would be pure unsolicited traffic to third
+ * parties. Wikipedia already rate-limited this app during probing; there is no
+ * case for poking it every 30 seconds on the chance a search is coming.
+ */
+async function warmSearchConnections() {
+    /* Only the GENERAL providers — the three every query asks. The specialised
+       indexes (github, npm, crates, stackoverflow, nvd, arxiv, hackernews,
+       openlibrary) are intent-gated and mostly never used in a given session,
+       so warming them would be startup traffic bought for nothing. */
+    const origins = [
+        ['duckduckgo', 'https://api.duckduckgo.com/?q=jarvis&format=json&no_html=1'],
+        ['wikipedia', 'https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=jarvis&srlimit=1&format=json'],
+        ['google-news', 'https://news.google.com/rss/search?q=jarvis&hl=en-US&gl=US&ceid=US:en'],
+    ];
+
+    const started = Date.now();
+    const settled = await Promise.allSettled(origins.map(async ([id, url]) => {
+        const res = await fetch(url, {
+            headers: { 'User-Agent': WIKI_UA },
+            signal: AbortSignal.timeout(5000),
+        });
+        await res.arrayBuffer();          // drain, or the socket is not returned to the pool
+        if (!res.ok) throw new Error(`${id} HTTP ${res.status}`);
+        return id;
+    }));
+
+    /* Named failures, not just a count: a warm-up that quietly stops working is
+       how a 750ms regression hides. */
+    const ok = settled.filter((s) => s.status === 'fulfilled').length;
+    const failed = settled
+        .map((s, i) => (s.status === 'rejected' ? origins[i][0] : null))
+        .filter(Boolean);
+    console.log(`Search warm-up: ${ok}/${origins.length} origins in ${Date.now() - started}ms`
+        + (failed.length ? ` (failed: ${failed.join(', ')})` : ''));
+}
+
+/* Corrections are far more cacheable than results: a misspelling maps to the
+   same fix for as long as the word is spelled that way, whereas search results
+   go stale in minutes. Hence a 24h TTL here against 3 minutes for results. */
+const correctionCache = new webSearch.SearchCache({ ttlMs: 86400000, max: 500 });
+
+async function suggestCorrection(query) {
+    const cached = correctionCache.get(query);
+    if (cached !== null) return cached.value;   // caches misses too, as {value:null}
+
+    const result = await lookupCorrection(query);
+    correctionCache.set(query, { value: result });
+    return result;
+}
+
+async function lookupCorrection(query) {
+    const url = 'https://en.wikipedia.org/w/api.php?action=query&list=search'
+        + `&srsearch=${encodeURIComponent(query)}&srinfo=suggestion&srlimit=1&format=json&origin=*`;
+    try {
+        const res = await fetch(url, {
+            headers: { 'User-Agent': WIKI_UA, Accept: 'application/json' },
+            signal: AbortSignal.timeout(1500),
+        });
+        if (!res.ok) return null;
+        const data = await res.json();
+
+        // The API's own spelling suggestion is the strongest signal.
+        const spelling = data?.query?.searchinfo?.suggestion;
+        if (spelling) {
+            const verdict = webSearch.shouldApplyCorrection(query, spelling);
+            if (verdict.apply) return { corrected: spelling, ...verdict, kind: 'spelling' };
+        }
+
+        /* Entity resolution: no spelling suggestion, but the top article title
+           is a near-match for the query. This is what turns "jamie diamond"
+           into "Jamie Dimon" — the words are spelled fine, the person is not. */
+        const title = data?.query?.search?.[0]?.title;
+        if (title) {
+            const verdict = webSearch.shouldApplyCorrection(query, title);
+            if (verdict.apply) return { corrected: title, ...verdict, kind: 'entity' };
+        }
+        return null;
+    } catch {
+        return null;   // correction is an enhancement, never a dependency
+    }
+}
+
+/* Local index over what the feed poller has already crawled. Reloaded only
+   when the file changes, so a query costs a BM25 pass and no disk I/O. */
+let feedIndex = { items: [], mtimeMs: 0 };
+
+function loadFeedIndex() {
+    const file = path.join(app.getPath('userData'), 'feed-events.jsonl');
+    try {
+        const stat = fsSync.statSync(file);
+        if (stat.mtimeMs === feedIndex.mtimeMs) return feedIndex.items;
+        const items = [];
+        for (const line of fsSync.readFileSync(file, 'utf-8').split('\n')) {
+            if (!line.trim()) continue;
+            try { items.push(JSON.parse(line)); } catch { /* skip torn line */ }
+        }
+        feedIndex = { items, mtimeMs: stat.mtimeMs };
+        console.log(`Local index: ${items.length} crawled items loaded`);
+    } catch {
+        feedIndex = { items: [], mtimeMs: 0 };   // no feeds yet — not an error
+    }
+    return feedIndex.items;
+}
+
+/**
+ * Read the top result and pull out the sentence that answers the question.
+ *
+ * Strictly budgeted. This runs AFTER the results are already in hand, so every
+ * millisecond it takes is added to a number the user feels — a slow page must
+ * cost the answer, never the search. On timeout the caller simply speaks the
+ * titles it already has.
+ */
+async function readTopResult(results, query, budgetMs = 1500) {
+    const target = (results || []).find((r) => /^https?:\/\//i.test(r.url || '')
+        // News aggregator links are redirect stubs with no article text.
+        && !/news\.google\.com|duckduckgo\.com\/c\//i.test(r.url));
+    if (!target) return null;
+
+    try {
+        const res = await fetch(target.url, {
+            headers: { 'User-Agent': webSearch.BROWSER_UA, Accept: 'text/html' },
+            signal: AbortSignal.timeout(budgetMs),
+            redirect: 'follow',
+        });
+        if (!res.ok) return null;
+        const type = res.headers.get('content-type') || '';
+        if (!/text\/html|text\/plain|application\/xhtml/i.test(type)) return null;
+
+        const text = webSearch.htmlToText(await res.text());
+        const answer = webSearch.extractAnswer(text, query);
+        if (!answer) return null;
+
+        /* Verify before speaking. Extractive answers are much harder to
+           fabricate than generated ones, but truncation and re-assembly can
+           still misrepresent a page — and an unverifiable claim is exactly the
+           failure this feature exists to prevent. */
+        const check = webSearch.verifyAnswer(answer, text);
+        if (!check.verified) {
+            console.warn(`Web search: answer failed verification (${check.overlap}) — not speaking it`);
+            return null;
+        }
+        return { answer, url: target.url, title: target.title, verified: true, overlap: check.overlap };
+    } catch {
+        return null;   // budget exceeded, or the site refused us — not an error
+    }
+}
+
+ipcMain.handle('web-search', async (event, opts) => {
+    /* Accepts a bare query STRING as well as an options object. Both call
+       shapes exist in the renderer: the EDGAR corroboration step passes a
+       string (the original preload signature) while handleWebSearch passes
+       { query, limit }. Reading only opts.query silently turned every
+       string-form call into "empty query" — a broken feature that reported
+       success, which is worse than a crash. */
+    const isString = typeof opts === 'string';
+    const query = String((isString ? opts : opts?.query) || '').trim().slice(0, 200);
+    const limit = Math.min(Math.max(Number(isString ? 6 : opts?.limit) || 6, 1), 10);
+    if (!query) return { success: false, error: 'empty query', results: [] };
+
+    /* Repeats are common — the log shows the same query typed four times in
+       five minutes — and a repeat should cost nothing. */
+    const cached = searchCache.get(query);
+    if (cached) return { ...cached, cached: true, elapsedMs: 0 };
+
+    const braveKey = process.env.BRAVE_API_KEY || null;
+    /* Sticky ordering works on ids, not provider objects: buildProviders returns
+       fresh objects per call, so the identity comparison inside createStickyOrder
+       would never match and the preference would silently do nothing. */
+    const built = webSearch.buildProviders(query, { braveKey });
+    let orderedIds = searchStickyOrder.order('web', built.map((p) => p.id));
+
+    /* Aptness beats stickiness, and must be applied AFTER it. Sticky order is a
+       learned preference for whatever answered last, which is the right default
+       — but it is query-INDEPENDENT, so one "bitcoin price today" would pin the
+       news feed in front for every later question. Measured doing exactly that:
+       "rust async runtime" resolved from the news index in 23ms because a
+       previous timely query had promoted it. */
+    if (webSearch.isTimeSensitive(query)) {
+        orderedIds = ['google-news', ...orderedIds.filter((id) => id !== 'google-news')];
+    } else {
+        orderedIds = orderedIds.filter((id) => id !== 'google-news').concat('google-news');
+    }
+
+    const providers = orderedIds
+        .map((id) => built.find((p) => p.id === id))
+        .filter(Boolean);
+
+    const started = Date.now();
+
+    /* Fired BEFORE the search is awaited, so the correction lookup overlaps the
+       providers instead of adding to them. Not awaited here — only consulted
+       further down, and only if the original query did poorly. */
+    const correctionPromise = suggestCorrection(query);
+    // Nothing may reject unhandled: this promise is often never awaited at all.
+    correctionPromise.catch(() => {});
+
+    const runProvider = async (provider) => {
+        const res = await fetch(provider.url, {
+            headers: provider.headers,
+            signal: AbortSignal.timeout(2500),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const parsed = provider.parse(await res.text(), limit);
+        // An empty parse is a failure, not a result: a challenge page answers
+        // 200, and counting it as "no results" would hide it.
+        if (!parsed.length) throw new Error('returned nothing');
+        return parsed;
+    };
+
+    try {
+        /* GATHER, don't race. Providers here are complementary rather than
+           interchangeable — a Rust question wants the crates.io entry AND the
+           GitHub repo AND the Stack Overflow thread — and a first-wins race
+           discards all but one of them. The deadline keeps this as fast as the
+           race was: slow providers are absent from the answer, never a delay. */
+        const { lists, errors, elapsedMs } = await webSearch.gatherAll(
+            providers, runProvider, { budgetMs: 2000, minProviders: 3 },
+        );
+
+        /* The local index runs alongside, not inside, the network gather: it is
+           a synchronous BM25 pass over already-crawled items, so putting it
+           behind the same deadline would be paying a timeout for a lookup that
+           costs a millisecond. */
+        const localHits = webSearch.bm25Search(loadFeedIndex(), query, { limit });
+        if (localHits.length) lists.unshift({ provider: 'local-index', results: localHits });
+
+        if (!lists.length) throw new Error(errors.join('; ') || 'no provider answered');
+
+        // Remember whichever answered first for next time's ordering.
+        searchStickyOrder.remember('web', lists[0].provider);
+
+        /* RRF over the per-provider lists. Scores across GitHub stars, Stack
+           Overflow votes and news recency are not comparable, so fusion reads
+           rank position only. Falls back to the single list when just one
+           provider answered, where fusion has nothing to fuse. */
+        const fused = webSearch.rrfFuse(lists, {
+            k: 60, limit, weights: webSearch.providerWeights(query),
+        });
+        let results = fused.length
+            ? fused
+            : webSearch.rankResults(
+                webSearch.dedupeResults(lists.flatMap((l) => l.results)), query).slice(0, limit);
+        const item = { id: lists.map((l) => l.provider).join('+') };
+        void elapsedMs;
+
+        /* SPELLING / ENTITY CORRECTION. The lookup was fired before the search
+           and has been running alongside it, so consulting it here costs
+           nothing when the answer is already good.
+
+           Only re-run when the original query did POORLY. Re-searching a query
+           that already worked would double the cost to fix something that was
+           not broken — and the correction is only kept if it actually returned
+           more, so a bad suggestion cannot make results worse. */
+        let correction = null;
+        if (results.length < 3) {
+            correction = await correctionPromise;
+            if (correction) {
+                const retry = await webSearch.gatherAll(
+                    webSearch.buildProviders(correction.corrected, { braveKey }),
+                    runProvider,
+                    { budgetMs: 2000, minProviders: 2 },
+                );
+                const retryFused = webSearch.rrfFuse(retry.lists, {
+                    k: 60, limit, weights: webSearch.providerWeights(correction.corrected),
+                });
+                if (retryFused.length > results.length) {
+                    console.log(`Web search: "${query}" -> "${correction.corrected}" `
+                        + `(${correction.kind}, confidence ${correction.confidence})`);
+                    results = retryFused;
+                } else {
+                    correction = null;   // suggestion did not help — keep the original
+                }
+            }
+        }
+
+        /* An answer, when one is already free. DuckDuckGo's Instant Answer
+           abstract IS the answer and costs nothing extra, so it is preferred
+           over fetching a page. Only when no provider supplied prose is the top
+           result read, and then under a hard budget. */
+        let answer = null;
+        const abstract = results.find((r) => r.snippet && r.snippet.length >= 60);
+        if (abstract) {
+            answer = { answer: abstract.snippet, url: abstract.url, title: abstract.title };
+        } else if (opts?.readPage !== false) {
+            answer = await readTopResult(results, query, 1500);
+        }
+
+        const payload = {
+            success: true,
+            query,
+            // What was actually searched, when it differs from what was said.
+            correction,
+            provider: item.id,
+            elapsedMs: Date.now() - started,
+            results,
+            answer,
+        };
+        searchCache.set(query, payload);
+        return payload;
+    } catch (e) {
+        return {
+            success: false,
+            query,
+            elapsedMs: Date.now() - started,
+            error: e?.message || String(e),
+        };
+    }
+});
 
 ipcMain.handle('get-news', async (event, opts) => {
     const query = String(opts?.query || '').trim().slice(0, 120);

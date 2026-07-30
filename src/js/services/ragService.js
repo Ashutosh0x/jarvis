@@ -46,6 +46,7 @@
 import { adaptiveFusionWeights } from './adaptiveWeights.js';
 import { buildNeighborGraphAsync, expandCandidates } from './docGraph.js';
 import perf from './perf.js';
+import { health } from './selfHeal.js';
 
 const STOPWORDS = new Set(['a', 'an', 'the', 'is', 'are', 'was', 'were', 'be', 'been', 'to', 'of', 'in', 'on', 'at', 'for', 'with', 'and', 'or', 'not', 'it', 'its', 'this', 'that', 'i', 'my', 'me', 'you', 'your', 'we', 'do', 'does', 'did', 'have', 'has', 'had', 'what', 'which', 'who', 'when', 'where', 'how', 'about', 'from', 'by', 'as', 'so']);
 
@@ -301,23 +302,52 @@ class RagService {
     /* ---------- embeddings (optional, local-only) ---------- */
 
     async _embed(texts) {
+        /* Supervised the same way as the reranker, for the same reason: this
+           had a fixed 15s deadline and was measured hitting it exactly (15003ms
+           on 30 Jul). Worse, a single miss latched embedAvailable=false for the
+           rest of the session, so one slow call silently demoted every later
+           query to BM25-only with no path back. The breaker replaces that latch
+           — it still stops calling a broken embedder, but it re-probes and
+           recovers on its own. */
+        const breaker = health.breaker('rag.embed', {
+            threshold: 3, cooldownMs: 120000, maxCooldownMs: 900000,
+        });
+        const budget = health.budget('rag.embed', {
+            min: 3000, max: 45000, initial: 15000, factor: 2,
+        });
+
+        // A hard "not installed" answer is still permanent — no amount of
+        // retrying conjures a model that was never pulled.
         if (this.embedAvailable === false) return null;
+        if (!breaker.allow()) return null;
+
+        const budgetMs = budget.value;
+        const startedAt = Date.now();
         try {
             const res = await fetch(`${this._ollamaUrl()}/api/embed`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ model: 'nomic-embed-text', input: texts }),
-                signal: AbortSignal.timeout(15000),
+                signal: AbortSignal.timeout(budgetMs),
             });
             if (!res.ok) throw new Error(`embed HTTP ${res.status}`);
             const data = await res.json();
             this.embedAvailable = true;
+            budget.record(Date.now() - startedAt);
+            breaker.onSuccess();
             return data.embeddings || null;
         } catch (e) {
-            if (this.embedAvailable === null) {
+            const timedOut = e?.name === 'TimeoutError' || e?.name === 'AbortError';
+            if (timedOut) budget.recordTimeout(budgetMs);
+            breaker.onFailure();
+
+            /* A 404 means the model is genuinely absent; that is worth latching.
+               A timeout means it was slow, which is what the budget and breaker
+               are for — latching on it is what caused the silent demotion. */
+            if (!timedOut && this.embedAvailable === null) {
                 console.warn('RAG: no local embedder (pull nomic-embed-text in Ollama for dense search). BM25-only mode.', e.message);
+                this.embedAvailable = false;
             }
-            this.embedAvailable = false;
             return null;
         }
     }
@@ -585,11 +615,32 @@ class RagService {
      * dependency, so a slow or malformed response must not break recall.
      */
     async _rerank(query, top, limit = RERANK_CANDIDATES) {
+        /* Supervision. Reranking is an enhancement that is allowed to fail
+           silently, which is precisely why it needed watching: between 22 and 30
+           Jul it timed out 32 times in 37 and nothing said so, because falling
+           back to the fused order looks identical to success from the outside.
+           The breaker makes a persistently failing reranker cost 0ms instead of
+           a full budget, and the budget itself now tracks this machine rather
+           than the ~3s the call measured on the day the constant was written. */
+        const breaker = health.breaker('rag.rerank', {
+            threshold: 3, cooldownMs: 120000, maxCooldownMs: 900000,
+        });
+        const budget = health.budget('rag.rerank', {
+            min: 2000, max: 30000, initial: RERANK_TIMEOUT_MS, factor: 2,
+        });
+
+        if (!breaker.allow()) {
+            perf.stage('rag.rerank.skipped', 0);
+            return top;
+        }
+
         const cands = top.slice(0, limit);
         const listing = cands
             .map((r, i) => `[${i + 1}] ${r.text.slice(0, 300)}`)
             .join('\n');
 
+        const budgetMs = budget.value;
+        const startedAt = Date.now();
         try {
             const res = await fetch(`${this._ollamaUrl()}/api/chat`, {
                 method: 'POST',
@@ -608,9 +659,9 @@ class RagService {
                         { role: 'user', content: `Question: ${query}\n\nPassages:\n${listing}` }
                     ]
                 }),
-                signal: AbortSignal.timeout(RERANK_TIMEOUT_MS),
+                signal: AbortSignal.timeout(budgetMs),
             });
-            if (!res.ok) return top;
+            if (!res.ok) { breaker.onFailure(); return top; }
 
             const data = await res.json();
             const order = JSON.parse(data.message?.content || '{}').order;
@@ -627,11 +678,20 @@ class RagService {
                 seen.add(idx);
                 reordered.push(cands[idx]);
             }
-            if (!reordered.length) return top;
+            if (!reordered.length) { breaker.onFailure(); return top; }
             cands.forEach((c, i) => { if (!seen.has(i)) reordered.push(c); });
 
+            budget.record(Date.now() - startedAt);
+            breaker.onSuccess();
             return [...reordered, ...top.slice(limit)];
-        } catch {
+        } catch (e) {
+            /* A deadline miss teaches the budget; anything else (offline model,
+               malformed JSON) does not, since its duration says nothing about
+               how long a working call needs. Both count against the breaker. */
+            if (e?.name === 'TimeoutError' || e?.name === 'AbortError') {
+                budget.recordTimeout(budgetMs);
+            }
+            breaker.onFailure();
             return top; // timeout, offline model, bad JSON — keep lexical order
         }
     }
