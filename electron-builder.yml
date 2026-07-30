@@ -84,7 +84,7 @@ npmRebuild: false
 # to emit that metadata at all.
 publish:
   provider: github
-  owner: ashutosh
+  owner: Ashutosh0x
   repo: jarvis
   releaseType: release
 
@@ -159,6 +159,11 @@ afterSign: scripts/notarize.cjs
 # ------------------------------------------------------------------- Linux --
 linux:
   icon: build/icon.png
+  # .deb and .rpm REQUIRE a maintainer. electron-builder derives it from
+  # package.json `author`, which must be the object form with an email — a
+  # bare "Name" string fails the Linux build with "Please specify author
+  # 'email'". Stated here as well so the two cannot drift apart.
+  maintainer: Ashutosh Kumar Singh <ashutoshkumarsingh0x@gmail.com>
   category: Utility
   synopsis: Local-first desktop assistant
   description: >-
