@@ -133,9 +133,17 @@ jobs:
           CSC_IDENTITY_AUTO_DISCOVERY: ${{ secrets.CSC_LINK && 'true' || 'false' }}
         run: npx electron-builder ${{ matrix.target }} --publish never
 
+      # Chromium's setuid sandbox helper must be root-owned and mode 4755.
+      # dpkg/rpm set that when the package is INSTALLED; the unpacked directory
+      # the smoke test launches has the runner's ownership, and Electron aborts
+      # rather than run unsandboxed. Reproducing the installed permissions tests
+      # the same configuration a user gets, which --no-sandbox would not.
       - name: Smoke test (Linux)
         if: matrix.os == 'ubuntu-latest'
-        run: xvfb-run --auto-servernum node scripts/smoke-test.mjs
+        run: |
+          sudo chown root:root release/linux-unpacked/chrome-sandbox
+          sudo chmod 4755 release/linux-unpacked/chrome-sandbox
+          xvfb-run --auto-servernum node scripts/smoke-test.mjs
 
       - name: Smoke test
         if: matrix.os != 'ubuntu-latest'

@@ -56,6 +56,13 @@ console.log(`smoke: launching ${binary}`);
    still appear to run. */
 const FATAL = /Cannot find module|MODULE_NOT_FOUND|Error: ENOENT.*\.(js|json)|App threw an error during load/;
 
+/* Chromium's setuid sandbox helper needs root:root 4755. A real .deb or .rpm
+   install sets that; a raw linux-unpacked directory straight out of a build
+   does not, so Electron aborts before printing anything of its own. Detected
+   separately because the generic "no startup output" message hid the cause and
+   sent the reader looking for a packaging bug that was not there. */
+const SANDBOX = /SUID sandbox helper binary|chrome-sandbox is owned by root/;
+
 const child = spawn(binary, [], {
     env: { ...process.env, JARVIS_SMOKE_TEST: '1', ELECTRON_ENABLE_LOGGING: '1' },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -96,6 +103,14 @@ const evidence = STARTED.filter((re) => re.test(out));
 console.log(`smoke: exit=${exitCode}, ${out.length} bytes of output, ` +
     `${evidence.length}/${STARTED.length} startup markers`);
 
+if (SANDBOX.test(out)) {
+    console.error('smoke: FAILED — Chromium\'s setuid sandbox is not configured.');
+    console.error('       The packaged .deb/.rpm set this on install; an unpacked');
+    console.error('       build does not. Reproduce the installed permissions with:');
+    console.error(`         sudo chown root:root ${dirname(binary)}/chrome-sandbox`);
+    console.error(`         sudo chmod 4755 ${dirname(binary)}/chrome-sandbox`);
+    process.exit(1);
+}
 if (fatal) {
     console.error(`smoke: FAILED — ${fatal}`);
     console.error(out.slice(0, 4000));
