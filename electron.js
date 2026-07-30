@@ -164,6 +164,16 @@ function createWindow() {
         width: 1200,
         height: 800,
 
+        /* Taskbar and Alt-Tab icon for DEVELOPMENT runs. A packaged build gets
+           its icon embedded in the executable by electron-builder, and build/
+           is not in the packaged files, so the path is checked rather than
+           assumed — it is also absent on a fresh clone until `npm run icon`
+           generates it. Passing a non-existent path logs a warning and shows
+           the default Electron logo, which is what this replaces. */
+        ...(fsSync.existsSync(path.join(__dirname, 'build', 'icon.png'))
+            ? { icon: path.join(__dirname, 'build', 'icon.png') }
+            : {}),
+
         // ✅ Transparency
         transparent: true,
         backgroundColor: '#00000000',

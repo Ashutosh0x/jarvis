@@ -116,8 +116,10 @@ jobs:
       - name: Stub absent platform packages
         run: node scripts/prepare-native-deps.mjs
 
-      - name: Generate the icon
-        run: npm run icon
+      # Both icon sets come from the same artwork. The favicons are committed,
+      # so this also fails CI if someone edits the source without regenerating.
+      - name: Generate icons
+        run: npm run icons
 
       # Unsigned on purpose. A pull request from a fork has no certificate, and
       # build validation must not depend on one.

@@ -111,7 +111,7 @@ jobs:
         run: node scripts/prepare-native-deps.mjs
 
       - name: Generate the icon
-        run: npm run icon
+        run: npm run icons
 
       - name: Build renderer
         run: npm run build
