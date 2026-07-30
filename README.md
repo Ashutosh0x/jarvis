@@ -370,6 +370,7 @@ trusted with one and a wrong figure stated confidently is worse than no answer.
 - **A name against its peers** — `sectorMove.js`: how much of a move the sector
   explains and how much belongs to the company
 - SEC filings through a pinned fetch guard, `edgarGuard.js`
+- **Disclosure venues beyond EDGAR** — see below
 - Headlines from Google News with Bing failover, keyless
 
 Three choices in here are load-bearing rather than incidental.
@@ -417,6 +418,42 @@ minimum-variance solution is surfaced rather than clipped — "hold none" and
 Both modules state their limits instead of implying them with a null. A holding
 that only listed three weeks ago truncates every other series to match; the
 analysis names it and says that dropping it would widen the window.
+
+---
+
+### Disclosure venues beyond EDGAR
+
+The memory industry is mostly not American, so an EDGAR-only assistant answers
+"no filings" for half of it and is wrong every time. `edgarGuard.js` carries a
+venue registry naming where each issuer's filings actually live, and every
+entry records the date it was checked rather than a permanent claim.
+
+| Issuer | Venue | Reachable how |
+| --- | --- | --- |
+| Micron, Sandisk, Western Digital | SEC EDGAR | Atom feeds, keyless, declared User-Agent |
+| SK hynix | Both — SEC since 9 Jul 2026, and DART | 6-K and 424B4 on EDGAR; business reports on DART |
+| Samsung Electronics | Korea's DART | Open API, free key required |
+| CXMT | Shanghai STAR Market since 27 Jul 2026 | HTML announcements only |
+| YMTC | None — privately held | No public filings of any kind |
+
+Probed live on 30 July 2026, because pasted endpoint lists have been wrong
+repeatedly in this project:
+
+- **HKEX** publishes real RSS. Two feeds are wired and return 25 parsed items
+  each. They are exchange-wide, not per-company.
+- **DART** advertises no RSS anywhere. Its Open API is real and returns clean
+  JSON, but rejects unregistered callers with `{"status":"010"}`. The key is
+  free, so this follows the Alchemy and Helius pattern: dormant without one,
+  and it says so rather than failing obscurely.
+- **SSE** serves announcements as HTML only — no feed, no public API.
+- **SZSE** does not complete a fetch from here at all.
+
+The registry exists because of a specific failure. Its first version asserted
+that CXMT was "a private Chinese DRAM maker with no US listing." That was true
+when written and false three days later: CXMT listed on the STAR Market on
+27 July 2026, rose 466% on debut, and now trades as `688825.SS`. A registry
+that hardcodes a company's status will state a falsehood the moment that status
+changes, so entries carry a venue and a checked-on date instead.
 
 ---
 

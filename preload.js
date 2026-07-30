@@ -110,6 +110,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     getHistory: (opts) => ipcRenderer.invoke('get-history', opts),
     getSectorMove: (opts) => ipcRenderer.invoke('get-sector-move', opts),
     getPortfolioSeries: (opts) => ipcRenderer.invoke('get-portfolio-series', opts),
+    dartFilings: (opts) => ipcRenderer.invoke('dart-filings', opts),
     // Security advisories: Chrome Releases RSS + NVD, both keyless. Exists so
     // CVE answers come from an advisory rather than from the model.
     // Continuous ingestion: fetch verified feeds, record events with provenance

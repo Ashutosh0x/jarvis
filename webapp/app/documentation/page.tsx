@@ -91,6 +91,7 @@ const toc = [
   { id: "memory", label: "Cognitive memory" },
   { id: "evaluation", label: "Evaluation" },
   { id: "finance", label: "Finance & quant" },
+  { id: "venues", label: "Disclosure venues" },
   { id: "portfolio", label: "Peer & portfolio risk" },
   { id: "onchain", label: "On-chain reads" },
   { id: "whales", label: "Real-time whale stream" },
@@ -433,7 +434,42 @@ blackScholes(S, K, T, sigma, r)  // price + delta/gamma/vega/theta`}</Code>
             </p>
           </Section>
 
-          <Section id="portfolio" eyebrow="09" title="Peer & portfolio risk">
+          <Section id="venues" eyebrow="09" title="Disclosure venues beyond EDGAR">
+            <p>
+              The memory industry is mostly not American, so an EDGAR-only assistant answers
+              &quot;no filings&quot; for half of it and is wrong every time. A venue registry names
+              where each issuer&apos;s filings actually live, and every entry records the date it
+              was checked rather than a permanent claim.
+            </p>
+            <Table
+              head={["Issuer", "Venue", "Reachable how"]}
+              rows={[
+                ["Micron, Sandisk, WDC", "SEC EDGAR", "Atom feeds, keyless, declared User-Agent"],
+                ["SK hynix", "Both — SEC since 9 Jul 2026, and DART", "6-K and 424B4 on EDGAR; business reports on DART"],
+                ["Samsung Electronics", "Korea's DART", "Open API, free key required"],
+                ["CXMT", "Shanghai STAR Market since 27 Jul 2026", "HTML announcements only"],
+                ["YMTC", "None — privately held", "No public filings of any kind"],
+              ]}
+            />
+            <p>
+              Probed live on 30 July 2026. <strong className="text-foreground">HKEX</strong> publishes
+              real RSS — two feeds are wired, 25 parsed items each, exchange-wide rather than
+              per-company. <strong className="text-foreground">DART</strong> advertises no RSS
+              anywhere; its Open API returns clean JSON but rejects unregistered callers with
+              <Term>{'{"status":"010"}'}</Term>, so it is dormant until a free key is saved.
+              <strong className="text-foreground"> SSE</strong> serves HTML only.
+              <strong className="text-foreground"> SZSE</strong> does not complete a fetch at all.
+            </p>
+            <p>
+              The registry exists because of a specific failure. Its first version asserted CXMT
+              was &quot;a private Chinese DRAM maker with no US listing.&quot; That was true when written
+              and false three days later: CXMT listed on the STAR Market on 27 July 2026, rose
+              466% on debut, and now trades as <Term>688825.SS</Term>. An entry that hardcodes a
+              company&apos;s status will state a falsehood the moment that status changes.
+            </p>
+          </Section>
+
+          <Section id="portfolio" eyebrow="10" title="Peer & portfolio risk">
             <p>
               Two questions single-security metrics cannot answer. The first is how much of a
               move belongs to the sector and how much to the company; the second is where the
@@ -470,7 +506,7 @@ portfolioTailRisk(w, returns)    // the book's own VaR, not a sum`}</Code>
             </p>
           </Section>
 
-          <Section id="onchain" eyebrow="10" title="On-chain reads">
+          <Section id="onchain" eyebrow="11" title="On-chain reads">
             <p>
               The same rule applies to blockchain data: converting a wei balance to ETH, or
               a raw token amount to a human figure, is exact BigInt arithmetic — never an
@@ -511,7 +547,7 @@ portfolioTailRisk(w, returns)    // the book's own VaR, not a sum`}</Code>
             </p>
           </Section>
 
-          <Section id="whales" eyebrow="11" title="Real-time whale stream">
+          <Section id="whales" eyebrow="12" title="Real-time whale stream">
             <p>
               A websocket subscription to new block headers. Every confirmed block is
               scanned for large movements, and every figure announced is read out of that
@@ -569,7 +605,7 @@ portfolioTailRisk(w, returns)    // the book's own VaR, not a sum`}</Code>
             </p>
           </Section>
 
-          <Section id="issuance" eyebrow="12" title="Stablecoin issuance">
+          <Section id="issuance" eyebrow="13" title="Stablecoin issuance">
             <p>
               A mint is a transfer <em>from</em> the zero address; a burn is a transfer{" "}
               <em>to</em> it. That makes supply changes one of the few pieces of market
@@ -589,7 +625,7 @@ portfolioTailRisk(w, returns)    // the book's own VaR, not a sum`}</Code>
             </p>
           </Section>
 
-          <Section id="providers" eyebrow="13" title="Provider keys">
+          <Section id="providers" eyebrow="14" title="Provider keys">
             <p>
               Every key is optional. Without any, JARVIS reads public endpoints and says so;
               with them, it sees more and still says exactly what it can and cannot reach.
@@ -626,7 +662,7 @@ portfolioTailRisk(w, returns)    // the book's own VaR, not a sum`}</Code>
             </p>
           </Section>
 
-          <Section id="tracer" eyebrow="14" title="Fund-flow tracer">
+          <Section id="tracer" eyebrow="15" title="Fund-flow tracer">
             <p>
               A deterministic fund-tracing engine implements the core of TRacer (KDD &apos;22):
               Approximate Personalized PageRank, forward-biased to follow where money goes.
@@ -647,7 +683,7 @@ detectConsistentChains(...)   // structurally coherent paths`}</Code>
             </p>
           </Section>
 
-          <Section id="companion" eyebrow="15" title="Android companion">
+          <Section id="companion" eyebrow="16" title="Android companion">
             <p>
               The companion pairs over Wi-Fi and mirrors the same voice interface to a
               phone. Discovery is by mDNS; the link is a token-authenticated WebSocket with a
@@ -661,7 +697,7 @@ detectConsistentChains(...)   // structurally coherent paths`}</Code>
             </p>
           </Section>
 
-          <Section id="ports" eyebrow="16" title="Network ports">
+          <Section id="ports" eyebrow="17" title="Network ports">
             <p>
               Every listener binds locally or to the LAN. None is exposed to the internet.
             </p>
@@ -677,7 +713,7 @@ detectConsistentChains(...)   // structurally coherent paths`}</Code>
             />
           </Section>
 
-          <Section id="privacy" eyebrow="17" title="Privacy model">
+          <Section id="privacy" eyebrow="18" title="Privacy model">
             <p>
               Privacy is the architecture, not a setting. Your microphone, screen captures,
               and conversations stay on local disk because there is no provider server to
@@ -700,7 +736,7 @@ detectConsistentChains(...)   // structurally coherent paths`}</Code>
             </p>
           </Section>
 
-          <Section id="install" eyebrow="18" title="Install & run">
+          <Section id="install" eyebrow="19" title="Install & run">
             <p>
               Clone the repository, install dependencies, and pull two local models. The
               whole assistant boots from one command.

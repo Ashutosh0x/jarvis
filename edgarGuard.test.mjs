@@ -172,5 +172,50 @@ check('path: a sibling route sharing the prefix is refused',
         buildCompanyFeedUrl({ cik: '1652044', type: 'SC 13G' }).url.includes('type=SC+13G'));
 }
 
+/* --- disclosure venues -------------------------------------------------------
+   EDGAR is one venue among several. These entries exist so "show me CXMT's
+   filings" gets the real answer instead of "no SEC filings", which is true and
+   useless.
+
+   The CXMT case is the reason each entry carries a checked-on date: the first
+   version of this registry asserted CXMT was privately held, and it listed on
+   the Shanghai STAR Market three days later. */
+{
+    const { disclosureVenue, DISCLOSURE_VENUES } = require('./edgarGuard');
+
+    const cxmt = disclosureVenue('CXMT');
+    check('venues: CXMT resolves', !!cxmt);
+    check('venues: CXMT is no longer described as private',
+        !/private/i.test(cxmt.venue) && !/private/i.test(cxmt.how || ''), cxmt.venue);
+    check('venues: CXMT points at the Shanghai STAR Market', /STAR/i.test(cxmt.venue), cxmt.venue);
+    check('venues: CXMT carries the ticker its prices come from', cxmt.ticker === '688825.SS', cxmt.ticker);
+    check('venues: CXMT is still not an SEC registrant', cxmt.secRegistrant === false);
+    check('venues: CXMT records when it listed', cxmt.listedSince === '2026-07-27', cxmt.listedSince);
+
+    const ymtc = disclosureVenue('YMTC');
+    check('venues: YMTC is the genuinely unlisted case', /none/i.test(ymtc.venue) && ymtc.ticker === null);
+
+    const sam = disclosureVenue('SAMSUNG');
+    check('venues: Samsung points at DART, not at the SEC',
+        /DART/i.test(sam.venue) && sam.secRegistrant === false);
+    check('venues: Samsung carries its Seoul ticker', sam.ticker === '005930.KS');
+    check('venues: the DART key requirement is stated up front', /key/i.test(sam.how));
+
+    const skhy = disclosureVenue('SKHY');
+    check('venues: SK hynix is recorded as filing in BOTH places',
+        skhy.secRegistrant === true && /DART/i.test(skhy.venue), skhy.venue);
+    check('venues: SK hynix carries its CIK', skhy.cik === '2120882');
+    check('venues: the wrong ADR ticker is redirected, not silently accepted',
+        /SKHY/.test(disclosureVenue('SKHYY').venue));
+
+    check('venues: an ordinary registrant has no entry, which is not the same as no filings',
+        disclosureVenue('MU') === null && disclosureVenue('AAPL') === null);
+    check('venues: empty input is safe', disclosureVenue('') === null && disclosureVenue(null) === null);
+    check('venues: every entry records when it was checked',
+        Object.values(DISCLOSURE_VENUES).every((v) => /^\d{4}-\d{2}-\d{2}$/.test(v.checked)));
+    check('venues: every entry names a venue and how to reach it',
+        Object.values(DISCLOSURE_VENUES).every((v) => v.venue && v.how));
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

@@ -128,41 +128,80 @@ const ALLOWED_FORMS = new Set([
 ]);
 
 /* ---------------------------------------------------------------------------
-   ISSUERS THAT DO NOT FILE WITH THE SEC.
+   WHERE AN ISSUER'S FILINGS ACTUALLY LIVE.
 
-   Verified against company_tickers.json (10,432 registrants) on 30 Jul 2026:
-   ChangXin Memory (CXMT) and Samsung Electronics have NO SEC registrant at all,
-   and 'SKHYY' — the ADR ticker most sources print for SK hynix — is absent even
-   though SK hynix itself now files under CIK 2120882 as SKHY/HXSCL.
+   EDGAR is one venue among several, and "not an SEC registrant" is a statement
+   about the SEC rather than about the company. A reader asking for CXMT's
+   filings is not helped by being told which database does not have them.
 
-   Returning "no filings" for these is true but useless, and inviting a model to
-   fill the silence is how a plausible fabrication gets spoken aloud. Naming the
-   real disclosure venue is the honest answer to "show me CXMT's filings".
+   This entry began life as a NON_SEC_ISSUERS list asserting that CXMT was "a
+   private Chinese DRAM maker with no US listing". That was true when it was
+   written and became false three days later: CXMT listed on the Shanghai STAR
+   Market on 27 Jul 2026, rose 466% on debut, and now trades as 688825.SS —
+   verified against live quotes, which show the 27 Jul open at CNY 49 against
+   an offer price of 8.66. A registry that hardcodes "private" is a registry
+   that will state a falsehood the moment a company lists, so each entry now
+   records a venue and the date it was checked instead of a permanent claim.
+
+   Checked 30 Jul 2026 against SEC company_tickers.json (10,432 registrants),
+   live DART and SSE endpoints, and live quotes.
 --------------------------------------------------------------------------- */
-const NON_SEC_ISSUERS = {
+const DISCLOSURE_VENUES = {
     CXMT: {
         name: 'ChangXin Memory Technologies',
-        why: 'a private Chinese DRAM maker with no US listing',
-        disclosure: 'Chinese regulatory filings and its STAR Market listing process; no EDGAR presence',
+        venue: 'Shanghai Stock Exchange, STAR Market',
+        ticker: '688825.SS',
+        secRegistrant: false,
+        listedSince: '2026-07-27',
+        how: 'SSE disclosure platform. No RSS and no public API — announcements are HTML only.',
+        checked: '2026-07-30',
+    },
+    YMTC: {
+        name: 'Yangtze Memory Technologies',
+        venue: 'none — privately held',
+        ticker: null,
+        secRegistrant: false,
+        how: 'No public filings of any kind. Capacity and roadmap figures come from industry research and are estimates, not disclosures.',
+        checked: '2026-07-30',
     },
     SAMSUNG: {
         name: 'Samsung Electronics',
-        why: 'listed in Seoul (005930.KS), not registered with the SEC',
-        disclosure: 'KRX/DART filings in Korea',
+        venue: "Korea's DART, operated by the Financial Supervisory Service",
+        ticker: '005930.KS',
+        secRegistrant: false,
+        how: 'DART Open API. Free key required; without one the endpoint returns status 010, an unregistered-key error, rather than data.',
+        checked: '2026-07-30',
     },
     SKHYY: {
         name: 'SK hynix',
-        why: 'this ADR ticker is not the SEC registrant',
-        disclosure: 'SK hynix files under CIK 2120882 — use SKHY or HXSCL',
+        venue: 'wrong ticker — the SEC registrant is SKHY / HXSCL under CIK 2120882',
+        ticker: 'SKHY',
+        secRegistrant: false,
+        how: 'Use SKHY. This ADR ticker appears in press coverage but is absent from the SEC ticker file.',
+        checked: '2026-07-30',
+    },
+    SKHY: {
+        name: 'SK hynix',
+        venue: 'both — DART in Korea and the SEC since its US listing',
+        ticker: 'SKHY',
+        secRegistrant: true,
+        cik: '2120882',
+        listedSince: '2026-07-09',
+        how: 'SEC filings are 6-K and the 424B4 prospectus, as a foreign private issuer; the Korean annual and quarterly business reports remain on DART.',
+        checked: '2026-07-30',
     },
 };
 
-/** @returns {{name, why, disclosure}|null} */
-function nonSecIssuer(symbolOrName) {
+/**
+ * @returns {{name, venue, ticker, secRegistrant, how, checked}|null}
+ *   null means "no entry", which is NOT the same as "no filings" — most
+ *   issuers are ordinary SEC registrants and need no special case.
+ */
+function disclosureVenue(symbolOrName) {
     const k = String(symbolOrName || '').trim().toUpperCase();
     if (!k) return null;
-    if (NON_SEC_ISSUERS[k]) return NON_SEC_ISSUERS[k];
-    for (const [key, v] of Object.entries(NON_SEC_ISSUERS)) {
+    if (DISCLOSURE_VENUES[k]) return DISCLOSURE_VENUES[k];
+    for (const [key, v] of Object.entries(DISCLOSURE_VENUES)) {
         if (k.includes(key) || v.name.toUpperCase().includes(k)) return v;
     }
     return null;
@@ -208,6 +247,6 @@ module.exports = {
     checkSecDocumentUrl, SEC_DOC_HOST, SEC_DOC_PATH,
     SEC_DOC_MAX_BYTES: 12 * 1024 * 1024,
     buildCompanyFeedUrl, SEC_BROWSE_HOST, ALLOWED_FORMS,
-    NON_SEC_ISSUERS, nonSecIssuer,
+    DISCLOSURE_VENUES, disclosureVenue,
     SEC_TICKERS_URL, SEC_TICKERS_MAX_BYTES: 4 * 1024 * 1024,
 };

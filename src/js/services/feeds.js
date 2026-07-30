@@ -33,6 +33,27 @@ export const FEEDS = [
 
     // --- finance: SEC requires a declared User-Agent -------------------------
     { id: 'sec-8k', domain: 'finance', title: 'SEC latest 8-K filings', url: 'https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&company=&dateb=&owner=include&count=40&output=atom', verified: true, items: 40, needsUserAgent: true },
+
+    /* --- Hong Kong Exchange (probed 30 Jul 2026) ----------------------------
+       EDGAR is not the only disclosure venue, and the memory complex is mostly
+       NOT American: Samsung and SK hynix report to Korea's DART, CXMT to the
+       Shanghai Stock Exchange. Of the non-US venues, HKEX is the only one that
+       publishes a real feed, and these two return 200 with text/xml. The raw
+       XML looks like 50 entries; parseFeed yields 25, and 25 is what is
+       recorded — the declared count is what the parser produces, not what a
+       tag count suggests.
+
+       WHAT THE OTHER VENUES ACTUALLY DO, so nobody re-tests them hopefully:
+         DART   no RSS anywhere on the English site. Its Open API is real and
+                returns clean JSON, but every call needs a free registered key —
+                without one it answers {"status":"010"}, an unregistered-key
+                error. Wired separately, gated on that key.
+         SSE    announcements are HTML only. No RSS, no public API.
+         SZSE   the fetch does not complete at all from here.
+       Neither HKEX feed is per-company; they are exchange-wide, which is why
+       they sit in the general feed rotation rather than behind a ticker. */
+    { id: 'hkex-news', domain: 'finance', title: 'HKEX news releases', url: 'https://www.hkex.com.hk/Services/RSS-Feeds/News-Releases?sc_lang=en', verified: true, items: 25 },
+    { id: 'hkex-regulatory', domain: 'finance', title: 'HKEX regulatory announcements', url: 'https://www.hkex.com.hk/Services/RSS-Feeds/regulatory-announcements?sc_lang=en', verified: true, items: 25 },
     { id: 'sec-xbrl', domain: 'finance', title: 'SEC XBRL financial filings', url: 'https://www.sec.gov/Archives/edgar/xbrlrss.all.xml', verified: true, items: 200, needsUserAgent: true, heavy: true },
 
     /* --- SEC newsroom and enforcement (probed 22 Jul 2026) -------------------

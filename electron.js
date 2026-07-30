@@ -3771,6 +3771,71 @@ ipcMain.handle('get-portfolio-series', async (event, opts) => {
     }
 });
 
+/* =========================
+   KOREA — DART, the Financial Supervisory Service's filing system.
+
+   The memory complex is mostly not American. Samsung Electronics has no SEC
+   registrant at all, and SK hynix's Korean business reports live here rather
+   than in its US 6-K filings, so an EDGAR-only assistant answers "no filings"
+   for two of the four largest players and is wrong twice.
+
+   KEYED, unlike every other disclosure source here. DART publishes no RSS —
+   confirmed against the English site, which advertises none — and its Open API
+   rejects unregistered callers with {"status":"010"}. The key is free, so this
+   follows the Alchemy and Helius pattern: dormant without one, and it says so
+   rather than failing obscurely.
+
+   Corp codes are DART's own eight-digit identifiers, not tickers. There is a
+   bulk corpCode.xml download to resolve arbitrary names; these two are pinned
+   because they are the ones the memory work actually asks for.
+========================= */
+const DART_CORP_CODES = { '005930.KS': '00126380', SAMSUNG: '00126380', '000660.KS': '00164779', SKHYNIX: '00164779' };
+
+ipcMain.handle('dart-filings', async (event, opts) => {
+    const key = await getCredential('dart_api_key');
+    if (!key) {
+        return {
+            success: false,
+            error: 'DART needs a free API key. Register at opendart.fss.or.kr and save it as dart_api_key.',
+            dormant: true,
+        };
+    }
+    const raw = String(opts?.company || opts?.symbol || '').trim().toUpperCase();
+    const corp = DART_CORP_CODES[raw] || (/^\d{8}$/.test(raw) ? raw : null);
+    if (!corp) {
+        return { success: false, error: `no DART corp code known for ${raw || 'that company'}` };
+    }
+    /* Dates are YYYYMMDD with no separators, and the API rejects a range wider
+       than three months on a single call. */
+    const end = (opts?.end || new Date().toISOString().slice(0, 10)).replace(/-/g, '');
+    const begin = (opts?.begin || new Date(Date.now() - 89 * 864e5).toISOString().slice(0, 10)).replace(/-/g, '');
+    const url = `https://opendart.fss.or.kr/api/list.json?crtfc_key=${encodeURIComponent(key)}`
+        + `&corp_code=${corp}&bgn_de=${begin}&end_de=${end}&page_count=50`;
+    try {
+        const res = await fetch(url, { signal: AbortSignal.timeout(20000), redirect: 'error' });
+        if (!res.ok) throw new Error(`http ${res.status}`);
+        const data = await res.json();
+        /* DART reports failure in the BODY with HTTP 200, so status has to be
+           read rather than inferred from the response code. 013 is "no data",
+           which is an answer and not an error. */
+        if (data.status === '013') return { success: true, corp, filings: [], note: 'no filings in that window' };
+        if (data.status !== '000') {
+            return { success: false, error: `DART status ${data.status}: ${data.message || 'unknown'}` };
+        }
+        return {
+            success: true,
+            corp,
+            filings: (data.list || []).map((f) => ({
+                name: f.report_nm, date: f.rcept_dt, filer: f.flr_nm, corpName: f.corp_name,
+                receipt: f.rcept_no,
+                url: `https://dart.fss.or.kr/dsaf001/main.do?rcpNo=${f.rcept_no}`,
+            })),
+        };
+    } catch (error) {
+        return { success: false, error: error.message };
+    }
+});
+
 // Keyless news via RSS. RSS is used deliberately over scraping a news site's
 // HTML: it is a stable, structured contract with real per-item timestamps and
 // source attribution, which snippet scraping cannot give.
