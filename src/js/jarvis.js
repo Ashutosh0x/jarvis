@@ -9,12 +9,17 @@ import { routePhoneCommand, targetsPhone, executePhoneTool } from './services/ph
 import ragService from './services/ragService.js';
 import reflectionService from './services/reflectionService.js';
 import * as quant from './services/quant.js';
+import * as portfolio from './services/portfolio.js';
 import * as onchain from './services/onchain.js';
 import * as ens from './services/ens.js';
 import * as chainIntel from './services/chainIntel.js';
 import * as prediction from './services/predictionMarkets.js';
 import * as security from './services/security.js';
 import * as feeds from './services/feeds.js';
+import { parseEdgarQuery, buildSearchUrl as buildEdgarUrl, parseSearchResults as parseEdgarResults, describeResults as describeEdgarResults, toMemoryText as edgarMemoryText } from './services/edgarSearch.js';
+import * as edgarCompany from './services/edgarCompany.js';
+import * as secSections from './services/secSections.js';
+import * as investigation from './services/investigation.js';
 import * as feedback from './services/feedback.js';
 import { parseOndoQuery, ONDO_COUNT, HOT_LIST as ONDO_HOT_LIST } from './services/ondoRegistry.js';
 import * as netInspect from './services/netInspect.js';
@@ -22,6 +27,7 @@ import * as netDiscovery from './services/netDiscovery.js';
 import * as sysInspect from './services/sysInspect.js';
 import * as inputControl from './services/inputControl.js';
 import { LocalVoiceService } from './services/voiceService.js';
+import { NeuralTTSService } from './services/ttsService.js';
 import { guardOutput } from './services/groundingGuard.js';
 import { config } from '../config.js';
 import perf from './services/perf.js';
@@ -34,6 +40,7 @@ class Jarvis {
         this.recognition = null;
         this.synthesis = window.speechSynthesis;
         this.selectedVoice = null; // Will be set during initialization
+        this.neuralTTS = null;     // edge-tts neural voice (initialized below)
         // API key now loaded exclusively from settings system
         this.openWeatherApiKey = null;
         this.location = null;
@@ -70,7 +77,16 @@ class Jarvis {
                 onTranscript: (text, meta) => this._handleVoiceTranscript(text, meta),
                 onVolume: (v) => { window.visualizerVolume = v; },
                 onStatus: (s) => this._onVoiceStatus(s),
-                isTtsSpeaking: () => this.ttsActive,
+                // Gate mic while EITHER SAPI or neural TTS is speaking
+                isTtsSpeaking: () => this.ttsActive || (this.neuralTTS && this.neuralTTS.isSpeaking()),
+                // Barge-in is only offered while the neural voice is carrying
+                // the reply. It plays through WebAudio, so Chromium's echo
+                // canceller has a reference for it and what reaches the mic is
+                // residual. SAPI plays out of process with no reference at all:
+                // there the mic hears the reply at full strength and no
+                // threshold can separate it from the user.
+                canBargeIn: () => !!(this.neuralTTS && this.neuralTTS.isSpeaking()),
+                onBargeIn: () => this._onBargeIn(),
             });
             setTimeout(() => {
                 this.localVoice.start().catch(e => {
@@ -79,6 +95,30 @@ class Jarvis {
                 });
             }, 1500);
         }
+
+        // Neural TTS: natural-sounding voice through WebAudio, which also
+        // gives Chromium's echo canceller a proper reference signal (SAPI
+        // plays out of process and bypasses it entirely).
+        //
+        // NOT LOCAL. server/tts-server.py uses edge-tts, which streams the
+        // text to Microsoft's endpoint and streams MP3 back. Every sentence
+        // Jarvis speaks leaves the machine, and with no network there is no
+        // neural voice. That is the opposite of what the rest of this build
+        // guarantees, so it is stated here rather than buried: the SAPI path
+        // below is the offline voice, and the fallback is what keeps the
+        // offline promise true when this is unreachable.
+        //
+        // Connects asynchronously — if the TTS server is not running, speak()
+        // falls back to SAPI transparently.
+        this.neuralTTS = new NeuralTTSService({
+            onSpeakStart: () => { this.ttsActive = true; },
+            onSpeakEnd: () => { this.ttsActive = false; },
+            onStatus: (s) => console.log('NeuralTTS:', s),
+        });
+        this.neuralTTS.connect().then(ok => {
+            if (ok) console.log('NeuralTTS: edge-tts connected — natural voice active (NOT local)');
+            else console.log('NeuralTTS: server unavailable — using SAPI fallback');
+        }).catch(() => {});
 
         // Live Service (Gemini Multimodal Live)
         this.liveService = new LiveService();
@@ -852,61 +892,103 @@ class Jarvis {
             // mic picks up the very first words.
             this._rememberSpoken(clean);
 
-            // Flush the queue: the newest information wins
-            this.synthesis.cancel();
-            this._flushSpeechQueue();
-
-            /* Multi-sentence answers go through the paced queue so they get the
-               same breathing room as streamed ones. A whale alert is three
-               facts — amount, both parties, the block — and running them
-               together is what makes the delivery feel rushed. Single-sentence
-               answers keep the direct path below, including its resume() nudge
-               for Chromium's long-utterance pause bug. */
-            const sentences = clean.match(/[^.!?]+[.!?]+(\s|$)|[^.!?]+$/g)?.map(s => s.trim()).filter(Boolean) || [];
-            if (sentences.length > 1) {
+            // ──────────────────────────────────────────────────────────────
+            // NEURAL TTS (edge-tts): try first for natural-sounding voice.
+            // Routes audio through WebAudio, giving Chromium's AEC a proper
+            // reference signal. Falls back to SAPI if server unavailable.
+            // ──────────────────────────────────────────────────────────────
+            if (this.neuralTTS && this.neuralTTS.isAvailable()) {
                 this.ttsActive = true;
-                this._utterCount = sentences.length;
-                this._speechQueue = sentences;
-                this._drainSpeech();
+                // Interrupt any in-progress speech
+                this.neuralTTS.interrupt();
+                this.synthesis.cancel();
+                this._flushSpeechQueue();
+
+                const maxMs = Math.min(clean.split(/\s+/).length * 450 + 5000, 60000);
+                clearTimeout(this._ttsSafetyTimer);
+                this._ttsSafetyTimer = setTimeout(() => { this.ttsActive = false; }, maxMs);
+
+                this.neuralTTS.speak(clean, {
+                    voice: this.settings.get('neuralVoice') || 'en-US-GuyNeural',
+                    speed: this.settings.get('speechRate') || 1.0
+                }).then((ok) => {
+                    clearTimeout(this._ttsSafetyTimer);
+                    this.ttsActive = false;
+                    if (!ok) {
+                        // Neural TTS failed mid-flight, fall back to SAPI
+                        console.warn('NeuralTTS: failed, falling back to SAPI');
+                        this._speakSAPI(clean);
+                    }
+                }).catch(() => {
+                    clearTimeout(this._ttsSafetyTimer);
+                    this.ttsActive = false;
+                });
                 return;
             }
 
-            const utterance = new SpeechSynthesisUtterance(clean);
-            if (this.selectedVoice) utterance.voice = this.selectedVoice;
-            utterance.rate = this.settings.get('speechRate') || 1.0;
-            utterance.pitch = this.settings.get('speechPitch') || 1.0;
-            utterance.volume = this.settings.get('speechVolume') || 1.0;
-
-            // Explicit TTS-active flag for the mic gate. Never trust
-            // synthesis.speaking — Chromium can leave it stuck true forever,
-            // which would permanently deafen the voice loop.
-            this.ttsActive = true;
-            // Safety net: force-clear even if onend never fires (~400ms/word)
-            const maxMs = Math.min(clean.split(/\s+/).length * 450 + 3000, 30000);
-            clearTimeout(this._ttsSafetyTimer);
-            this._ttsSafetyTimer = setTimeout(() => { this.ttsActive = false; }, maxMs);
-
-            // Chromium bug workaround: synthesis silently pauses on long
-            // utterances (~15s). Nudge it with resume() while speaking.
-            const resumeTimer = setInterval(() => {
-                if (this.synthesis.speaking) this.synthesis.resume();
-                else clearInterval(resumeTimer);
-            }, 10000);
-            utterance.onstart = () => { this.ttsActive = true; };
-            utterance.onend = () => {
-                clearInterval(resumeTimer);
-                this.ttsActive = false;
-            };
-            utterance.onerror = (e) => {
-                clearInterval(resumeTimer);
-                this.ttsActive = false;
-                console.warn('TTS error:', e.error);
-            };
-
-            this.synthesis.speak(utterance);
+            // ──────────────────────────────────────────────────────────────
+            // SAPI FALLBACK: used when the neural TTS server is unavailable
+            // ──────────────────────────────────────────────────────────────
+            this._speakSAPI(clean);
         } catch (e) {
             console.warn('TTS unavailable:', e);
         }
+    }
+
+    /** SAPI TTS fallback — the original speak path, preserved for resilience. */
+    _speakSAPI(clean) {
+        // Flush the queue: the newest information wins
+        this.synthesis.cancel();
+        this._flushSpeechQueue();
+
+        /* Multi-sentence answers go through the paced queue so they get the
+           same breathing room as streamed ones. A whale alert is three
+           facts — amount, both parties, the block — and running them
+           together is what makes the delivery feel rushed. Single-sentence
+           answers keep the direct path below, including its resume() nudge
+           for Chromium's long-utterance pause bug. */
+        const sentences = clean.match(/[^.!?]+[.!?]+(\s|$)|[^.!?]+$/g)?.map(s => s.trim()).filter(Boolean) || [];
+        if (sentences.length > 1) {
+            this.ttsActive = true;
+            this._utterCount = sentences.length;
+            this._speechQueue = sentences;
+            this._drainSpeech();
+            return;
+        }
+
+        const utterance = new SpeechSynthesisUtterance(clean);
+        if (this.selectedVoice) utterance.voice = this.selectedVoice;
+        utterance.rate = this.settings.get('speechRate') || 1.0;
+        utterance.pitch = this.settings.get('speechPitch') || 1.0;
+        utterance.volume = this.settings.get('speechVolume') || 1.0;
+
+        // Explicit TTS-active flag for the mic gate. Never trust
+        // synthesis.speaking — Chromium can leave it stuck true forever,
+        // which would permanently deafen the voice loop.
+        this.ttsActive = true;
+        // Safety net: force-clear even if onend never fires (~400ms/word)
+        const maxMs = Math.min(clean.split(/\s+/).length * 450 + 3000, 30000);
+        clearTimeout(this._ttsSafetyTimer);
+        this._ttsSafetyTimer = setTimeout(() => { this.ttsActive = false; }, maxMs);
+
+        // Chromium bug workaround: synthesis silently pauses on long
+        // utterances (~15s). Nudge it with resume() while speaking.
+        const resumeTimer = setInterval(() => {
+            if (this.synthesis.speaking) this.synthesis.resume();
+            else clearInterval(resumeTimer);
+        }, 10000);
+        utterance.onstart = () => { this.ttsActive = true; };
+        utterance.onend = () => {
+            clearInterval(resumeTimer);
+            this.ttsActive = false;
+        };
+        utterance.onerror = (e) => {
+            clearInterval(resumeTimer);
+            this.ttsActive = false;
+            console.warn('TTS error:', e.error);
+        };
+
+        this.synthesis.speak(utterance);
     }
 
     // Get location from IP - SECURITY FIX: Use HTTPS endpoint
@@ -1140,6 +1222,57 @@ class Jarvis {
             cmd === 'disconnect' || cmd === 'disconnect wifi' || cmd === 'disconnect the wifi') {
             return { intent: 'WIFI_DISCONNECT' };
         }
+        /* INVESTIGATE — "investigate the goldman sachs filing", "dig into X",
+           "look into the nvidia note and tell me what it says".
+
+           Before EDGAR search and before parseInputCommand, because an
+           investigation subsumes a search: it runs the search AND reads the
+           document AND corroborates. Requires an explicit investigate verb, so
+           an ordinary question never pays the latency. */
+        {
+            const m = cmd.match(/^(?:\w+\s+){0,2}(?:investigate|dig into|look into|research|do a deep dive (?:on|into)|deep dive (?:on|into))\s+(.+)/i);
+            if (m) {
+                const subject = m[1].replace(/\s+(?:for me|please|sir)\s*$/i, '').replace(/[?.!]+$/, '').trim();
+                if (subject.length > 2) return { intent: 'INVESTIGATE', query: subject };
+            }
+        }
+
+        /* EDGAR FULL-TEXT SEARCH — "search edgar for tokenized securities",
+           "which companies mention stablecoin in their filings".
+
+           MUST be checked before parseInputCommand below. That matcher turns
+           any "search X" into keystrokes typed at the focused window, and it
+           silently swallowed every EDGAR phrasing during development — the same
+           failure already in this project's log, where "google stock price" was
+           TYPED INTO A WINDOW instead of answered. Ordering is the whole fix;
+           the routing tests assert both directions.
+
+           parseEdgarQuery returns null unless there is a search lead-in AND a
+           subject, so "any new sec filings" still reaches the feed brief. */
+        const edgarQ = parseEdgarQuery(cmd);
+        if (edgarQ) return { intent: 'EDGAR_SEARCH', ...edgarQ };
+
+        /* PER-COMPANY FILINGS — "sec filings of google", "apple's 10-Ks",
+           "what did tesla file".
+
+           Found the same way the domain-scoped feed brief was: by routing a
+           real phrasing. "sec filings of google" matched nothing above it —
+           parseEdgarQuery needs a search lead-in and there is none, and the
+           feed brief below needs one of its recency words, which "sec filings
+           of google" also lacks. It therefore reached the MODEL, which has no
+           filing data and answers about Google's filings from imagination.
+           That is the exact failure the investigation pipeline was built for,
+           arriving through the front door.
+
+           Position matters in both directions and both are asserted in the
+           routing tests. AFTER EDGAR_SEARCH, so "which companies mention
+           stablecoin in their filings" stays a full-text search. BEFORE the
+           feed brief, so "latest sec filings of google" is not swallowed by
+           the "latest" + "sec filings" branch and answered with everyone
+           else's filings. */
+        const companyQ = edgarCompany.parseCompanyFilingsQuery(cmd);
+        if (companyQ) return { intent: 'COMPANY_FILINGS', ...companyQ };
+
         // Keyboard/window control ("type ...", "press enter", "close notepad").
         // Checked before the system/network matchers so "close chrome" acts on
         // the window rather than being read as a process question.
@@ -1205,6 +1338,14 @@ class Jarvis {
         if (cmd.startsWith('store key ') || cmd.startsWith('set key ')) return { intent: 'SET_KEY', raw: command };
         if (cmd === 'list keys' || cmd === 'list my keys') return { intent: 'LIST_KEYS' };
 
+        /* PORTFOLIO RISK, checked before the watchlist block below. "How risky
+           is my watchlist" says "watchlist", so that block claimed it and
+           answered with a list of prices — a different question. The parser
+           requires a risk word AND rejects add/remove wording, so "what's on my
+           watchlist" and "add micron to my watchlist" still fall through. */
+        const portQ = this.parsePortfolioQuery(cmd);
+        if (portQ) return { intent: 'PORTFOLIO_QUERY', group: portQ.group, symbols: portQ.symbols };
+
         // Finance watchlist. Whale-stream and address-watch commands must fall
         // through to the chain parser — a real log shows "watch for whales"
         // becoming WATCHLIST_ADD "FOR" because this block ran first.
@@ -1242,6 +1383,13 @@ class Jarvis {
         // "analyze Apple". Computed by the DETERMINISTIC quant engine over real
         // historical prices — never estimated by the model. Checked before the
         // price query so a metric question wins over a bare price.
+        /* BEFORE the quant parser. "decompose Micron" and "break down the
+           memory sector" both contain a metric-free entity that parseQuantQuery
+           would take as a plain risk-summary request, answering a
+           sector-relative question with an absolute one. */
+        const sectorQ = this.parseSectorQuery(cmd);
+        if (sectorQ) return { intent: 'SECTOR_QUERY', entity: sectorQ.entity };
+
         const quantQ = this.parseQuantQuery(cmd);
         if (quantQ) return { intent: 'QUANT_QUERY', metric: quantQ.metric, entity: quantQ.entity };
 
@@ -1267,6 +1415,34 @@ class Jarvis {
         if (/\b(brief me|briefing|what'?s changed|what changed|anything new|catch me up on (the )?feeds?|feed brief|what did i miss)\b/.test(cmd)) {
             const h = /\bweek\b/.test(cmd) ? 168 : /\bhour\b/.test(cmd) ? 1 : 24;
             return { intent: 'FEED_BRIEF', hours: h };
+        }
+
+        /* DOMAIN-SCOPED FEED QUERY — "any new sec filings", "latest filings",
+           "anything new in research".
+
+           Found by routing a live prompt: "any new sec filings" matched none of
+           the phrasings above ("anything new" is not "any new") and reached the
+           MODEL, which has no feed history and answers about SEC filings from
+           imagination. Nine SEC feeds are ingested and none of them were
+           reachable by the obvious question. Placed after the general brief so
+           "anything new" keeps its existing meaning, and after EDGAR search so
+           a query WITH a subject still goes to full-text search. */
+        {
+            const scoped = /\b(any|anything|what'?s|whats|show me|list|latest|newest|recent|new|what did)\b/.test(cmd);
+            /* The enforcement wording is here because the SEC's own vocabulary
+               is not "filings": litigation releases, administrative
+               proceedings and trading suspensions are three separate ingested
+               feeds, and asking for any of them by name reached the MODEL
+               until this line existed. Found by routing the phrasings a person
+               actually uses, not the ones the registry uses. */
+            const domain = /\b(sec filings?|filings?|edgar|8-?ks?|10-?ks?|litigation|enforcement|administrative proceedings?|trading suspensions?|suspensions?|sec (announce|announced|press|say|said))\b/.test(cmd) ? 'finance'
+                : /\b(advisor(y|ies)|vulnerabilit(y|ies)|security feeds?)\b/.test(cmd) ? 'security'
+                    : /\b(papers?|preprints?|arxiv|research feeds?)\b/.test(cmd) ? 'research'
+                        : null;
+            if (scoped && domain) {
+                const h = /\bweek\b/.test(cmd) ? 168 : /\bhour\b/.test(cmd) ? 1 : /\bmonth\b/.test(cmd) ? 720 : 24;
+                return { intent: 'FEED_BRIEF', hours: h, domain };
+            }
         }
 
         /* SECURITY ADVISORIES. Checked before news and before the AI fallback,
@@ -1633,8 +1809,23 @@ class Jarvis {
                 case 'QUANT_QUERY':
                     await this.handleQuantQuery(intent.metric, intent.entity);
                     break;
+                case 'SECTOR_QUERY':
+                    await this.handleSectorQuery(intent.entity);
+                    break;
+                case 'PORTFOLIO_QUERY':
+                    await this.handlePortfolioQuery({ group: intent.group, symbols: intent.symbols });
+                    break;
                 case 'CHAIN_QUERY':
                     await this.handleOnchainQuery(intent);
+                    break;
+                case 'EDGAR_SEARCH':
+                    await this.handleEdgarSearch(intent);
+                    break;
+                case 'COMPANY_FILINGS':
+                    await this.handleCompanyFilings(intent);
+                    break;
+                case 'INVESTIGATE':
+                    await this.handleInvestigate(intent.query);
                     break;
                 case 'PRICE_QUERY':
                     await this.handlePriceQuery(intent.entity);
@@ -1646,7 +1837,7 @@ class Jarvis {
                     await this.handleSelfCritique();
                     break;
                 case 'FEED_BRIEF':
-                    await this.handleFeedBrief(intent.hours);
+                    await this.handleFeedBrief(intent.hours, intent.domain);
                     break;
                 case 'SECURITY_ADVISORY':
                     await this.handleSecurityAdvisory();
@@ -2178,10 +2369,11 @@ class Jarvis {
             drawdown: /\b(max(imum)? )?drawdown\b/i,
             beta: /\b(beta|alpha)\b/i,
             return: /\b(annual(ized)? return|cagr|performance)\b/i,
+            var: /\b(va ?r|value at risk|expected shortfall|cvar|tail risk)\b/i,
         };
         let m;
         // "<metric> of <entity>" / "<metric> for <entity>"
-        if ((m = cmd.match(/\b(sharpe( ratio)?|sortino( ratio)?|volatility|beta|alpha|max(imum)? drawdown|drawdown|annual(ized)? return|cagr)\s+(?:of|for|on)\s+(.+)/i))) {
+        if ((m = cmd.match(/\b(sharpe( ratio)?|sortino( ratio)?|volatility|beta|alpha|max(imum)? drawdown|drawdown|annual(ized)? return|cagr|value at risk|va ?r|expected shortfall|cvar|tail risk)\s+(?:of|for|on)\s+(.+)/i))) {
             const entity = clean(m[m.length - 1]);
             if (entity) return { metric: this._metricOf(m[1], METRIC), entity };
         }
@@ -2190,10 +2382,23 @@ class Jarvis {
             const entity = clean(m[2]);
             if (entity) return { metric: m[1].toLowerCase() === 'volatile' ? 'volatility' : 'summary', entity };
         }
-        // "analyze / risk analysis of <entity>"
-        if ((m = cmd.match(/\b(?:analyz|analys)e?\s+(.+)|(?:risk|quant)\s+analysis\s+(?:of|for)\s+(.+)/i))) {
+        /* "analyze / risk analysis of <entity>"
+           ANCHORED near the start, and the entity may not begin with a
+           conjunction. From the live log of 22 Jul 2026:
+
+             "investigate what might me his future plans next move analyze and
+              tell me"
+               -> QUANT_QUERY entity="and tell me"
+               -> "I could not find enough price history for and tell me."
+
+           The verb was the ninth word of a sentence about something else, and
+           `analyze\s+(.+)` took the rest of the line as a ticker. A real quant
+           request leads with the verb; this one merely contained it. Same
+           class as the watchlist stealing "watch for whales" -> "FOR". */
+        if ((m = cmd.match(/^(?:\w+\s+){0,2}(?:analyz|analys)e?\s+(.+)|(?:risk|quant)\s+analysis\s+(?:of|for)\s+(.+)/i))) {
             const entity = clean(m[1] || m[2]);
-            if (entity && METRIC && !/[?]/.test(entity)) return { metric: 'summary', entity };
+            const startsWithFiller = /^(?:and|or|but|then|so|it|that|this|these|those|me|my|him|her|them|us|there|please)\b/i.test(entity || '');
+            if (entity && METRIC && !startsWithFiller && !/[?]/.test(entity)) return { metric: 'summary', entity };
         }
         // trailing form: "<entity> sharpe / volatility / beta"
         if ((m = cmd.match(/^(.+?)\s+(sharpe|sortino|volatility|beta|drawdown|risk)\b/i))) {
@@ -2202,6 +2407,217 @@ class Jarvis {
             if (entity) return { metric, entity };
         }
         return null;
+    }
+
+    /* Parse a peer-relative request into { entity }, or null.
+       "Micron fell 9.9%" and "the sector fell 5% and Micron fell 9.9%" are
+       different answers, and this is how a listener asks for the second one.
+
+       ANCHORED, for the reason parseQuantQuery documents at length: a verb like
+       "break down" or "decompose" appearing in the middle of a sentence about
+       something else must not swallow the rest of the line as a ticker. */
+    parseSectorQuery(cmd) {
+        const clean = (s) => s && s.replace(/[?.!,]+$/, '')
+            .replace(/\b(please|now|right now|currently|today|for me|stock|shares?)\b/gi, '')
+            .replace(/^\s*(?:the|a|of|for|on)\s+/i, '')
+            .replace(/'s\b/gi, '')
+            /* "decompose micron's move" leaves "micron move", which resolves to
+               no ticker at all. The motion noun is the thing being decomposed,
+               never part of the name. */
+            .replace(/\s+(?:move|moves|movement|drop|fall|decline|selloff|sell-off|gain|rise|performance|action)\s*$/i, '')
+            .replace(/\s+/g, ' ').trim();
+        const FILLER = /^(?:and|or|but|then|so|it|that|this|these|those|me|my|him|her|them|us|there)\b/i;
+        const ok = (e) => e && !FILLER.test(e) && e.length <= 40 ? { entity: e } : null;
+        let m;
+
+        // "how much of X's drop is the sector" / "...is company specific"
+        if ((m = cmd.match(/\bhow much of\s+(.+?)(?:'s)?\s+(?:drop|fall|decline|move|gain|rise|selloff)\s+is\s+(?:the\s+)?(?:sector|market|company|peer)/i))) {
+            return ok(clean(m[1]));
+        }
+        // "decompose X" / "break down X" — verb within the first two words only.
+        if ((m = cmd.match(/^(?:\w+\s+){0,2}(?:decompose|break\s*down)\s+(.+)/i))) {
+            return ok(clean(m[1]));
+        }
+        // "sector move / peer analysis / relative strength of X"
+        if ((m = cmd.match(/\b(?:sector (?:move|analysis|breakdown)|peer (?:analysis|comparison|relative)|relative strength)\s+(?:of|for|on|in)\s+(.+)/i))) {
+            return ok(clean(m[1]));
+        }
+        // "is X's fall the sector or the company"
+        if ((m = cmd.match(/\bis\s+(?:this|the)\s+(?:a\s+)?sector[- ]wide\b/i))) {
+            return ok('memory'); // only meaningful with a group in view
+        }
+        // "who is outperforming in memory" / "who's holding up in memory"
+        if ((m = cmd.match(/\bwho(?:'s| is|se)?\s+(?:out\s?performing|holding up|strongest|weakest)\b(?:\s+in\s+(.+))?/i))) {
+            return ok(clean(m[1] || 'memory'));
+        }
+        return null;
+    }
+
+    /* Peer-relative decomposition. Every figure comes from sectorMove.js in the
+       main process; the model narrates and computes nothing. */
+    async handleSectorQuery(entity) {
+        if (!window.electronAPI?.getSectorMove) {
+            this.speak('Sector analysis is not available in this environment.');
+            return;
+        }
+        this.displayText(`Decomposing ${entity}...`, null);
+        let r;
+        try { r = await window.electronAPI.getSectorMove({ text: entity, range: '6mo' }); }
+        catch (e) { console.error('Sector move error:', e); this.speak(`I could not analyze ${entity}.`); return; }
+        if (!r || !r.success) {
+            this.speak(r?.error ? `I could not analyze ${entity}. ${r.error}.` : `I could not analyze ${entity}.`);
+            return;
+        }
+        const pc = (x, dp = 1) => (x == null ? 'n/a' : `${x >= 0 ? '+' : ''}${x.toFixed(dp)}%`);
+
+        if (r.groupWide) {
+            const lines = [`${r.groupName} — move vs. peer group`, ''];
+            for (const a of r.members) {
+                lines.push(`${(a.symbol || '').padEnd(10)} ${pc(a.move).padStart(7)}  sector ${pc(a.sectorMove).padStart(7)}` +
+                    `  β ${a.beta == null ? ' n/a' : a.beta.toFixed(2)}  own ${pc(a.idiosyncratic).padStart(7)}`);
+            }
+            if (r.offIndex?.length) lines.push('', `Not in the index: ${r.offIndex.join(', ')}`);
+            if (r.unavailable?.length) lines.push(`No data: ${r.unavailable.map((u) => u.symbol).join(', ')}`);
+            this.displayText(lines.join('\n'), null);
+
+            const ranked = r.members.filter((a) => a.idiosyncratic != null);
+            const best = ranked[0], worst = ranked[ranked.length - 1];
+            let spoken = `Across ${r.groupName.toLowerCase()}, `;
+            if (best && worst && best !== worst) {
+                spoken += `${best.symbol} is the strongest after adjusting for the sector, ${pc(best.idiosyncratic)} beyond what its beta explains, `
+                    + `and ${worst.symbol} the weakest at ${pc(worst.idiosyncratic)}.`;
+            } else {
+                spoken += 'I could not separate the sector from the individual names — the peer overlap was too short.';
+            }
+            this.speak(spoken);
+            return;
+        }
+
+        const a = r.analysis;
+        const lines = [
+            `${r.name || a.symbol} (${a.symbol}) — vs. ${r.groupName}`,
+            `Move: ${pc(a.move, 2)}   Sector: ${pc(a.sectorMove, 2)}   Beta: ${a.beta == null ? 'n/a' : a.beta.toFixed(2)}`,
+            `Explained by sector: ${pc(a.explainedBySector, 2)}   Company-specific: ${pc(a.idiosyncratic, 2)}`,
+            `Correlation: ${a.correlation == null ? 'n/a' : a.correlation.toFixed(2)}   Volatility: ${pc(a.volAnnualisedPct, 0)}`,
+        ];
+        if (a.drawdown) lines.push(`Drawdown: ${pc(a.drawdown.pct)} from its ${a.drawdown.highDate} high`);
+        if (a.breadth) lines.push(`Breadth: ${a.breadth.down} of ${a.breadth.of} peers fell`);
+        /* The limits are displayed, not hidden — a three-week-old listing
+           produces nulls that otherwise read as a malfunction. */
+        if (a.limits?.length) lines.push('', ...a.limits.map((l) => `Note: ${l}`));
+        this.displayText(lines.join('\n'), null);
+        this.speak(r.spoken);
+    }
+
+    /* Parse a portfolio-level request into { group } | {} , or null.
+       "How risky is Micron" is a quant question about one security; "how risky
+       is my watchlist" is a different question that only the covariance can
+       answer, and answering the second with the first is the failure this
+       intent exists to prevent. */
+    parsePortfolioQuery(cmd) {
+        const t = String(cmd || '');
+        /* "add micron to my watchlist" is a different intent that also says
+           "watchlist". Checked first so nothing below can claim it. */
+        if (/\b(add|remove|delete|drop)\b/i.test(t)) return null;
+
+        // A BOOK — a watchlist, a portfolio, or a named peer group.
+        const book = /\b(my (?:watchlist|portfolio|holdings|book|positions)|the (?:watchlist|portfolio)|portfolio|watchlist)\b/i.test(t);
+        const groupM = t.match(/\b(memory)\b\s*(?:sector|stocks?|complex|names?)?/i);
+
+        /* A NAMED METHOD is itself a portfolio question. "What would risk
+           parity do here" names no book and asks nothing that reads as a risk
+           word on its own, so it fell through to the single-security parser
+           and tried to resolve "here" as a ticker. Naming the method is enough;
+           the book then defaults to the watchlist. */
+        const method = /\b(risk parity|min(?:imum)?[- ]variance|max(?:imum)?[- ]sharpe|tangency|mean[- ]variance|efficient frontier)\b/i.test(t);
+
+        /* An EXPLICIT LIST — "for MU, SNDK, WDC". Two or more separated tokens
+           are required: one bare word after "for" is far more likely to be a
+           company name for a single-security question than a one-stock book. */
+        let symbols = null;
+        const listM = t.match(/\b(?:for|of|across|on|between)\s+([a-z0-9.\-]{1,6}(?:\s*(?:,|and|&)\s*[a-z0-9.\-]{1,6}){1,19})/i);
+        if (listM) {
+            const parts = listM[1].split(/\s*(?:,|and|&)\s*/).map((s) => s.trim().toUpperCase()).filter(Boolean);
+            if (parts.length >= 2) symbols = parts;
+        }
+
+        if (!book && !groupM && !method && !symbols) return null;
+
+        /* Leading \b only. A trailing one cannot match an inflected word:
+           /\bdiversif\b/ fails on "diversified" because the boundary needs a
+           non-word character after the "f", so "how diversified is my
+           portfolio" fell through to the model.
+           "position" is here because "is my portfolio really just one position"
+           is the diversification question asked in plain words. */
+        const asksRisk = /(\brisk|\bvolatil|\bdiversif|\bconcentrat|\bcorrelat|\bexposure|\bparity|\ballocation|\bweight|\boptimi|\bvar\b|\btail|\bposition)/i.test(t);
+        /* A named method or an explicit multi-symbol list IS the request; it
+           does not also have to contain a risk noun. */
+        if (!asksRisk && !method && !symbols) return null;
+
+        const out = {};
+        if (symbols) out.symbols = symbols;
+        else if (groupM && !book) out.group = groupM[1].toLowerCase();
+        return out;
+    }
+
+    /* Portfolio risk. Main fetches dated closes; every number here is computed
+       by portfolio.js in this process — the model narrates only. */
+    async handlePortfolioQuery(opts = {}) {
+        if (!window.electronAPI?.getPortfolioSeries) {
+            this.speak('Portfolio analysis is not available in this environment.');
+            return;
+        }
+        this.displayText('Analyzing portfolio risk...', null);
+        let r;
+        try { r = await window.electronAPI.getPortfolioSeries({ group: opts.group, symbols: opts.symbols, range: '6mo' }); }
+        catch (e) { console.error('Portfolio error:', e); this.speak('I could not analyze the portfolio.'); return; }
+        if (!r || !r.success) {
+            this.speak(r?.error ? `I could not analyze it. ${r.error}.` : 'I could not analyze the portfolio.');
+            return;
+        }
+
+        const a = portfolio.analyzePortfolio(r.seriesBySymbol);
+        if (a.error) { this.speak(`I could not analyze the portfolio. ${a.error}.`); return; }
+
+        const pc = (x, dp = 1) => (x == null ? 'n/a' : `${(x * 100).toFixed(dp)}%`);
+        const lines = [
+            `Portfolio risk — ${a.symbols.length} holdings, equal weight`,
+            `${a.observations} overlapping sessions (${a.from} to ${a.to})`,
+            '',
+            `Volatility: ${pc(a.volatility)}   Diversification ratio: ${a.diversificationRatio?.toFixed(2) ?? 'n/a'}`,
+            '',
+            'Risk contribution (dollar weight -> share of risk):',
+            ...a.symbols.map((s, i) => `  ${s.padEnd(11)} ${pc(a.weights[i])} -> ${pc(a.riskContribution[i])}`),
+        ];
+        if (a.tail) {
+            lines.push('', `Portfolio VaR 95%: ${pc(a.tail.var)}   Expected shortfall: ${pc(a.tail.expectedShortfall)}`);
+        }
+        const rp = a.alternatives?.riskParity;
+        if (rp?.converged) {
+            lines.push('', 'Risk parity would hold:',
+                ...a.symbols.map((s, i) => `  ${s.padEnd(11)} ${pc(rp.weights[i])}`),
+                `  -> volatility ${pc(rp.vol)} vs ${pc(a.volatility)} equal-weight`);
+        }
+        const mv = a.alternatives?.minVariance;
+        if (mv) {
+            lines.push('', `Minimum variance: ${a.symbols.map((s, i) => `${s} ${pc(mv.weights[i])}`).join('  ')}`
+                + (mv.hasShorts ? '   [requires short positions]' : ''));
+        }
+        if (a.limits?.length) lines.push('', ...a.limits.map((l) => `Note: ${l}`));
+        this.displayText(lines.join('\n'), null);
+
+        /* Spoken: the gap between dollar weight and risk weight, which is the
+           one thing a dollar-weighted view cannot show. */
+        const top = a.concentration;
+        let spoken = `Across ${a.symbols.length} holdings the portfolio's annualised volatility is ${pc(a.volatility, 0)}. `;
+        if (top) {
+            spoken += `${top.symbolAtMostRisk} is ${pc(top.largestWeight, 0)} of the money but ${pc(top.largestRiskShare, 0)} of the risk. `;
+        }
+        if (a.diversificationRatio != null && a.diversificationRatio < 1.2) {
+            spoken += `The diversification ratio is only ${a.diversificationRatio.toFixed(2)}, so these holdings are behaving close to a single position. `;
+        }
+        if (a.tail) spoken += `One-day value at risk is ${pc(a.tail.var)} at 95 percent confidence.`;
+        this.speak(spoken.trim());
     }
 
     _metricOf(word, METRIC) {
@@ -2333,6 +2749,20 @@ class Jarvis {
             `Sharpe: ${num(a.sharpe)}   Sortino: ${num(a.sortino)}`,
         ];
         if (a.beta != null) lines.push(`Beta: ${num(a.beta)}   Alpha: ${pct(a.alpha)}   Corr(SPX): ${num(a.correlation)}`);
+        /* R2 first: it says whether the beta and alpha above mean anything. A
+           low one is grounds to disregard them, not to footnote them. */
+        if (a.rSquared != null) {
+            lines.push(`R²: ${num(a.rSquared)}${a.rSquared < 0.3 ? ' (low — beta and alpha are weakly determined)' : ''}`
+                + (a.informationRatio != null ? `   Info ratio: ${num(a.informationRatio)}` : ''));
+        }
+        if (a.capture?.up != null && a.capture?.down != null) {
+            lines.push(`Capture: ${num(a.capture.up * 100)}% up / ${num(a.capture.down * 100)}% down`);
+        }
+        /* The only figures here about tomorrow rather than the past. */
+        if (a.var95) {
+            lines.push(`1-day VaR 95%: ${pct(-a.var95.var)}   99%: ${pct(-a.var99?.var ?? 0)}`
+                + (a.cvar95 ? `   Expected shortfall: ${pct(-a.cvar95.expectedShortfall)}` : ''));
+        }
         this.displayText(lines.join('\n'), null);
 
         let spoken;
@@ -2348,6 +2778,14 @@ class Jarvis {
                 break;
             case 'drawdown':
                 spoken = `${name}'s maximum drawdown over the past year was ${pct(a.maxDrawdown)}.`;
+                break;
+            case 'var':
+                spoken = a.var95
+                    ? `${name}'s one-day value at risk is ${pct(a.var95.var)} at 95 percent confidence, `
+                      + `${pct(a.var99.var)} at 99 percent. On the days that threshold was breached, `
+                      + `the average loss was ${pct(a.cvar95.expectedShortfall)}. `
+                      + `That is historical simulation over ${a.var95.observations} sessions, not a normal-distribution estimate.`
+                    : `I do not have enough history to estimate value at risk for ${name}.`;
                 break;
             case 'beta':
                 spoken = a.beta != null
@@ -2377,8 +2815,20 @@ class Jarvis {
            question with a different answer. */
         // `markets?` — the third time a missing plural has sent a whole feature
         // to the model instead of its handler ("whale alerts", "usdc burns").
+        /* The connector alternatives below exist because requiring of|on|that|for
+           after the odds-word MISSED the most natural phrasing there is:
+           "what are the odds THE FED cuts rates" has no preposition at all, so
+           it fell through to the model — which then invents a probability, the
+           single worst failure available here. Found by routing a live prompt,
+           not by reading the regex. Two additions, both narrow:
+             * a determiner  ("odds the ...", "chances a ...")
+             * a nearby outcome verb ("chances bitcoin HITS 200k")
+           Both still require the odds-word itself, so ordinary speech that
+           merely contains "the" is untouched. */
         if (/\b(prediction markets?|polymarket|kalshi)\b/i.test(text) ||
-            /\b(odds|chances?|probability|likelihood)\b.*\b(of|on|that|for)\b/i.test(text)) {
+            /\b(odds|chances?|probability|likelihood)\b.*\b(of|on|that|for)\b/i.test(text) ||
+            /\b(odds|chances?|probability|likelihood)\s+(?:the|a|an)\b/i.test(text) ||
+            /\b(odds|chances?|probability|likelihood)\b[^.?!]{0,40}\b(will|hits?|reaches?|wins?|cuts?|beats?|passes|happens)\b/i.test(text)) {
             if (/\b(trending|most active|popular|what'?s hot|top market)/i.test(text)) {
                 return { kind: 'prediction-trending', chain: 'ethereum' };
             }
@@ -2554,6 +3004,510 @@ class Jarvis {
             if (!nRaw?.success || ens.isZeroNodeResult(nRaw.raw)) return null;
             return onchain.decodeAbiString(nRaw.raw) || null;
         } catch { return null; }
+    }
+
+    /* INVESTIGATE — collect, READ, corroborate, then answer.
+       Built from the failure of 22 Jul 2026: the assistant held a filing title
+       and invented its contents over eight turns. The document was 0.68s away.
+       The contract here is that no evidence means no answer, and the model is
+       called ONCE, at the end, over text that was actually fetched.
+
+       This is deliberately the SLOW path. The 23rd pass measured gemma3:4b at
+       ~3s per planning call and concluded a multi-step loop is unusable when
+       spoken; so this runs only when explicitly asked, reports each stage as it
+       goes, and is never reached from a bare question. */
+    async handleInvestigate(query) {
+        const plan = investigation.planInvestigation(query);
+        if (!plan) { this.speak('What should I investigate, Sir?'); return; }
+
+        const evidence = [];
+        const trace = [];
+        const note = (s) => { trace.push(s); this.displayText(`Investigating "${query}"...\n\n${trace.join('\n')}`, null); };
+
+        // 1. MEMORY — what is already known, before spending any request.
+        try {
+            const { results = [] } = await ragService.recall(query, { rerank: false });
+            for (const r of results.slice(0, 4)) evidence.push({ kind: 'memory', text: r.text, source: r.source });
+            note(`memory: ${results.length} passage${results.length === 1 ? '' : 's'}`);
+        } catch { note('memory: unavailable'); }
+
+        // 2. SEARCH — EDGAR full text, which returns filing metadata AND the
+        //    document URLs that step 3 reads.
+        let hits = [];
+        if (plan.steps.includes('search') && window.electronAPI?.edgarSearch) {
+            const url = buildEdgarUrl({ q: plan.subject, forms: plan.forms });
+            const res = url ? await window.electronAPI.edgarSearch({ url }).catch(() => null) : null;
+            if (res?.success) {
+                hits = parseEdgarResults(res.json, { limit: 5 }).results;
+                for (const h of hits) evidence.push({ kind: 'search', text: edgarMemoryText(h) || '', url: h.url, published: h.filedAt });
+                note(`edgar: ${hits.length} filing${hits.length === 1 ? '' : 's'}`);
+            } else note(`edgar: ${res?.error || 'unavailable'}`);
+        }
+
+        /* 2b. FEED FALLBACK — where the document URL actually comes from in the
+               case that caused all this. EDGAR full-text search returned ZERO
+               hits for the Goldman 424B2 (verified 22 Jul), because full text
+               does not index every form; but the feed store had the filing,
+               with its URL, all along. Searching and finding nothing is not
+               the same as there being nothing. */
+        if (plan.steps.includes('document') && !hits.length && window.electronAPI?.feedHistory) {
+            const fh = await window.electronAPI.feedHistory({ sinceMs: 7 * 24 * 3600 * 1000 }).catch(() => null);
+            const terms = plan.subject.toLowerCase().split(/\s+/).filter((w) => w.length > 3);
+            const matched = (fh?.events || [])
+                .filter((e) => e.url && terms.some((t) => `${e.title} ${e.summary}`.toLowerCase().includes(t)))
+                .slice(0, 3);
+            for (const e of matched) {
+                evidence.push({ kind: 'feed', text: `${e.title}. ${e.summary || ''}`.trim(), url: e.url, published: e.published });
+            }
+            if (matched.length) {
+                hits = matched.map((e) => ({ url: e.url, company: e.source, filedAt: e.published }));
+                note(`feeds: ${matched.length} matching event${matched.length === 1 ? '' : 's'} (edgar search found none)`);
+            }
+        }
+
+        /* 3. READ — the stage whose absence is the whole reason for this method.
+              Only the top hit: a filing is ~76k characters and the budget is
+              6k, so a second document buys nothing but latency. */
+        if (plan.steps.includes('document') && hits.length && window.electronAPI?.secDocument) {
+            const target = hits[0];
+            const doc = await this._readSecFiling(target, query);
+            if (doc.text) {
+                evidence.push({
+                    kind: 'document', text: doc.text,
+                    url: doc.url, published: target.filedAt,
+                    source: target.company, entity: target.company,
+                });
+                note(`document: ${doc.note} (${target.company || 'filer'})`);
+            } else note(`document: ${doc.note}`);
+        }
+
+        // 4. CORROBORATE — open web, for context the filing does not carry.
+        if (plan.steps.includes('web') && window.electronAPI?.webSearch) {
+            // webSearch takes the query STRING, not an object — the preload
+            // signature is `webSearch: (query) => invoke('web-search', query)`.
+            const w = await window.electronAPI.webSearch(query).catch(() => null);
+            const results = Array.isArray(w?.results) ? w.results : [];
+            for (const r of results.slice(0, 3)) {
+                evidence.push({ kind: 'web', text: `${r.title || ''}. ${r.snippet || ''}`.trim(), url: r.url });
+            }
+            note(`web: ${results.length} result${results.length === 1 ? '' : 's'}${w?.provider ? ` (${w.provider})` : ''}`);
+        }
+
+        // 5. LEDGER — dedupe, weight, and report what was actually gathered.
+        let ledger = investigation.buildLedger(evidence);
+
+        /* TEMPORAL GATEWAY (WorldReasoner, arXiv 2606.11816). That paper
+           measured six agent conditions and found temporally valid retrieval to
+           be the strongest driver of accuracy — 68.8% vs 58.7% without, 74.7%
+           with the boundary at one day before resolution. It is also why there
+           is no causal-graph layer here: their Causal Simulation condition
+           scored 56.6%, below the no-retrieval baseline, and adding graphs to
+           search cost 4.4 points. Retrieval timing, not reasoning machinery. */
+        const scope = investigation.parseTemporalScope(query);
+        if (scope.kind === 'as-of') {
+            const gate = investigation.applyTemporalGate(ledger, scope);
+            ledger = gate.ledger;
+            if (gate.excluded.length) {
+                note(`temporal: ${gate.excluded.length} item(s) published after ${scope.asOf.toISOString().slice(0, 10)} excluded as hindsight`);
+            }
+            if (gate.undated) note(`temporal: ${gate.undated} undated item(s) kept — age unknown`);
+        }
+        /* Age is computed for every investigation, not only gated ones: an
+           answer that does not say when its evidence is from is asserting a
+           currency it has not earned. */
+        const freshness = investigation.describeFreshness(ledger, { scope });
+        if (freshness.stale) note(`temporal: STALE — newest evidence is ${freshness.ageDays} days old`);
+
+        const summary = investigation.describeLedger(ledger);
+        note(`evidence: ${summary.items} items, ${summary.chars.toLocaleString()} chars${summary.hasPrimary ? ', including the primary document' : ', NO primary document'}`);
+
+        /* 6. ANSWER — or refuse. A null prompt means nothing was gathered, and
+              that is exactly the state in which the model previously invented
+              eight turns of detail. It does not get called. */
+        /* ENTITY-ATTRIBUTION GATE (deceptive grounding, arXiv 2607.09349).
+           Reproduced on this machine 22 Jul 2026: given only a Morgan Stanley
+           424B2 and asked about Goldman Sachs, the model reported Morgan
+           Stanley's $700,000 principal and $950.40 estimated value as
+           Goldman's — and the money guard PASSED it, correctly by its own rule,
+           because every figure was genuinely in the evidence. Figure-presence
+           is not entity-ownership.
+
+           The check runs BEFORE the model, because the paper's ablation finds
+           retrieval is the high-leverage lever and prompt-based anchoring works
+           on some model families and not others. A gate cannot be talked
+           around; an instruction can. */
+        const attribution = investigation.verifyEntityAttribution(query, ledger);
+        if (attribution.applies && !attribution.ok) {
+            const said = investigation.describeAttributionMismatch(query, attribution);
+            this.speak(said);
+            this.displayText(`${said}\n\n--- what was actually retrieved ---\n${investigation.renderEvidence(ledger)}`, null);
+            console.warn('Investigation refused on entity attribution:', JSON.stringify(attribution));
+            return;
+        }
+
+        const prompt = investigation.buildSynthesisPrompt(query, ledger, { freshness });
+        if (!prompt) {
+            this.speak('I found no evidence I could verify, Sir, so I have nothing to report rather than a guess.');
+            return;
+        }
+
+        const answer = await generateContentLocal(
+            [{ role: 'system', content: prompt }, { role: 'user', content: query }], null, {}
+        ).catch((e) => ({ error: e.message }));
+
+        if (!answer || answer.error) {
+            this.speak(`The analysis step failed, Sir: ${answer?.error || 'no response'}. The evidence is on screen.`);
+            return;
+        }
+
+        /* The guard runs over the evidence that was actually gathered, so any
+           figure the model adds to it is caught — the money class exists
+           because of this exact investigation. */
+        const grounded = guardOutput(String(answer), investigation.renderEvidence(ledger));
+        /* The staleness rule is also in the prompt, but a 4B model drops
+           instructions under load and the log shows it doing so. Prepending the
+           caveat here makes it unconditional: the age of the evidence is stated
+           whether or not the model chose to. */
+        const body = grounded.blocked ? grounded.text : String(answer);
+        const said = freshness.stale ? `${freshness.note} ${body}` : body;
+        this.speak(said);
+        this.displayText(
+            `${said}\n\n--- evidence (${summary.items} items) ---\n${investigation.renderEvidence(ledger)}`,
+            null);
+
+        if (grounded.blocked) {
+            console.warn('Investigation answer blocked:', grounded.found.map(f => `${f.kind}=${f.value}`).join(', '));
+        }
+    }
+
+    /* READ ONE SEC FILING — resolve an index page to the primary document,
+       fetch it, and reduce it to the query-relevant passages.
+
+       Extracted from handleInvestigate so both callers share ONE implementation.
+       Two copies of this would drift, and the specific thing that would drift is
+       the index-resolution step: a feed event links the filing INDEX, not the
+       filing, and fetching that yields ~11KB of table markup that reads like a
+       document and contains none of the filing's prose. That trap is the reason
+       the whole investigation pipeline exists.
+
+       @returns {{text?: string, url?: string, note: string}}
+    */
+    async _readSecFiling(filing, query) {
+        if (!window.electronAPI?.secDocument) return { note: 'sec-document unavailable' };
+        let docUrl = filing?.indexUrl || filing?.url;
+        if (!docUrl) return { note: 'no url on this filing' };
+
+        if (/-index\.html?$/i.test(docUrl)) {
+            const dir = docUrl.replace(/\/[^/]*$/, '');
+            const listing = await window.electronAPI.secDocument({ url: `${dir}/index.json` }).catch(() => null);
+            if (listing?.success) {
+                let items = [];
+                try { items = JSON.parse(listing.body)?.directory?.item || []; } catch { /* fall through */ }
+                const primary = investigation.pickPrimaryDocument(items, { accession: filing.accession || '' });
+                if (primary) docUrl = `${dir}/${primary}`;
+            }
+        }
+
+        const doc = await window.electronAPI.secDocument({ url: docUrl }).catch((e) => ({ success: false, error: e.message }));
+        if (!doc?.success) {
+            /* A real 10-K can exceed the fetch ceiling — the Alphabet 10-K is
+               15MB per its own feed entry. Saying so is the honest outcome; a
+               silent failure here reads as "the filing said nothing". */
+            return { note: `could not read: ${doc?.error || 'no response'}` };
+        }
+
+        const text = investigation.extractDocumentText(doc.body);
+
+        /* SECTION-AWARE RETRIEVAL, before any sentence scoring.
+           Measured on Alphabet's real 10-Q: selecting sentences from the whole
+           198,885-character document for the query "as cc filings of google"
+           returned the trademark notice and the 1998 incorporation history,
+           with no financial figure in it. Narrowing to named sections first
+           returns the disaggregated revenue table and the Wiz acquisition note.
+           Same selector, same query, same document — the only change is that it
+           is no longer asked to search the boilerplate. */
+        const sections = secSections.parseSections(text);
+        const plan = secSections.planSectionRetrieval(sections, query, { maxChars: 6000 });
+        /* `parts` is the section list AFTER hierarchical descent — a section
+           that fits is used whole, one that does not is narrowed to its
+           topic-matching subsections. MD&A alone is 12,794 tokens against this
+           model's 4,096-token window. */
+        const scope = plan.parts.length
+            ? plan.parts.map((p) => p.text).join('\n\n')
+            : text;                                  // unparseable filing: fall back whole
+        const selected = ragService.selectRelevant(scope, query, { maxChars: 6000 });
+
+        const cov = secSections.coverage(sections, plan.topics);
+        return {
+            text: selected,
+            url: doc.url,
+            sections: plan.sections,
+            /* Missing sections are named. "I could not find the section that
+               would answer this" is a useful thing to know and is invisible if
+               only the retrieved text is reported. */
+            missing: cov.missing,
+            note: `read ${doc.bytes.toLocaleString()} bytes in ${doc.ms}ms; `
+                + `${sections.length} sections, ${plan.reason}; `
+                + `-> ${secSections.describeSections(plan.sections)}; ${selected.length} chars selected`
+                + (cov.missing.length ? `; NO SECTION FOUND for: ${cov.missing.join(', ')}` : ''),
+        };
+    }
+
+    /* PER-COMPANY FILINGS — "sec filings of google".
+       Feed first, then memory, then the model. In that order, and the order is
+       the whole design:
+
+         1. RESOLVE the spoken name to a CIK from the SEC's own ticker map.
+         2. READ the company's EDGAR filings feed. This is the RSS side, and it
+            is where every fact in the answer comes from.
+         3. INGEST each filing into long-term memory with its date, form and
+            accession, so the next question about this company is answerable
+            without another request — and so an ordinary follow-up, which goes
+            through processAICommand, retrieves them via RAG automatically.
+         4. ANSWER from the feed deterministically, THEN let the model talk
+            about that evidence and nothing else.
+
+       Step 4 is split in two on purpose. The counts and dates are spoken from
+       the parsed feed with no model in the path, exactly as handleEdgarSearch
+       does; the model only ever sees an evidence ledger it must cite. The log
+       of 22 Jul 2026 is what this buys: asked about SEC filings with only
+       titles in context, the model invented a Goldman compensation structure
+       ending at "$8.5 billion". Here it cannot, because the gate in front of
+       it is the same one handleInvestigate uses. */
+    async handleCompanyFilings({ name, forms = [], raw = '' }) {
+        if (!window.electronAPI?.secCompanyFeed || !window.electronAPI?.secTickers) {
+            this.speak('EDGAR company filings are not available in this environment, Sir.');
+            return;
+        }
+
+        this.displayText(`Looking up SEC filings for "${name}"...`, null);
+
+        /* 1. RESOLVE. The ticker map is the only source: EDGAR's own
+              company-name search answers "google" with CapitalG GP LLC, which
+              is Alphabet's venture fund and not the filer anyone means. */
+        const tick = await window.electronAPI.secTickers().catch((e) => ({ success: false, error: e.message }));
+        if (!tick?.success) {
+            this.speak(`I could not load the SEC company list, Sir: ${tick?.error || 'no response'}.`);
+            return;
+        }
+        const matches = edgarCompany.resolveCompany(name, tick.rows);
+        if (!matches.length) {
+            /* Deliberately not a guess. A fuzzy resolver answers "openai" with
+               Opendoor Technologies — a real company, confidently wrong. Saying
+               nothing matched is the correct answer for a private company. */
+            this.speak(`I have no filer matching "${name}" in the SEC company list, Sir. `
+                + 'That usually means it is private, or files under a different name.');
+            return;
+        }
+
+        const company = matches[0];
+        const alsoMatched = matches.slice(1, 3).map((m) => m.title);
+
+        /* 2. THE FEED. EDGAR takes one form type, so a multi-form question is
+              narrowed to the first and the rest is said out loud rather than
+              silently dropped. */
+        const form = forms[0] || '';
+        const res = await window.electronAPI.secCompanyFeed({ cik: company.cik, type: form, count: 40 })
+            .catch((e) => ({ success: false, error: e.message }));
+        if (!res?.success) {
+            this.speak(`I could not reach the EDGAR filings feed for ${company.title}, Sir: ${res?.error || 'no response'}.`);
+            return;
+        }
+
+        const parsed = edgarCompany.parseCompanyFeed(res.xml, { limit: 20 });
+        if (!parsed.ok) {
+            /* An unknown CIK comes back as HTTP 200 with an HTML page. Reporting
+               that as "no filings" would be a false statement about a real
+               company, so the two cases are kept apart. */
+            this.speak(`EDGAR did not return a filings feed for ${company.title}, Sir — ${parsed.error}.`);
+            return;
+        }
+
+        const filed = parsed.filings;
+        const entity = parsed.company || company.title;
+
+        /* 3. INGEST. Every line carries the filer, the form, the date, the
+              accession number and the index URL, so a later answer built on it
+              can be checked. Failures here never affect the answer: the feed is
+              already parsed and memory is a side effect. */
+        let ingested = 0;
+        try {
+            for (const f of filed) {
+                const text = edgarCompany.toMemoryText(entity, f);
+                if (!text) continue;
+                await ragService.ingest(text, { source: 'sec-company-feed' });
+                ingested++;
+            }
+        } catch (e) { console.warn('Company filing ingest failed (answer unaffected):', e); }
+
+        /* 4a. THE DETERMINISTIC ANSWER. No model in this path.
+              Spoken from the MATERIALITY-ranked list, not the raw feed order:
+              "most recent: 4, S-8, 10-Q" led with an insider transaction and
+              buried the quarterly report, which is the one filing the question
+              was actually about. */
+        const { ranked, suppressed, counts } = edgarCompany.rankFilings(filed);
+        const alsoFiled = edgarCompany.describeSuppressed(suppressed, counts);
+        const said = edgarCompany.describeFilings(entity, ranked, { forms: form ? [form] : [], total: filed.length });
+        const caveats = [];
+        /* WHAT ACTUALLY HAPPENED, in the SEC's own words and with no model in
+           the path. An 8-K's item codes name the event from a closed regulatory
+           vocabulary — a departure, an acquisition, a restatement, an earnings
+           release — so this is the one part of "what changed today" that can be
+           answered without any possibility of invention. It leads the caveats
+           because it is the answer, not a footnote to it. */
+        const events = edgarCompany.describeEvents(entity, filed);
+        if (events) caveats.push(events);
+        if (alsoFiled) caveats.push(alsoFiled);
+        if (forms.length > 1) caveats.push(`I narrowed that to ${form}; you also asked for ${forms.slice(1).join(', ')}.`);
+        /* EDGAR prefix-matches the form, so a 10-K request returns 10-K/A too.
+           An amendment presented as the original is a real misreading, and the
+           feed tells us when one is present — so say it. */
+        if (form && filed.some((f) => f.form && f.form !== form)) {
+            const extra = [...new Set(filed.map((f) => f.form).filter((x) => x && x !== form))];
+            caveats.push(`EDGAR matches ${form} by prefix, so ${extra.join(' and ')} ${extra.length === 1 ? 'is' : 'are'} included.`);
+        }
+        if (alsoMatched.length) caveats.push(`Other filers also matched that name: ${alsoMatched.join(', ')}.`);
+
+        this.speak([said, ...caveats].join(' '));
+        this.displayText([
+            said,
+            ...caveats,
+            '',
+            `--- ${filed.length} filing${filed.length === 1 ? '' : 's'} from EDGAR (CIK ${parsed.cik || company.cik}${parsed.sic ? `, ${parsed.sic}` : ''}), most material first ---`,
+            ...ranked.map((f) => `${(f.filedAt || 'undated').padEnd(12)} ${(f.form || '?').padEnd(10)} ${f.formName || ''}\n    ${f.indexUrl || ''}`),
+            ...(suppressed.length ? ['', `--- ${suppressed.length} routine filing(s) not detailed ---`,
+                ...suppressed.map((f) => `${(f.filedAt || 'undated').padEnd(12)} ${(f.form || '?').padEnd(10)}`)] : []),
+            '',
+            `${ingested} filing${ingested === 1 ? '' : 's'} added to long-term memory — ask me about ${entity} and I will answer from these.`,
+        ].join('\n'), null);
+
+        if (!filed.length) return;      // nothing to discuss; no model call
+
+        /* 4b. THE LEDGER, built from the materiality-ranked list computed above.
+               The live run of 24 Jul 2026 fed twenty filings to gemma3:4b in
+               reverse-chronological order — fifteen of them Form 4s — and the
+               answer never mentioned the 10-Q at all. See rankFilings() for the
+               SEFD and Fin-RATE measurements this ordering comes from. */
+        const evidence = ranked.map((f) => ({
+            kind: 'feed',
+            /* The SEC's own purpose line rides along with each filing. The
+               model invented its own description of Form 144 ("a company
+               intends to sell a significant block of its own stock ... potential
+               dilution" — wrong on both counts) when nothing authoritative was
+               in front of it. */
+            text: [edgarCompany.toMemoryText(entity, f), edgarCompany.formPurpose(f.form)]
+                .filter(Boolean).join(' Form purpose: ') + '.',
+            url: f.indexUrl,
+            published: f.filedAt,
+            source: 'SEC EDGAR',
+            entity,
+        }));
+
+        /* 4c. READ THE TOP FILING. The stage whose absence produced the worst
+               fabrication in this project's log, and the one Fin-RATE measures
+               as the dominant bottleneck: "the retriever's failure to surface
+               essential evidence, not deficiencies in generation."
+
+               Bounded deliberately. ONE document, only when the top-ranked
+               filing is genuinely material (a periodic or event report, not an
+               S-8 or a Form 4), because this is the slow step and the voice
+               path cannot afford it on every question. */
+        const question = raw || `What has ${entity} filed with the SEC recently?`;
+
+        const target = ranked[0];
+        if (target && edgarCompany.formMateriality(target.form) >= 70 && window.electronAPI?.secDocument) {
+            this.displayText(`${said}\n\nReading the ${target.form} filed ${target.filedAt}...`, null);
+            const doc = await this._readSecFiling(target, question);
+            if (doc?.text) {
+                evidence.unshift({
+                    kind: 'document', text: doc.text, url: doc.url,
+                    published: target.filedAt, source: entity, entity,
+                });
+            }
+            if (doc?.note) console.info('Company filings document read:', doc.note);
+        }
+
+        const ledger = investigation.buildLedger(evidence);
+        const scope = investigation.parseTemporalScope(question);
+        const freshness = investigation.describeFreshness(ledger, { scope });
+
+        const prompt = investigation.buildSynthesisPrompt(question, ledger, { freshness });
+        if (!prompt) return;
+
+        const answer = await generateContentLocal(
+            [{ role: 'system', content: prompt }, { role: 'user', content: question }], null, {}
+        ).catch((e) => ({ error: e.message }));
+        if (!answer || answer.error) return;    // the filing list is already on screen
+
+        /* The guard runs over the ledger, so any figure the model adds to a set
+           of filing titles is caught. This is the highest-risk sentence in the
+           whole path: a form type and a date invite a confident summary of
+           contents that were never fetched. */
+        const grounded = guardOutput(String(answer), investigation.renderEvidence(ledger));
+        const body = grounded.blocked ? grounded.text : String(answer);
+        const withAge = freshness.stale ? `${freshness.note} ${body}` : body;
+
+        this.speak(withAge);
+        this.displayText(`${said}\n\n${withAge}\n\n--- evidence (${ledger.length} filings) ---\n${investigation.renderEvidence(ledger)}`, null);
+        if (grounded.blocked) {
+            console.warn('Company filings answer blocked:', grounded.found.map((f) => `${f.kind}=${f.value}`).join(', '));
+        }
+    }
+
+    /* EDGAR FULL-TEXT SEARCH — the pull side of the SEC data already arriving
+       by feed. The feeds say what was filed most recently; this answers "which
+       companies have said X", across the whole full-text index (2001 onward).
+
+       Every number and name spoken here comes out of the SEC's response. The
+       model is not in this path at all, which is the point: it is the same
+       contract as the quant and on-chain engines, for the same reason — a
+       plausible-sounding filing that does not exist is worse than no answer. */
+    async handleEdgarSearch({ term, forms = [], recent = false }) {
+        if (!window.electronAPI?.edgarSearch) {
+            this.speak('EDGAR search is not available in this environment, Sir.');
+            return;
+        }
+
+        /* Recency is resolved HERE because this is where a clock exists; the
+           parser stays pure. One year back, which is what "recently" means for
+           filings that arrive quarterly. */
+        let startdt = null, enddt = null;
+        if (recent) {
+            const now = new Date();
+            enddt = now.toISOString().slice(0, 10);
+            startdt = new Date(now.getTime() - 365 * 24 * 3600 * 1000).toISOString().slice(0, 10);
+        }
+
+        const url = buildEdgarUrl({ q: term, forms, startdt, enddt });
+        if (!url) { this.speak('I did not catch what to search EDGAR for, Sir.'); return; }
+
+        this.displayText(`Searching EDGAR full text for "${term}"${forms.length ? ` in ${forms.join(', ')}` : ''}...`, null);
+        const res = await window.electronAPI.edgarSearch({ url }).catch((e) => ({ success: false, error: e.message }));
+        if (!res?.success) {
+            // Named failure, never a silent fallback to the model.
+            this.speak(`I could not reach EDGAR, Sir: ${res?.error || 'no response'}.`);
+            return;
+        }
+
+        const parsed = parseEdgarResults(res.json, { limit: 10 });
+        const said = describeEdgarResults(term, parsed);
+        this.speak(said);
+        this.displayText(
+            `${said}\n\n` + parsed.results.map((r, i) =>
+                `${i + 1}. ${r.company || 'CIK ' + r.cik}${r.ticker ? ` (${r.ticker})` : ''} — ${r.form || ''} ${r.filedAt || ''}`
+                + `${r.items?.length ? ` [items ${r.items.join(', ')}]` : ''}\n   ${r.url || ''}`).join('\n'),
+            null);
+
+        /* Results go into long-term memory with their own provenance, so a
+           later question can be answered from what was actually found rather
+           than from a second live search. Best-effort: a memory failure must
+           never lose the answer that was already spoken. */
+        try {
+            for (const r of parsed.results.slice(0, 5)) {
+                const text = edgarMemoryText(r);
+                if (text) await ragService.ingest(text, { source: 'sec-edgar-search' });
+            }
+        } catch (e) { console.warn('EDGAR result ingest failed (answer already given):', e); }
     }
 
     async handleOnchainQuery(intent) {
@@ -4946,7 +5900,7 @@ class Jarvis {
     _rememberSpoken(text) {
         if (!text) return;
         this._spokenRecently = this._spokenRecently || [];
-        this._spokenRecently.push({ words: this._echoWords(text), at: Date.now() });
+        this._spokenRecently.push({ words: this._echoWords(text), phrase: this._echoPhrase(text), at: Date.now() });
         const cutoff = Date.now() - 20000;
         this._spokenRecently = this._spokenRecently.filter(e => e.at > cutoff);
         // Accumulate this turn's spoken output for the interaction log. Both
@@ -4998,25 +5952,79 @@ class Jarvis {
         );
     }
 
+    // Normalised phrase for substring echo detection — catches partial echoes
+    // where the mic picks up a fragment of Jarvis's speech that has too few
+    // words for the word-overlap guard (e.g. 2 words of a 10-word sentence).
+    _echoPhrase(text) {
+        return String(text)
+            .toLowerCase()
+            .replace(/[^a-z0-9\s]/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
     /**
      * True when a transcript overlaps heavily with something recently spoken.
      * Word-overlap rather than exact match, because the STT re-transcription of
      * synthesised speech is close but never identical.
+     *
+     * Three detection strategies (any match → echo):
+     *   1. Overlap ratio: ≥60% of input words appear in spoken words
+     *   2. Jaccard similarity: |intersection|/|union| ≥ 0.4
+     *   3. Substring match: normalised input appears inside a recent phrase
+     *      (catches 2-word fragments the word guards can't score)
      */
     _isEchoOfSelf(cmd) {
         const recent = this._spokenRecently || [];
         if (!recent.length) return false;
 
         const said = this._echoWords(cmd);
-        if (said.size < 3) return false; // too short to judge; let it through
+        // Lowered from 3→2: two-word echoes like "seventeen thousand" are real
+        // and were slipping through. Single words are still too ambiguous.
+        if (said.size < 2) return false;
+
+        const cmdPhrase = this._echoPhrase(cmd);
 
         for (const entry of recent) {
             if (!entry.words.size) continue;
+
+            // Strategy 1: overlap ratio (original guard)
             let hits = 0;
             for (const w of said) if (entry.words.has(w)) hits++;
             if (hits / said.size >= 0.6) return true;
+
+            // Strategy 2: Jaccard similarity — symmetric measure that catches
+            // cases where the input has few words but they are a subset of a
+            // much larger spoken phrase (overlap ratio is asymmetric).
+            const union = new Set([...said, ...entry.words]);
+            if (union.size > 0 && hits / union.size >= 0.4) return true;
+
+            // Strategy 3: substring match — if the normalised input phrase is
+            // contained verbatim within a recent spoken phrase, it's almost
+            // certainly echo. Only applies when input is ≥8 chars to avoid
+            // false-positives on common short phrases.
+            if (cmdPhrase.length >= 8 && entry.phrase && entry.phrase.includes(cmdPhrase)) {
+                return true;
+            }
         }
         return false;
+    }
+
+    /**
+     * The user started talking over the reply. Stop talking.
+     *
+     * Everything queued is dropped rather than paused: the answer to a
+     * question the user has already moved on from is not worth finishing, and
+     * resuming mid-sentence afterwards sounds like a fault.
+     */
+    _onBargeIn() {
+        console.log('Jarvis: barge-in — user is speaking, stopping playback');
+        if (this.neuralTTS) this.neuralTTS.interrupt();
+        try { this.synthesis.cancel(); } catch { /* noop */ }
+        this._flushSpeechQueue();
+        clearTimeout(this._ttsSafetyTimer);
+        this.ttsActive = false;
+        this._showTranscript('', 'ambient', 'LISTENING', 1200);
     }
 
     _handleVoiceTranscript(text, meta) {
@@ -5059,6 +6067,13 @@ class Jarvis {
         // query related to that term, and one and two"), which it then answered,
         // talking to itself. Compare against what was recently spoken.
         if (this._isEchoOfSelf(cmd)) {
+            // A barged transcript that turns out to be Jarvis's own words is
+            // proof the echo canceller is not holding on this hardware. One
+            // such miss is enough: keep barge-in on and every reply gets cut
+            // off by itself, which is worse than not having it.
+            if (meta && meta.barged && this.localVoice) {
+                this.localVoice.disableBargeIn('barge-in transcript was self-echo');
+            }
             this._showTranscript(t, 'ambient', 'ECHO IGNORED', 2500);
             return;
         }
@@ -5734,7 +6749,18 @@ class Jarvis {
                     // resolved it; the address was invented and stated as fact.
                     // Concrete identifiers are the highest-harm thing to guess,
                     // because he acts on them.
-                    + ' NEVER state a specific IP address, MAC address, port number, hostname, price, balance, device name, network name, or any other concrete measured value unless it appears verbatim in the context above. You have no ability to look these up or scan for them while answering. If you do not have the value, say you do not have it and stop — a plausible-looking number or a placeholder name is worse than no answer. Never invent example names such as "Device_XYZ".'
+                    /* THE OFFER-THEN-FABRICATE LOOP, from the live session of
+                       22 Jul 2026. The model answered "I can access SEC XBRL
+                       filings from July 21st... Would you like me to display
+                       the details?" — it could not; the feed carries a title,
+                       a date and a link. The user said "yes", and over eight
+                       turns it invented an entire Goldman Sachs compensation
+                       structure, ending at "$8.5 billion" and "1.25 skew
+                       factor". The existing rules forbid claiming an ACTION;
+                       nothing forbade claiming ACCESS, and the offer is what
+                       obliged it to produce something on the next turn. */
+                    + ' Never offer to retrieve, display, elaborate on, or look up anything. You have no ability to fetch anything while answering: the only information you have is the context above. If the context contains a filing title and date but not its contents, say exactly that and stop — do not offer to show details you do not have. Answer from what is in front of you or say it is not there.'
+                    + ' NEVER state a specific IP address, MAC address, port number, hostname, price, balance, device name, network name, dollar amount, financial metric, or any other concrete measured value unless it appears verbatim in the context above. You have no ability to look these up or scan for them while answering. If you do not have the value, say you do not have it and stop — a plausible-looking number or a placeholder name is worse than no answer. Never invent example names such as "Device_XYZ".'
                     + sysContext + memoryContext + webContext + factContext
             },
             ...history,

@@ -10,6 +10,13 @@ const { CompanionBridge, WS_PORT: COMPANION_WS_PORT } = require('./companionBrid
 const adbService = require('./adbService');
 const { hedgedRace, createStickyOrder } = require('./rpcHedge');
 const chainProviders = require('./chainProviders');
+const {
+    BACKENDS: VISION_BACKENDS,
+    chooseBackend: chooseVisionBackend,
+    pagePrompt: visionPagePrompt,
+    buildVisionPayload,
+    assemblePages: assembleVisionPages,
+} = require('./visionRouter');
 
 /* =========================
    LOCAL SECRETS (.env)
@@ -45,6 +52,29 @@ if (ENV_KEYS_PRESENT.length) console.log('[env] loaded keys:', ENV_KEYS_PRESENT.
 const OCR_SERVER_URL = process.env.JARVIS_OCR_URL || 'http://127.0.0.1:10000';
 const OCR_MAX_PDF_PAGES = 20; // safety limit; model supports dozens of pages in one pass
 const OCR_TIMEOUT_MS = 300000; // long-horizon parsing can take minutes on consumer GPUs
+
+/* =========================
+   VISIONPSY CONFIG (CPU document fallback)
+   qvac/VisionPsy-Nano-460M via llama.cpp's llama-server.
+
+   Exists because Unlimited-OCR needs an NVIDIA card with 6-8GB of VRAM plus
+   SGLang, and on a machine without one document parsing does not degrade — it
+   is simply absent. That matters more than it sounds: the Downloads watcher
+   already ingests parsed documents into the RAG corpus and says "I have read
+   and memorized {name}", but it is gated on an OCR server being reachable, so
+   on CPU-only machines that whole memory path never runs.
+
+   The STANDARD variant, not Flash: Flash's own model card says its largest
+   quality gaps are in OCR and fine-grained perception, which is precisely
+   what this path is for. Flash is for glance-and-answer, not documents.
+========================= */
+const VISION_SERVER_URL = process.env.JARVIS_VISION_URL || 'http://127.0.0.1:8772';
+const VISION_MODEL_PATH = process.env.JARVIS_VISION_MODEL || '';
+const VISION_MMPROJ_PATH = process.env.JARVIS_VISION_MMPROJ || '';
+const VISION_SERVER_BIN = process.env.JARVIS_LLAMA_SERVER || 'llama-server';
+// One page at a time: VisionPsy is single-image by design ("one image per
+// query"), so pages are looped rather than batched the way SGLang allows.
+const VISION_PAGE_TIMEOUT_MS = 120000;
 
 /* =========================
    LOCAL LLM CONFIG (Ollama)
@@ -196,6 +226,9 @@ app.whenReady().then(async () => {
     setTimeout(compactMetrics, 90000);
     setInterval(compactMetrics, 6 * 3600 * 1000);
     startSttServer();
+    startTtsServer();
+    // No-op unless the VisionPsy weights are configured; see startVisionServer.
+    startVisionServer();
     // Not awaited — readiness polling + model warm must not block the window.
     startOllamaServer();
     // Probe which chains the configured keys actually serve. Not awaited and
@@ -351,19 +384,55 @@ ipcMain.handle('capture-screen', async () => {
 ========================= */
 
 // Health check so the renderer can toggle between Cloud OCR and Local OCR
-ipcMain.handle('check-ocr-server', async () => {
+async function unlimitedOcrAlive() {
     try {
         const res = await axios.get(`${OCR_SERVER_URL}/health`, { timeout: 2000 });
-        return { available: res.status === 200, url: OCR_SERVER_URL };
+        return res.status === 200;
     } catch {
         // SGLang also answers /v1/models; try it as a fallback probe
         try {
             const res = await axios.get(`${OCR_SERVER_URL}/v1/models`, { timeout: 2000 });
-            return { available: res.status === 200, url: OCR_SERVER_URL };
+            return res.status === 200;
         } catch {
-            return { available: false, url: OCR_SERVER_URL };
+            return false;
         }
     }
+}
+
+async function visionServerAlive() {
+    try {
+        const res = await axios.get(`${VISION_SERVER_URL}/health`, { timeout: 2000 });
+        return res.status === 200;
+    } catch {
+        try {
+            const res = await axios.get(`${VISION_SERVER_URL}/v1/models`, { timeout: 2000 });
+            return res.status === 200;
+        } catch {
+            return false;
+        }
+    }
+}
+
+/* Reports EITHER backend, deliberately.
+   The renderer's isOcrAvailable() gates more than a feature flag: the Downloads
+   watcher only reaches its ragService.ingest() call when this says yes, so a
+   probe that knows about the GPU server alone leaves the CPU-only machine with
+   documents it can read but never remember. `backend` is reported so callers
+   can say which one answered rather than implying the GPU path is up. */
+ipcMain.handle('check-ocr-server', async () => {
+    const [ocr, vision] = await Promise.all([unlimitedOcrAlive(), visionServerAlive()]);
+    const backend = chooseVisionBackend({ ocrAvailable: ocr, visionAvailable: vision });
+    return {
+        available: backend !== null,
+        backend,
+        url: backend === VISION_BACKENDS.VISIONPSY ? VISION_SERVER_URL : OCR_SERVER_URL,
+        backends: { unlimitedOcr: ocr, visionPsy: vision },
+    };
+});
+
+ipcMain.handle('check-vision-server', async () => {
+    const available = await visionServerAlive();
+    return { available, url: VISION_SERVER_URL, model: VISION_MODEL_PATH || null };
 });
 
 async function collectOcrImages(request) {
@@ -397,6 +466,37 @@ async function collectOcrImages(request) {
     return { images: [imageBuffer.toString('base64')], isMultiPage: false };
 }
 
+/**
+ * VisionPsy parse: one request per page, stitched back together.
+ *
+ * The loop is not a shortcut around batching — the model card states "one
+ * image per query" outright, so a multi-image request is outside what the
+ * model was built to answer. Pages are attempted independently so that one
+ * failure costs one page rather than the document.
+ */
+async function performVisionPsyOcr(images) {
+    const pages = [];
+    for (let i = 0; i < images.length; i++) {
+        try {
+            const payload = buildVisionPayload({
+                imageBase64: images[i],
+                prompt: visionPagePrompt(i, images.length),
+            });
+            const res = await axios.post(
+                `${VISION_SERVER_URL}/v1/chat/completions`,
+                payload,
+                { timeout: VISION_PAGE_TIMEOUT_MS }
+            );
+            const markdown = res.data?.choices?.[0]?.message?.content;
+            pages.push({ page: i + 1, markdown: markdown || '', error: markdown ? undefined : 'empty response' });
+        } catch (e) {
+            console.warn(`VisionPsy: page ${i + 1} failed:`, e.message);
+            pages.push({ page: i + 1, error: e.message });
+        }
+    }
+    return assembleVisionPages(pages);
+}
+
 ipcMain.handle('perform-ocr', async (event, request) => {
     try {
         // Back-compat: old callers passed a bare string path
@@ -406,6 +506,39 @@ ipcMain.handle('perform-ocr', async (event, request) => {
         }
 
         const { images, isMultiPage } = await collectOcrImages(request);
+
+        /* Backend choice happens per request, not at boot: the GPU server is
+           often started by hand after Jarvis is already running, and pinning
+           the decision would keep sending work to the CPU model afterwards. */
+        const [ocrUp, visionUp] = await Promise.all([unlimitedOcrAlive(), visionServerAlive()]);
+        const backend = chooseVisionBackend({
+            ocrAvailable: ocrUp,
+            visionAvailable: visionUp,
+            preferred: request.backend,
+        });
+
+        if (backend === null) {
+            throw new Error(
+                'No vision backend is running. Start the Unlimited-OCR server ' +
+                'for GPU parsing, or VisionPsy for CPU parsing (see docs/OCR-SETUP.md)'
+            );
+        }
+
+        if (backend === VISION_BACKENDS.VISIONPSY) {
+            const result = await performVisionPsyOcr(images);
+            if (result.ok === 0) {
+                throw new Error(`VisionPsy parsed no pages of ${images.length}`);
+            }
+            return {
+                success: true,
+                markdown: result.markdown,
+                pages: images.length,
+                pagesParsed: result.ok,
+                pagesFailed: result.failed,
+                backend,
+                mode: 'visionpsy',
+            };
+        }
 
         // Model card: single page -> "gundam" mode + window 128,
         //             multi-page  -> "base" mode + window 1024
@@ -441,11 +574,15 @@ ipcMain.handle('perform-ocr', async (event, request) => {
         const markdown = response.data?.choices?.[0]?.message?.content;
         if (!markdown) throw new Error('OCR server returned an empty response');
 
-        return { success: true, markdown, pages: images.length, mode: imageMode };
+        return {
+            success: true, markdown, pages: images.length, mode: imageMode,
+            backend: VISION_BACKENDS.UNLIMITED_OCR,
+        };
     } catch (error) {
-        console.error('Unlimited-OCR error:', error.message);
+        console.error('Document parse error:', error.message);
         const hint = error.code === 'ECONNREFUSED'
-            ? ` (Is the SGLang server running at ${OCR_SERVER_URL}? See docs/OCR-SETUP.md)`
+            ? ` (No parser reachable. Unlimited-OCR at ${OCR_SERVER_URL} needs an NVIDIA GPU;` +
+              ` VisionPsy at ${VISION_SERVER_URL} runs on CPU. See docs/OCR-SETUP.md)`
             : '';
         return { success: false, error: `${error.message}${hint}` };
     }
@@ -1808,9 +1945,79 @@ function startSttServer() {
     }
 }
 
+/* ========================= NEURAL TTS SERVER (edge-tts) ========================= */
+let ttsProcess = null;
+
+function startTtsServer() {
+    try {
+        ttsProcess = spawn('uv', [
+            'run', '--python', '3.12',
+            '--with', 'edge-tts', '--with', 'websockets',
+            'python', '-I', 'server/tts-server.py'
+        ], { cwd: __dirname, windowsHide: true, stdio: 'ignore' });
+
+        ttsProcess.on('error', (e) => {
+            console.warn('TTS server spawn failed (falling back to SAPI):', e.message);
+            ttsProcess = null;
+        });
+        ttsProcess.on('exit', (code) => {
+            console.log('TTS server exited with code', code);
+            ttsProcess = null;
+            // AUTO-RESPAWN: same pattern as STT server.
+            if (!app.isQuittingJarvis) {
+                setTimeout(() => { if (!ttsProcess) startTtsServer(); }, 15000);
+            }
+        });
+        console.log('TTS server spawning (edge-tts, port 8771)');
+    } catch (e) {
+        console.warn('TTS server unavailable (SAPI fallback active):', e.message);
+    }
+}
+
+/* ================= VISION SERVER (VisionPsy-Nano via llama.cpp) =================
+   Only started when the model files are configured. Unlike STT/TTS this has no
+   sensible default path — the weights are a few hundred MB the user downloads
+   themselves — so an unset JARVIS_VISION_MODEL means "not installed" and the
+   server is simply never spawned. Nothing degrades: the OCR path already
+   reports which backends are up and errors honestly when none are. */
+let visionProcess = null;
+
+function startVisionServer() {
+    if (!VISION_MODEL_PATH || !VISION_MMPROJ_PATH) {
+        console.log('Vision server: not configured (set JARVIS_VISION_MODEL and JARVIS_VISION_MMPROJ)');
+        return;
+    }
+    try {
+        const port = new URL(VISION_SERVER_URL).port || '8772';
+        visionProcess = spawn(VISION_SERVER_BIN, [
+            '-m', VISION_MODEL_PATH,
+            '--mmproj', VISION_MMPROJ_PATH,
+            '--port', port,
+            '--host', '127.0.0.1',
+        ], { cwd: __dirname, windowsHide: true, stdio: 'ignore' });
+
+        visionProcess.on('error', (e) => {
+            console.warn(`Vision server spawn failed (is '${VISION_SERVER_BIN}' on PATH?):`, e.message);
+            visionProcess = null;
+        });
+        visionProcess.on('exit', (code) => {
+            console.log('Vision server exited with code', code);
+            visionProcess = null;
+            if (!app.isQuittingJarvis) {
+                setTimeout(() => { if (!visionProcess) startVisionServer(); }, 15000);
+            }
+        });
+        console.log(`Vision server spawning (VisionPsy-Nano, port ${port})`);
+    } catch (e) {
+        console.warn('Vision server unavailable:', e.message);
+    }
+}
+
 app.on('before-quit', () => {
-    app.isQuittingJarvis = true; // stop the STT/Ollama respawn loops
+    app.isQuittingJarvis = true; // stop the STT/TTS/Ollama/vision respawn loops
+    if (visionProcess) try { visionProcess.kill(); } catch { /* noop */ }
     if (sttProcess) try { sttProcess.kill(); } catch { /* noop */ }
+    if (ttsProcess) try { ttsProcess.kill(); } catch { /* noop */ }
     // Only ours to kill — an Ollama we merely reused stays up for the user.
     if (ollamaProcess) try { ollamaProcess.kill(); } catch { /* noop */ }
     // Unpublish mDNS and drop companion sockets cleanly, otherwise the phone
@@ -2579,17 +2786,38 @@ async function saveChainWatchlist(list) {
     return writeJsonStore(CHAIN_WATCHLIST_FILE(), list, 'address watchlist');
 }
 
-/* ETH/USD context for whale announcements. Best-effort with a 5-minute cache —
-   reuses the existing keyless Yahoo quote path; a missing price simply means
-   the alert speaks ETH amounts only, never a made-up dollar figure. */
-let ethUsdCache = { price: null, at: 0 };
-async function getEthUsd() {
-    if (Date.now() - ethUsdCache.at < 5 * 60 * 1000) return ethUsdCache.price;
+/* Native/USD context for whale announcements. Best-effort with a 5-minute
+   cache — reuses the existing keyless Yahoo quote path; a missing price simply
+   means the alert speaks native amounts only, never a made-up dollar figure.
+
+   Priced PER CHAIN, not per network family. This used to be a single ETH/USD
+   figure applied to every chain's native transfer, which is only correct on
+   the four chains whose native asset actually is ETH: a 500,000 POL transfer
+   on Polygon was announced at ETH's price, roughly a thousand times its real
+   value. That is worse than an unpriced alert, and worse still because whales
+   are ranked by dollar value — one mispriced POL transfer outranked every
+   genuine movement in the block and took both spoken slots. */
+const NATIVE_USD_TICKER = {
+    ETH: 'ETH-USD',
+    POL: 'POL-USD',
+    BNB: 'BNB-USD',
+};
+const nativeUsdCache = new Map();   // symbol -> { price, at }
+async function getNativeUsd(symbol) {
+    const ticker = NATIVE_USD_TICKER[symbol];
+    // An asset with no known ticker stays unpriced rather than borrowing
+    // another asset's price.
+    if (!ticker) return null;
+
+    const hit = nativeUsdCache.get(symbol);
+    if (hit && Date.now() - hit.at < 5 * 60 * 1000) return hit.price;
     try {
-        const q = await fetchQuoteYahoo('ETH-USD');
-        ethUsdCache = { price: q?.price || null, at: Date.now() };
-    } catch { ethUsdCache = { price: null, at: Date.now() }; }
-    return ethUsdCache.price;
+        const q = await fetchQuoteYahoo(ticker);
+        nativeUsdCache.set(symbol, { price: q?.price || null, at: Date.now() });
+    } catch {
+        nativeUsdCache.set(symbol, { price: null, at: Date.now() });
+    }
+    return nativeUsdCache.get(symbol).price;
 }
 
 /* --- ERC-20 whale tracking -------------------------------------------------
@@ -2776,17 +3004,26 @@ function startChainStream(chainKey = 'ethereum') {
                 fromBlock: blockHex, toBlock: blockHex, address: tokenAddrs, topics: [TRANSFER_TOPIC],
             }]).catch(() => null);
             if (Array.isArray(logs)) {
+                // Only used when a token has no measured price: a large round
+                // number of units, stated without a dollar claim.
+                const rawFloors = { USDC: 10n ** 12n, USDT: 10n ** 12n, DAI: 10n ** 24n };
                 const scanned = scanTokenLogs(logs, {
                     chain: chainKey, tokens, prices, minUsd: TOKEN_WHALE_MIN_USD,
-                    // Only used when a token has no measured price: a large
-                    // round number of units, stated without a dollar claim.
-                    minAmount: { USDC: 10n ** 12n, USDT: 10n ** 12n, DAI: 10n ** 24n },
+                    minAmount: rawFloors,
                     watch: watchedAddrs,
                 });
-                // One transaction routing the same token through several pools
-                // is ONE movement, not one alert per hop (live-verified: a
-                // single arb tx otherwise announced $27M three times).
-                tokenWhales = aggregateTokenWhales(scanned.whales);
+                /* Aggregate over EVERY transfer in the block, then apply the
+                   floor to the resulting movement. Passing only the hops that
+                   individually cleared the floor hid the rest of the route, so
+                   a movement whose final hop was small was reported as ending
+                   at the wrong address.
+                   One transaction routing the same token through several pools
+                   is ONE movement, not one alert per hop (live-verified: a
+                   single arb tx otherwise announced $27M three times) — but a
+                   batch paying several recipients stays several movements. */
+                tokenWhales = aggregateTokenWhales(scanned.transfers, {
+                    minUsd: TOKEN_WHALE_MIN_USD, minAmount: rawFloors,
+                });
                 tokenHits = scanned.watchHits;
 
                 /* Issuance rides the SAME logs — a mint is a Transfer from 0x0
@@ -2805,17 +3042,23 @@ function startChainStream(chainKey = 'ethereum') {
             }
         }
 
-        // Duplicate suppression across reconnect replays and backfill overlap.
-        // Token and native events from the SAME tx hash are distinct facts, so
-        // the dedup key carries the symbol.
+        /* Duplicate suppression across reconnect replays and backfill overlap.
+           Token and native events from the SAME tx hash are distinct facts, so
+           the dedup key carries the symbol — and, since a batch transaction now
+           yields one movement PER RECIPIENT rather than a single collapsed row,
+           the counterparty too. Keyed on hash+symbol alone, a payout to five
+           addresses announced the first and silently swallowed the other four. */
         const freshWhales = whales.filter(w => !state.dedup.seen(`${chainKey}:${w.hash}:w`));
         const freshHits = watchHits.filter(h => !state.dedup.seen(`${chainKey}:${h.hash}:h`));
-        const freshTokenWhales = tokenWhales.filter(w => !state.dedup.seen(`${chainKey}:${w.hash}:${w.symbol}:w`));
-        const freshTokenHits = tokenHits.filter(h => !state.dedup.seen(`${chainKey}:${h.hash}:${h.symbol}:h`));
+        const freshTokenWhales = tokenWhales.filter(
+            w => !state.dedup.seen(`${chainKey}:${w.hash}:${w.symbol}:${w.from}>${w.to}:w`));
+        const freshTokenHits = tokenHits.filter(
+            h => !state.dedup.seen(`${chainKey}:${h.hash}:${h.symbol}:${h.from}>${h.to}:h`));
         state.procCount++; state.procTotalMs += Date.now() - t0;
         if (!freshWhales.length && !freshHits.length && !freshTokenWhales.length && !freshTokenHits.length) return;
 
-        const price = await getEthUsd();
+        const nativeSymbol = CHAIN_IDS[chainKey]?.native || 'ETH';
+        const price = await getNativeUsd(nativeSymbol);
         const usdOf = (amount) => price ? Math.round(parseFloat(String(amount).replace(/,/g, '')) * price) : null;
 
         // Watch hits ALWAYS announce — the user asked about these addresses.
@@ -2840,7 +3083,6 @@ function startChainStream(chainKey = 'ethereum') {
            question, not one per asset. USD is attached before ranking so the
            comparison is between measured values, not raw units of different
            tokens. */
-        const nativeSymbol = CHAIN_IDS[chainKey]?.native || 'ETH';
         const priced = [
             ...freshWhales.map(w => ({ ...w, asset: nativeSymbol, usd: usdOf(w.amount) })),
             ...freshTokenWhales.map(w => ({ ...w, asset: w.symbol })),
@@ -3325,6 +3567,182 @@ ipcMain.handle('get-history', async (event, opts) => {
     }
 });
 
+/* =========================
+   PEER-RELATIVE MOVE. "Micron fell 9.9%" and "the memory sector fell 5% and
+   Micron fell 9.9%" are different answers, and only the second one is useful.
+   Measured 30 Jul 2026: the complex moves together (MU/SNDK r=0.84,
+   SNDK/SKHY r=0.80), so an absolute move quoted alone attributes a sector
+   repricing to one company.
+
+   Dated closes rather than the bare `closes` array that get-history returns:
+   the split has to align two venues BY DATE, and a Seoul listing and a Nasdaq
+   one do not share a trading calendar.
+========================= */
+const { PEER_GROUPS, analyzeMove, describeMove } = require('./sectorMove');
+
+async function fetchDatedCloses(symbol, range = '6mo') {
+    const res = await fetch(
+        `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=${range}`,
+        { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(12000) },
+    );
+    if (!res.ok) throw new Error(`yahoo history ${res.status}`);
+    const r = (await res.json())?.chart?.result?.[0];
+    const ts = r?.timestamp || [];
+    const closes = r?.indicators?.quote?.[0]?.close || [];
+    return {
+        symbol,
+        currency: r?.meta?.currency || 'USD',
+        name: r?.meta?.shortName || r?.meta?.longName || symbol,
+        series: ts
+            .map((t, i) => ({ d: new Date(t * 1000).toISOString().slice(0, 10), c: closes[i] }))
+            .filter((p) => p.c != null && p.c > 0),
+    };
+}
+
+/** "memory sector", "memory stocks", "memory" -> the group key, or null. */
+function matchPeerGroup(text) {
+    const t = String(text || '').toLowerCase().replace(/\b(sector|stocks?|complex|names?|group|space)\b/g, ' ')
+        .replace(/\s+/g, ' ').trim();
+    if (!t) return null;
+    return Object.keys(PEER_GROUPS).find(
+        (k) => k === t || PEER_GROUPS[k].name.toLowerCase().includes(t) || t.includes(k),
+    ) || null;
+}
+
+ipcMain.handle('get-sector-move', async (event, opts) => {
+    try {
+        const raw = opts?.text || opts?.symbol || '';
+        /* GROUP-WIDE. "break down the memory sector" names no company, and
+           resolving it as a ticker used to produce whatever Yahoo's search
+           thought "memory" meant. A group name is matched FIRST and answered
+           with every member, which is what the question asked for. */
+        const namedGroup = (opts?.group && PEER_GROUPS[opts.group]) ? opts.group : matchPeerGroup(raw);
+        if (namedGroup && !opts?.symbol) {
+            const group = PEER_GROUPS[namedGroup];
+            const range = HISTORY_RANGES.has(opts?.range) ? opts.range : '6mo';
+            const fetched = await Promise.all(group.members.map(
+                (s) => fetchDatedCloses(s, range).catch((e) => ({ symbol: s, series: [], error: e.message })),
+            ));
+            const usable = fetched.filter((f) => f.series.length > 1);
+            const members = usable.map((t) => ({
+                ...analyzeMove(t, usable.filter((p) => p.symbol !== t.symbol)),
+                name: t.name,
+                currency: t.currency,
+            }));
+            return {
+                success: true,
+                group: namedGroup,
+                groupName: group.name,
+                groupWide: true,
+                offIndex: group.offIndex || [],
+                unavailable: fetched.filter((f) => f.error).map((f) => ({ symbol: f.symbol, error: f.error })),
+                /* Ranked by what belongs to the company, not by the raw move:
+                   "who is holding up" is a question about idiosyncratic
+                   strength, and the largest faller is often just the highest
+                   beta. Nulls sort last rather than to the top as 0. */
+                members: members.sort((a, b) => (b.idiosyncratic ?? -Infinity) - (a.idiosyncratic ?? -Infinity)),
+            };
+        }
+
+        const symbol = await resolveSymbol(raw);
+        if (!symbol) return { success: false, error: 'no matching symbol' };
+
+        /* An explicit group wins; otherwise use the one that already contains
+           this symbol. Nothing is inferred from correlation — a peer group is
+           a product-market claim, and guessing one from a chart is how an
+           unrelated name ends up quoted as a peer. */
+        const groupKey = opts?.group && PEER_GROUPS[opts.group]
+            ? opts.group
+            : Object.keys(PEER_GROUPS).find((k) => PEER_GROUPS[k].members.includes(symbol));
+        if (!groupKey) {
+            return { success: false, error: `no peer group defined for ${symbol}`, symbol };
+        }
+        const group = PEER_GROUPS[groupKey];
+        const range = HISTORY_RANGES.has(opts?.range) ? opts.range : '6mo';
+
+        const wanted = [...new Set([symbol, ...group.members])];
+        const fetched = await Promise.all(wanted.map(
+            (s) => fetchDatedCloses(s, range).catch((e) => ({ symbol: s, series: [], error: e.message })),
+        ));
+        const target = fetched.find((f) => f.symbol === symbol);
+        if (!target || target.series.length < 2) {
+            return { success: false, error: `no usable history for ${symbol}`, symbol };
+        }
+        const peers = fetched.filter((f) => f.symbol !== symbol && f.series.length > 1);
+
+        const analysis = analyzeMove(target, peers);
+        return {
+            success: true,
+            group: groupKey,
+            groupName: group.name,
+            currency: target.currency,
+            name: target.name,
+            /* Names in the same market that cannot enter the index — a private
+               competitor or a venue we do not price — are reported rather than
+               silently omitted from "the sector". */
+            offIndex: group.offIndex || [],
+            unavailable: fetched.filter((f) => f.error).map((f) => ({ symbol: f.symbol, error: f.error })),
+            analysis,
+            spoken: describeMove(analysis),
+        };
+    } catch (error) {
+        return { success: false, error: error.message };
+    }
+});
+
+/* =========================
+   PORTFOLIO RISK. Single-security analytics answer "how risky is this"; only
+   the covariance answers "where is the risk in what I actually hold". Measured
+   30 Jul 2026 on four memory names: equal dollar weights put 40.4% of the risk
+   in one holding, and the diversification ratio was 1.095 — four positions
+   behaving very nearly as one.
+
+   The holdings come from the watchlist by default, so "how risky is my
+   watchlist" needs no arguments.
+========================= */
+/* FETCHES ONLY. The covariance maths lives in src/js/services/portfolio.js,
+   which is an ES module beside quant.js, and this file is CommonJS and cannot
+   import one — the same constraint edgarGuard.js documents. So main returns
+   dated closes and the renderer computes, exactly as handleQuantQuery already
+   does with quant.js. Dated, not a bare closes[] array: covariance has to align
+   holdings BY DATE, and a Seoul listing and a Nasdaq one do not share a
+   calendar. */
+ipcMain.handle('get-portfolio-series', async (event, opts) => {
+    try {
+        let symbols = Array.isArray(opts?.symbols) && opts.symbols.length ? opts.symbols : null;
+        if (!symbols) {
+            const wl = await loadWatchlist();
+            symbols = (wl || []).map((w) => w.symbol).filter(Boolean);
+        }
+        /* A named peer group is a valid book to ask about too. */
+        if ((!symbols || symbols.length < 2) && opts?.group && PEER_GROUPS[opts.group]) {
+            symbols = PEER_GROUPS[opts.group].members;
+        }
+        if (!symbols || symbols.length < 2) {
+            return { success: false, error: 'need at least two holdings — add more to the watchlist' };
+        }
+        symbols = [...new Set(symbols)].slice(0, 20);
+
+        const range = HISTORY_RANGES.has(opts?.range) ? opts.range : '6mo';
+        const fetched = await Promise.all(symbols.map(
+            (s) => fetchDatedCloses(s, range).catch((e) => ({ symbol: s, series: [], error: e.message })),
+        ));
+        const seriesBySymbol = {};
+        for (const f of fetched) if (f.series.length > 1) seriesBySymbol[f.symbol] = f.series;
+        if (Object.keys(seriesBySymbol).length < 2) {
+            return { success: false, error: 'not enough usable price history' };
+        }
+        return {
+            success: true,
+            range,
+            unavailable: fetched.filter((f) => f.error).map((f) => ({ symbol: f.symbol, error: f.error })),
+            seriesBySymbol,
+        };
+    } catch (error) {
+        return { success: false, error: error.message };
+    }
+});
+
 // Keyless news via RSS. RSS is used deliberately over scraping a news site's
 // HTML: it is a stable, structured contract with real per-item timestamps and
 // source attribution, which snippet scraping cannot give.
@@ -3471,6 +3889,151 @@ ipcMain.handle('feed-fetch', async (event, { url, needsUserAgent = false } = {})
         if (!res.ok) return { success: false, error: `http ${res.status}` };
         return { success: true, xml: await res.text(), fetchedAt: Date.now() };
     } catch (e) { return { success: false, error: e.message }; }
+});
+
+/* EDGAR FULL-TEXT SEARCH. Separate from feed-fetch for three reasons: the
+   response is JSON not XML, the host is efts.sec.gov rather than sec.gov, and
+   the URL is built by the renderer's edgarSearch.js — so this handler PINS the
+   host rather than trusting whatever URL arrives. A search endpoint that will
+   fetch any host is an SSRF hole, and this one is reachable from voice input.
+   SEC's fair-access policy requires the declared User-Agent on this host too. */
+/* Guard lives in edgarGuard.js so it is unit-tested rather than trusted; see
+   that file for what each rejection is defending against. */
+const { checkEdgarUrl, EDGAR_MAX_BYTES, checkSecDocumentUrl, SEC_DOC_MAX_BYTES,
+    buildCompanyFeedUrl, SEC_TICKERS_URL, SEC_TICKERS_MAX_BYTES } = require('./edgarGuard');
+
+/* SEC DOCUMENT FETCH — the stage whose absence produced the worst fabrication
+   in this project's log. On 22 Jul 2026 the assistant had a filing TITLE and
+   invented its contents across eight turns; the document itself was one
+   request away (measured: 0.68s, 354KB). This handler is that request.
+   Host-pinned like edgar-search, and for the same reason: it is reachable from
+   spoken input. */
+ipcMain.handle('sec-document', async (event, { url } = {}) => {
+    const guard = checkSecDocumentUrl(url);
+    if (!guard.ok) return { success: false, error: `sec-document: ${guard.error}` };
+    try {
+        const t0 = Date.now();
+        const res = await fetch(guard.url, {
+            headers: { 'User-Agent': SEC_UA, Accept: 'text/html,application/json' },
+            signal: AbortSignal.timeout(30000),
+            redirect: 'error',
+        });
+        if (!res.ok) return { success: false, error: `http ${res.status}` };
+        const declared = Number(res.headers.get('content-length') || 0);
+        if (declared > SEC_DOC_MAX_BYTES) return { success: false, error: 'document too large' };
+        const body = await res.text();
+        if (body.length > SEC_DOC_MAX_BYTES) return { success: false, error: 'document too large' };
+        return { success: true, body, bytes: body.length, ms: Date.now() - t0, url: guard.url, fetchedAt: Date.now() };
+    } catch (e) { return { success: false, error: e.message }; }
+});
+
+ipcMain.handle('edgar-search', async (event, { url } = {}) => {
+    const guard = checkEdgarUrl(url);
+    if (!guard.ok) return { success: false, error: `edgar-search: ${guard.error}` };
+    try {
+        const t0 = Date.now();
+        const res = await fetch(guard.url, {
+            headers: { 'User-Agent': SEC_UA, Accept: 'application/json' },
+            signal: AbortSignal.timeout(20000),
+            // Never follow a redirect off the pinned host. An error here is the
+            // correct outcome: it means the endpoint moved and this needs a
+            // human, not a silent fetch of wherever it pointed.
+            redirect: 'error',
+        });
+        if (!res.ok) return { success: false, error: `http ${res.status}` };
+
+        const ctype = String(res.headers.get('content-type') || '');
+        if (!/\bjson\b/i.test(ctype)) return { success: false, error: `unexpected content-type ${ctype || 'none'}` };
+
+        /* Read as text with a ceiling before parsing. Content-Length is a
+           claim, not a guarantee, so the bound is enforced on what actually
+           arrived; an unbounded res.json() on a hostile or broken response is
+           a memory exhaustion path in the main process. */
+        const declared = Number(res.headers.get('content-length') || 0);
+        if (declared > EDGAR_MAX_BYTES) return { success: false, error: 'response too large' };
+        const body = await res.text();
+        if (body.length > EDGAR_MAX_BYTES) return { success: false, error: 'response too large' };
+
+        let json;
+        try { json = JSON.parse(body); }
+        catch { return { success: false, error: 'response was not valid json' }; }
+
+        return { success: true, json, ms: Date.now() - t0, bytes: body.length, fetchedAt: Date.now() };
+    } catch (e) { return { success: false, error: e.message }; }
+});
+
+/* PER-COMPANY FILINGS FEED — "sec filings of google".
+   Takes a CIK and a form type, never a URL: buildCompanyFeedUrl composes the
+   whole thing from validated primitives, so a spoken company name reaches the
+   network as at most ten digits. That is a smaller surface than the two
+   handlers above, which have to defend a caller-supplied string.
+
+   NOTE ON THE 200-WITH-HTML CASE: an unknown CIK is served as a normal HTML
+   page, not a 404. This handler does NOT try to detect that — parseCompanyFeed
+   in the renderer does, because distinguishing "no such filer" from "filed
+   nothing" is a parsing question and belongs where it can be unit-tested. */
+ipcMain.handle('sec-company-feed', async (event, { cik, type, count } = {}) => {
+    const built = buildCompanyFeedUrl({ cik, type, count });
+    if (!built.ok) return { success: false, error: `sec-company-feed: ${built.error}` };
+    try {
+        const t0 = Date.now();
+        const res = await fetch(built.url, {
+            headers: { 'User-Agent': SEC_UA, Accept: 'application/atom+xml,application/xml,text/xml' },
+            signal: AbortSignal.timeout(20000),
+            redirect: 'error',
+        });
+        if (!res.ok) return { success: false, error: `http ${res.status}` };
+        const body = await res.text();
+        if (body.length > EDGAR_MAX_BYTES) return { success: false, error: 'response too large' };
+        return { success: true, xml: body, bytes: body.length, ms: Date.now() - t0, url: built.url, fetchedAt: Date.now() };
+    } catch (e) { return { success: false, error: e.message }; }
+});
+
+/* THE TICKER -> CIK MAP. 798KB, and it changes when companies list or delist —
+   daily at the fastest. Fetching it per question would be 798KB to answer "sec
+   filings of google", so it is cached on disk for a day.
+
+   The cache is served even when it is stale and the refetch fails: a
+   month-old ticker map still resolves Apple to CIK 320193 correctly, and
+   refusing to answer because a refresh failed would be worse than answering
+   from it. `stale` says which happened so the renderer can tell the truth. */
+const TICKERS_CACHE = () => path.join(app.getPath('userData'), 'sec-company-tickers.json');
+const TICKERS_TTL_MS = 24 * 3600 * 1000;
+
+ipcMain.handle('sec-tickers', async (event, { force = false } = {}) => {
+    const file = TICKERS_CACHE();
+    let cached = null;
+    try {
+        const st = await fs.stat(file);
+        const age = Date.now() - st.mtimeMs;
+        cached = { age, text: await fs.readFile(file, 'utf-8') };
+        if (!force && age < TICKERS_TTL_MS) {
+            return { success: true, rows: JSON.parse(cached.text), cached: true, ageMs: age };
+        }
+    } catch { /* no cache yet */ }
+
+    try {
+        const res = await fetch(SEC_TICKERS_URL, {
+            headers: { 'User-Agent': SEC_UA, Accept: 'application/json' },
+            signal: AbortSignal.timeout(30000),
+            redirect: 'error',
+        });
+        if (!res.ok) throw new Error(`http ${res.status}`);
+        const body = await res.text();
+        if (body.length > SEC_TICKERS_MAX_BYTES) throw new Error('ticker map too large');
+        /* Shaped {"0":{cik_str,ticker,title},...} — an object keyed by index,
+           not an array. Flattened here so the renderer never has to know. */
+        const rows = Object.values(JSON.parse(body)).filter(r => r && r.cik_str && r.ticker);
+        if (!rows.length) throw new Error('ticker map parsed to zero rows');
+        await fs.writeFile(file, JSON.stringify(rows), 'utf-8').catch(() => {});
+        return { success: true, rows, cached: false, ageMs: 0 };
+    } catch (e) {
+        if (cached) {
+            try { return { success: true, rows: JSON.parse(cached.text), cached: true, stale: true, ageMs: cached.age, error: e.message }; }
+            catch { /* cache unreadable too */ }
+        }
+        return { success: false, error: e.message };
+    }
 });
 
 /* Append-only with rotation, like the chain alert log: an event store you can

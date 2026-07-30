@@ -296,6 +296,94 @@ check('short: null means contract creation', shortAddr(null) === 'contract creat
         check('issuance summary: tracks the largest single event', sum.USDC.largest.units === 7500000);
         check('issuance summary: tokens kept separate', sum.USDT.net === 3000000);
         check('issuance summary: empty input is safe', Object.keys(summarizeIssuance([])).length === 0);
+        /* `largest` mixed the two kinds, so a summary phrased as "largest mint"
+           could quote a burn. Both are now reported separately. */
+        const mixed = summarizeIssuance([
+            { symbol: 'USDC', kind: 'mint', units: 2000000 },
+            { symbol: 'USDC', kind: 'burn', units: 9000000 },
+        ]);
+        check('issuance summary: largest mint is a mint', mixed.USDC.largestMint.units === 2000000);
+        check('issuance summary: largest burn is a burn', mixed.USDC.largestBurn.units === 9000000);
+        check('issuance summary: a token with no burns reports none',
+            summarizeIssuance([{ symbol: 'USDC', kind: 'mint', units: 5 }]).USDC.largestBurn === null);
+    }
+
+    /* --- batch transactions ------------------------------------------------
+       The aggregator used to assume ONE logical movement per (tx, token) and
+       collapse everything to a single source and sink. Batch payouts are common
+       and break that: recipients were credited with money they never received,
+       and whole movements disappeared from the output. */
+    {
+        const { aggregateTokenWhales, scanTokenLogs } = pkg;
+        const D = '0xdddddddddddddddddddddddddddddddddddddddd';
+        const E = '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
+        const hop = (from, to, units, hash = '0xsame') => ({
+            chain: 'ethereum', kind: 'token', hash, contract: USDC, symbol: 'USDC',
+            decimals: 6, from, to, raw: String(units * 1000000n),
+            amount: formatTokenAmount(units * 1000000n, 6), usd: Number(units),
+        });
+
+        const fan = aggregateTokenWhales([hop(A, B, 5000000n), hop(A, C, 4000000n), hop(A, D, 3000000n)]);
+        check('batch: a payout to three addresses stays three movements', fan.length === 3);
+        check('batch: no recipient is credited with the total',
+            !fan.some((r) => r.usd === 12000000));
+        check('batch: every recipient survives',
+            [B, C, D].every((addr) => fan.some((r) => r.to === addr)));
+        check('batch: each row carries its own true amount',
+            fan.find((r) => r.to === B).usd === 5000000 && fan.find((r) => r.to === D).usd === 3000000);
+        check('batch: rows are tagged with how many shared the transaction',
+            fan.every((r) => r.batchOf === 3));
+
+        /* Two movements that share only a hash are not one movement. The old
+           code emitted the larger and dropped the smaller outright. */
+        const disjoint = aggregateTokenWhales([hop(A, B, 2000000n), hop(C, D, 9000000n)]);
+        check('batch: unrelated transfers in one tx stay separate', disjoint.length === 2);
+        check('batch: the smaller movement is not swallowed',
+            disjoint.some((r) => r.from === A && r.to === B && r.usd === 2000000));
+        check('batch: no invented pairing across the two',
+            !disjoint.some((r) => r.from === A && r.to === D));
+
+        // A chain still collapses — the original bug must stay fixed.
+        const chain = aggregateTokenWhales([hop(A, B, 7000000n), hop(B, C, 7000000n)]);
+        check('batch: a genuine chain still collapses to one movement',
+            chain.length === 1 && chain[0].from === A && chain[0].to === C);
+
+        /* --- threshold after aggregation ---
+           Filtering hops BEFORE aggregation hid part of the route: a movement
+           whose last hop was under the floor was reported as ending early. */
+        const amt = (u) => '0x' + (BigInt(u) * 10n ** 6n).toString(16);
+        const logs = [
+            { address: USDC, topics: [TRANSFER_TOPIC, pad(A), pad(B)], data: amt(27000000), transactionHash: '0xr' },
+            { address: USDC, topics: [TRANSFER_TOPIC, pad(B), pad(C)], data: amt(27000000), transactionHash: '0xr' },
+            { address: USDC, topics: [TRANSFER_TOPIC, pad(C), pad(E)], data: amt(500000), transactionHash: '0xr' },
+        ];
+        const scanned = scanTokenLogs(logs, { tokens: TOKENS, prices: PRICES, minUsd: 1000000 });
+        check('threshold: scanTokenLogs also returns every transfer, unfiltered',
+            scanned.transfers.length === 3 && scanned.whales.length === 2);
+        const full = aggregateTokenWhales(scanned.transfers, { minUsd: 1000000 });
+        check('threshold: the true final destination is found using the whole route',
+            full.length === 1 && full[0].to === E);
+        check('threshold: the movement keeps the amount that left the source',
+            full[0].usd === 27000000);
+        check('threshold: a movement under the floor is dropped after aggregating',
+            aggregateTokenWhales(scanned.transfers, { minUsd: 50000000 }).length === 0);
+    }
+
+    /* --- both parties watched --------------------------------------------- */
+    {
+        const both = scanBlockTxs(
+            [{ hash: '0x1', from: A, to: B, value: hex(ETH) }],
+            { watch: [A, B] },
+        );
+        check('watch: a transfer between two watched addresses is one event',
+            both.watchHits.length === 1);
+        check('watch: it is reported as concerning both, not just the sender',
+            both.watchHits[0].direction === 'both');
+        check('watch: the other watched party is named',
+            both.watchHits[0].watchedCounterparty === B);
+        check('watch: a one-sided hit is unchanged',
+            scanBlockTxs([{ hash: '0x2', from: A, to: C, value: hex(ETH) }], { watch: [A] })
+                .watchHits[0].direction === 'out');
     }
 }
 

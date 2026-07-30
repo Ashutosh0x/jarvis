@@ -213,6 +213,143 @@ export function blackScholes(S, K, T, sigma, r = 0, q = 0, type = 'call') {
   return { price, delta, gamma, vega, theta: theta / 365, rho };
 }
 
+/* ---------------------------------------------------------------------------
+   LOSS METRICS.
+
+   Volatility and drawdown answer "how much does this move" and "how bad has it
+   already been". Neither answers "how bad can tomorrow be", which is the
+   question a risk desk actually asks, so these are separate functions.
+
+   HISTORICAL SIMULATION, not a normal distribution. The parametric form
+   (mu - z*sigma) is one line shorter and wrong in exactly the situation the
+   number exists for: return distributions have fat tails, so a Gaussian
+   understates the loss at the 99th percentile precisely when it matters. This
+   sorts the observed returns and reads the quantile off them, which is the
+   method JP Morgan's RiskMetrics established and the one that makes no
+   distributional claim at all.
+
+   The cost is that it can only report a loss the sample has actually seen:
+   over 60 sessions the 99% quantile rests on the single worst day, which is
+   why `minObservations` refuses rather than returning a confident number.
+--------------------------------------------------------------------------- */
+
+/**
+ * One-day Value at Risk by historical simulation.
+ * @returns {{var: number, confidence: number, observations: number, worst: number}|null}
+ *   `var` is a POSITIVE loss magnitude as a decimal (0.07 = a 7% loss).
+ */
+export function historicalVaR(returns, confidence = 0.95, minObservations = 30) {
+  const xs = (returns || []).filter(Number.isFinite);
+  if (xs.length < minObservations) return null;
+  if (!(confidence > 0 && confidence < 1)) return null;
+  const sorted = [...xs].sort((a, b) => a - b);
+  /* Nearest-rank on the LOWER tail. Math.floor keeps the index inside the
+     array and biases to the more conservative (worse) observation rather than
+     interpolating a loss nobody observed. */
+  const idx = Math.min(sorted.length - 1, Math.max(0, Math.floor((1 - confidence) * sorted.length)));
+  return {
+    var: Math.max(0, -sorted[idx]),
+    confidence,
+    observations: xs.length,
+    worst: Math.max(0, -sorted[0]),
+  };
+}
+
+/**
+ * Expected Shortfall (CVaR): the average loss GIVEN that the VaR threshold was
+ * breached. VaR says "you should not lose more than X"; it is silent about how
+ * much worse than X the bad days actually were, and that tail is where a
+ * levered book dies. D.E. Shaw and most modern risk committees run both.
+ * @returns {{expectedShortfall: number, confidence: number, tailObservations: number}|null}
+ */
+export function expectedShortfall(returns, confidence = 0.95, minObservations = 30) {
+  const xs = (returns || []).filter(Number.isFinite);
+  if (xs.length < minObservations) return null;
+  const sorted = [...xs].sort((a, b) => a - b);
+  const cut = Math.max(1, Math.floor((1 - confidence) * sorted.length));
+  const tail = sorted.slice(0, cut);
+  if (!tail.length) return null;
+  return {
+    expectedShortfall: Math.max(0, -mean(tail)),
+    confidence,
+    tailObservations: tail.length,
+  };
+}
+
+/* ---------------------------------------------------------------------------
+   BENCHMARK-RELATIVE METRICS.
+
+   betaAlpha already says how much a name moves with its benchmark and what is
+   left over. These say how RELIABLE that split is and how consistent the
+   leftover has been — an alpha fitted on a relationship that explains 4% of
+   the variance is noise wearing a Greek letter.
+--------------------------------------------------------------------------- */
+
+/** Fraction of an asset's variance explained by its benchmark. For a
+ *  single-factor fit this is exactly the squared correlation. Morgan Stanley's
+ *  published framework treats a low R2 as grounds to DISREGARD the alpha and
+ *  beta entirely rather than to quote them with a caveat. */
+export function rSquared(assetReturns, benchReturns) {
+  const r = correlation(assetReturns, benchReturns);
+  if (!Number.isFinite(r)) return null;
+  return r * r;
+}
+
+/** Annualized standard deviation of the return DIFFERENCE against a benchmark:
+ *  how far a portfolio wanders from what it is measured against. */
+export function trackingError(assetReturns, benchReturns, periodsPerYear = TRADING_DAYS) {
+  const n = Math.min(assetReturns?.length || 0, benchReturns?.length || 0);
+  if (n < 2) return null;
+  const diff = [];
+  for (let i = 0; i < n; i++) diff.push(assetReturns[i] - benchReturns[i]);
+  return stdev(diff) * Math.sqrt(periodsPerYear);
+}
+
+/**
+ * Information Ratio: active return per unit of active risk. The Sharpe ratio
+ * of the outperformance itself, and AQR's primary diagnostic for whether a
+ * manager has skill rather than luck.
+ * @returns {number|null} null when there is no tracking error to divide by —
+ *   a portfolio that never deviates has no active return to rate.
+ */
+export function informationRatio(assetReturns, benchReturns, periodsPerYear = TRADING_DAYS) {
+  const te = trackingError(assetReturns, benchReturns, periodsPerYear);
+  if (te == null || te <= 0) return null;
+  const n = Math.min(assetReturns.length, benchReturns.length);
+  const active = annualizedReturn(assetReturns.slice(0, n), periodsPerYear)
+    - annualizedReturn(benchReturns.slice(0, n), periodsPerYear);
+  return active / te;
+}
+
+/**
+ * Up/down capture: of the benchmark's gain on its up periods, what share did
+ * this asset capture, and of its loss on down periods, what share did it take?
+ * A single beta averages the two together and hides asymmetry — capturing 110%
+ * of the upside and 60% of the downside is the profile every allocator wants,
+ * and it and a symmetric beta of 0.85 look identical in one number.
+ * @returns {{up: number|null, down: number|null, upPeriods: number, downPeriods: number}}
+ *   Ratios where 1 = captured exactly the benchmark's move.
+ */
+export function upDownCapture(assetReturns, benchReturns) {
+  const n = Math.min(assetReturns?.length || 0, benchReturns?.length || 0);
+  const upA = [], upB = [], downA = [], downB = [];
+  for (let i = 0; i < n; i++) {
+    if (benchReturns[i] > 0) { upA.push(assetReturns[i]); upB.push(benchReturns[i]); }
+    else if (benchReturns[i] < 0) { downA.push(assetReturns[i]); downB.push(benchReturns[i]); }
+  }
+  const ratio = (a, b) => {
+    if (!a.length) return null;
+    const mb = mean(b);
+    return mb === 0 ? null : mean(a) / mb;
+  };
+  return {
+    up: ratio(upA, upB),
+    down: ratio(downA, downB),
+    upPeriods: upA.length,
+    downPeriods: downA.length,
+  };
+}
+
 /**
  * One-shot risk/return summary of a price series (plus optional benchmark).
  * The headline block a "how risky is X" question needs, computed once.
@@ -229,12 +366,24 @@ export function analyzeSeries(prices, opts = {}) {
     sortino: sortinoRatio(returns, riskFree),
     maxDrawdown: maxDrawdown(prices),
   };
+  /* Loss metrics ride the same return series, so they cost nothing extra and
+     answering "how risky" without them leaves out the only figure that is
+     about tomorrow rather than about the past. */
+  out.var95 = historicalVaR(returns, 0.95);
+  out.var99 = historicalVaR(returns, 0.99);
+  out.cvar95 = expectedShortfall(returns, 0.95);
+
   if (opts.benchmarkPrices && opts.benchmarkPrices.length > 1) {
     const br = dailyReturns(opts.benchmarkPrices);
     const { beta, alpha } = betaAlpha(returns, br);
     out.beta = beta;
     out.alpha = alpha;
     out.correlation = correlation(returns, br);
+    /* How much of that fit to believe, and how consistent the excess was. */
+    out.rSquared = rSquared(returns, br);
+    out.trackingError = trackingError(returns, br);
+    out.informationRatio = informationRatio(returns, br);
+    out.capture = upDownCapture(returns, br);
   }
   return out;
 }

@@ -21,17 +21,39 @@ const testDir = path.join(root, 'src', 'js', 'services', '__tests__');
 const suites = [
     ...readdirSync(testDir).filter(f => f.endsWith('.mjs')).map(f => path.join(testDir, f)),
     path.join(root, 'metricStore.test.mjs'),
+    path.join(root, 'edgarGuard.test.mjs'),
+    path.join(root, 'visionRouter.test.mjs'),
+    path.join(root, 'sectorMove.test.mjs'),
+];
+
+/* The answer benchmark's grader is the part of it that can silently lie, so its
+   self-test runs with the unit suites rather than only alongside a model run.
+   It needs no model: it replays canned answers through the identical scoring
+   path. Passed as a suite with its flag. */
+const flagged = [
+    [path.join(root, 'eval', 'answer-eval.mjs'), ['--selftest']],
+    /* Same reasoning for the significance harness: a p-value nobody can check is
+       worse than no p-value, because it will be quoted. Its self-test asserts
+       textbook exact-binomial values (a clean sweep of 6 is p=0.03125; of 5 is
+       0.0625) and that identical configs bootstrap to a zero-width interval. */
+    [path.join(root, 'eval', 'paired-stats.mjs'), ['--selftest']],
+    /* The section-routing benchmark grades itself with a topic-set comparison
+       and a rank function, both of which can silently pass everything. Its
+       self-test runs here; the benchmark proper needs the live filing and so
+       stays out of the unit suite. */
+    [path.join(root, 'eval', 'section-routing-eval.mjs'), ['--selftest']],
 ];
 
 let totalChecks = 0, totalFailed = 0, failedSuites = [];
 const started = Date.now();
 
-for (const suite of suites) {
+for (const entry of [...suites.map(s => [s, []]), ...flagged]) {
+    const [suite, args] = entry;
     const name = path.basename(suite);
     let out = '';
     let ok = true;
     try {
-        out = execFileSync(process.execPath, [suite], { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+        out = execFileSync(process.execPath, [suite, ...args], { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
     } catch (e) {
         ok = false;
         out = `${e.stdout || ''}${e.stderr || ''}`;
@@ -48,7 +70,7 @@ for (const suite of suites) {
     if (!ok) console.log(out.split('\n').filter(l => /FAIL|Error/.test(l)).slice(0, 5).map(l => `        ${l}`).join('\n'));
 }
 
-console.log(`\n${suites.length} suites, ${totalChecks} checks, ${totalFailed} failed, ${((Date.now() - started) / 1000).toFixed(1)}s`);
+console.log(`\n${suites.length + flagged.length} suites, ${totalChecks} checks, ${totalFailed} failed, ${((Date.now() - started) / 1000).toFixed(1)}s`);
 if (failedSuites.length) {
     console.log(`failing: ${failedSuites.join(', ')}`);
     process.exit(1);

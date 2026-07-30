@@ -21,6 +21,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     // Unlimited-OCR: accepts { filePath } for images/PDFs or { imageBase64 } for captures
     performOCR: (request) => ipcRenderer.invoke('perform-ocr', request),
     checkOcrServer: () => ipcRenderer.invoke('check-ocr-server'),
+    checkVisionServer: () => ipcRenderer.invoke('check-vision-server'),
     // System telemetry for the diagnostics HUD
     getSystemTelemetry: () => ipcRenderer.invoke('get-system-telemetry'),
     onSystemTelemetry: createSafeListener('system-telemetry'),
@@ -107,10 +108,17 @@ contextBridge.exposeInMainWorld('electronAPI', {
     getNews: (opts) => ipcRenderer.invoke('get-news', opts),
     // Historical daily closes for the quant analytics engine
     getHistory: (opts) => ipcRenderer.invoke('get-history', opts),
+    getSectorMove: (opts) => ipcRenderer.invoke('get-sector-move', opts),
+    getPortfolioSeries: (opts) => ipcRenderer.invoke('get-portfolio-series', opts),
     // Security advisories: Chrome Releases RSS + NVD, both keyless. Exists so
     // CVE answers come from an advisory rather than from the model.
     // Continuous ingestion: fetch verified feeds, record events with provenance
     feedFetch: (opts) => ipcRenderer.invoke('feed-fetch', opts),
+    edgarSearch: (opts) => ipcRenderer.invoke('edgar-search', opts),
+    secDocument: (opts) => ipcRenderer.invoke('sec-document', opts),
+    // Per-company filings: the CIK and form type only — main builds the URL.
+    secCompanyFeed: (opts) => ipcRenderer.invoke('sec-company-feed', opts),
+    secTickers: (opts) => ipcRenderer.invoke('sec-tickers', opts || {}),
     feedRecord: (opts) => ipcRenderer.invoke('feed-record', opts),
     feedHistory: (opts) => ipcRenderer.invoke('feed-history', opts || {}),
     feedSeenGet: () => ipcRenderer.invoke('feed-seen-get'),

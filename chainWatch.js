@@ -88,7 +88,11 @@ function scanBlockTxs(txs, opts = {}) {
                     from,
                     to,
                     watched: hitFrom ? from : to,
-                    direction: hitFrom ? 'out' : 'in',
+                    /* A transfer BETWEEN two watched addresses is one event that
+                       concerns both, not an outgoing one. Reporting it as 'out'
+                       hid that the receiver was also on the watchlist. */
+                    direction: hitFrom && hitTo ? 'both' : (hitFrom ? 'out' : 'in'),
+                    ...(hitFrom && hitTo ? { watchedCounterparty: to } : {}),
                     valueWei: value.toString(),
                     amount: formatWeiNative(value),
                 });
@@ -160,7 +164,12 @@ function scanTokenLogs(logs, opts = {}) {
 
     const whales = [];
     const watchHits = [];
-    if (!Array.isArray(logs)) return { whales, watchHits };
+    /* Every valid transfer, threshold or not. aggregateTokenWhales needs the
+       WHOLE hop graph to find a movement's real source and destination — fed
+       only the hops that individually cleared the floor, it reported a route
+       as ending at whichever hop happened to be the last big one. */
+    const transfers = [];
+    if (!Array.isArray(logs)) return { whales, watchHits, transfers };
 
     for (const log of logs) {
         if (!log || !Array.isArray(log.topics)) continue;
@@ -203,21 +212,29 @@ function scanTokenLogs(logs, opts = {}) {
             usd: usd != null ? Math.round(usd) : null,
         };
 
+        transfers.push(row);
         if (big) whales.push(row);
 
         if (watch.size) {
             const hitFrom = from && watch.has(from);
             const hitTo = to && watch.has(to);
             if (hitFrom || hitTo) {
-                watchHits.push({ ...row, watched: hitFrom ? from : to, direction: hitFrom ? 'out' : 'in' });
+                watchHits.push({
+                    ...row,
+                    watched: hitFrom ? from : to,
+                    /* Both parties watched: one hit that says so, rather than
+                       silently reporting only the sending side. */
+                    direction: hitFrom && hitTo ? 'both' : (hitFrom ? 'out' : 'in'),
+                    ...(hitFrom && hitTo ? { watchedCounterparty: to } : {}),
+                });
             }
         }
     }
-    return { whales, watchHits };
+    return { whales, watchHits, transfers };
 }
 
 /**
- * Collapse the transfers of ONE transaction into one movement.
+ * Collapse the transfers of one transaction into the movements they represent.
  *
  * Found by running the scanner against live mainnet blocks: a single arbitrage
  * transaction emitted the same 14,050 WETH three times (pool -> router -> pool
@@ -225,16 +242,38 @@ function scanTokenLogs(logs, opts = {}) {
  * is one movement taking three hops, and reporting it as three is misinformation
  * about how much money moved.
  *
- * The source is the address that only ever SENDS inside this transaction, and
- * the destination the one that only ever RECEIVES; the amount is what actually
- * left the source. When every party both sends and receives, the money came
- * back to where it started — a round trip — and that is stated rather than
- * dressed up as a transfer between two parties.
+ * WHY THIS IS NOT "one row per (tx, token)", which is what it used to be.
+ * Collapsing every transaction to a single source and sink assumes each one
+ * carries exactly one logical movement. Batch transactions break that, and they
+ * are common — payouts, airdrops, disperse contracts, exchange sweeps:
+ *
+ *   * FAN-OUT. A pays B 5M, C 4M and D 3M in one transaction. Picking one
+ *     source and one sink reported "A -> B, 12M": B is credited with money it
+ *     never received and C and D vanish from the output entirely.
+ *   * TWO UNRELATED MOVEMENTS batched together. A -> B 2M and C -> D 9M share
+ *     only a transaction hash. The old code emitted the larger pair and DROPPED
+ *     the smaller movement — silent data loss, not merely a mislabel.
+ *
+ * So the transfers are first split into CONNECTED COMPONENTS by address: two
+ * transfers belong to the same movement only if they actually share a party.
+ * A component is then collapsed only when collapsing is truthful:
+ *
+ *   * one pure sender and one pure receiver -> a chain; the intermediates are
+ *     the route, so it collapses to source -> sink for what left the source.
+ *   * nobody pure -> the money returned to where it started; reported as a
+ *     round trip rather than dressed up as a transfer between two parties.
+ *   * anything else (fan-out, fan-in, mixed) -> NOT collapsed. Each transfer is
+ *     reported as itself, tagged with how many transfers shared the
+ *     transaction, because inventing a single pair would misstate who was paid.
  *
  * @param {Array<object>} rows  per-transfer rows from scanTokenLogs
- * @returns {Array<object>} one row per (transaction, token)
+ * @param {{minUsd?: number, minAmount?: Record<string, bigint>}} [opts]
+ *   Applied AFTER aggregation. Thresholding before this point hid hops from the
+ *   graph and produced the wrong destination: for A -> B -> C -> D where the
+ *   last hop was under the floor, the movement was reported as ending at C.
+ * @returns {Array<object>} one row per movement
  */
-function aggregateTokenWhales(rows) {
+function aggregateTokenWhales(rows, opts = {}) {
     if (!Array.isArray(rows) || !rows.length) return [];
     const groups = new Map();
     for (const r of rows) {
@@ -245,50 +284,109 @@ function aggregateTokenWhales(rows) {
 
     const out = [];
     for (const [, hops] of groups) {
-        if (hops.length === 1) { out.push({ ...hops[0], hops: 1, roundTrip: false }); continue; }
-
-        const sent = new Map(), received = new Map();
-        for (const h of hops) {
-            let raw; try { raw = BigInt(h.raw); } catch { raw = 0n; }
-            if (h.from) sent.set(h.from, (sent.get(h.from) || 0n) + raw);
-            if (h.to) received.set(h.to, (received.get(h.to) || 0n) + raw);
-        }
-        // Deterministic pick: largest mover first, address as the tie-break.
-        const pick = (candidates) => [...candidates]
-            .sort((a, b) => (a[1] === b[1] ? a[0].localeCompare(b[0]) : (a[1] > b[1] ? -1 : 1)))[0] || null;
-
-        const pureSenders = [...sent].filter(([a]) => !received.has(a));
-        const pureReceivers = [...received].filter(([a]) => !sent.has(a));
-        const source = pick(pureSenders) || pick(sent);
-        const sink = pick(pureReceivers) || pick(received);
-        const roundTrip = !pureSenders.length || !pureReceivers.length;
-
-        // What left the source is the movement; the intermediate hops are the
-        // route it took, not additional money.
-        const moved = source ? (sent.get(source[0]) || 0n) : 0n;
-        const template = hops[0];
-        const ratio = (() => {
-            let total = 0n; try { total = BigInt(template.raw); } catch { /* 0 */ }
-            return total > 0n && template.usd != null ? template.usd / Number(total) : null;
-        })();
-
-        out.push({
-            ...template,
-            from: source ? source[0] : template.from,
-            to: sink ? sink[0] : template.to,
-            raw: moved.toString(),
-            amount: formatTokenAmount(moved, template.decimals),
-            usd: ratio != null ? Math.round(ratio * Number(moved)) : template.usd,
-            hops: hops.length,
-            roundTrip,
-        });
+        for (const comp of splitTransferComponents(hops)) out.push(...collapseComponent(comp));
     }
+
+    /* The floor belongs here, on the movement, not on the individual hops. */
+    const minUsd = Number.isFinite(opts.minUsd) ? opts.minUsd : null;
+    const minAmount = opts.minAmount || {};
+    const kept = minUsd == null && !Object.keys(minAmount).length ? out : out.filter((r) => {
+        if (r.usd != null) return minUsd == null || r.usd >= minUsd;
+        const floor = minAmount[r.symbol];
+        if (floor == null) return false;
+        try { return BigInt(r.raw) >= floor; } catch { return false; }
+    });
+
     // Stable output order: biggest first, hash as the tie-break.
-    return out.sort((a, b) => {
+    return kept.sort((a, b) => {
         const av = BigInt(a.raw || '0'), bv = BigInt(b.raw || '0');
         if (av !== bv) return av > bv ? -1 : 1;
-        return String(a.hash || '').localeCompare(String(b.hash || ''));
+        const h = String(a.hash || '').localeCompare(String(b.hash || ''));
+        return h || String(a.to || '').localeCompare(String(b.to || ''));
     });
+}
+
+/**
+ * Split one (tx, token)'s transfers into groups that share at least one party.
+ * Union-find over addresses: transfers that never touch a common address are
+ * separate movements that happen to share a transaction.
+ */
+function splitTransferComponents(hops) {
+    if (hops.length === 1) return [hops];
+    const parent = new Map();
+    const find = (x) => {
+        if (!parent.has(x)) parent.set(x, x);
+        while (parent.get(x) !== x) { parent.set(x, parent.get(parent.get(x))); x = parent.get(x); }
+        return x;
+    };
+    const union = (a, b) => { const ra = find(a), rb = find(b); if (ra !== rb) parent.set(ra, rb); };
+
+    // A null party (unparseable topic) is unique to its own transfer, so it can
+    // never merge two movements that share nothing else.
+    const partyOf = (h, side, i) => h[side] || ` ${side}${i}`;
+    hops.forEach((h, i) => union(partyOf(h, 'from', i), partyOf(h, 'to', i)));
+
+    const byRoot = new Map();
+    hops.forEach((h, i) => {
+        const root = find(partyOf(h, 'from', i));
+        if (!byRoot.has(root)) byRoot.set(root, []);
+        byRoot.get(root).push(h);
+    });
+    /* Deterministic component order: largest transfer first, then hash. */
+    return [...byRoot.values()].sort((a, b) => {
+        const av = BigInt(a[0]?.raw || '0'), bv = BigInt(b[0]?.raw || '0');
+        return av === bv ? 0 : (av > bv ? -1 : 1);
+    });
+}
+
+/** One component -> the movement(s) it truthfully represents. */
+function collapseComponent(hops) {
+    if (hops.length === 1) return [{ ...hops[0], hops: 1, roundTrip: false }];
+
+    const sent = new Map(), received = new Map();
+    for (const h of hops) {
+        let raw; try { raw = BigInt(h.raw); } catch { raw = 0n; }
+        if (h.from) sent.set(h.from, (sent.get(h.from) || 0n) + raw);
+        if (h.to) received.set(h.to, (received.get(h.to) || 0n) + raw);
+    }
+    // Deterministic pick: largest mover first, address as the tie-break.
+    const pick = (candidates) => [...candidates]
+        .sort((a, b) => (a[1] === b[1] ? a[0].localeCompare(b[0]) : (a[1] > b[1] ? -1 : 1)))[0] || null;
+
+    const pureSenders = [...sent].filter(([a]) => !received.has(a));
+    const pureReceivers = [...received].filter(([a]) => !sent.has(a));
+
+    const isChain = pureSenders.length === 1 && pureReceivers.length === 1;
+    const isRoundTrip = pureSenders.length === 0 && pureReceivers.length === 0;
+
+    /* Fan-out, fan-in or a mix: there is more than one counterparty on an
+       unmatched side, so no single pair describes it. Report the transfers. */
+    if (!isChain && !isRoundTrip) {
+        return hops.map((h) => ({ ...h, hops: 1, roundTrip: false, batchOf: hops.length }));
+    }
+
+    const source = isChain ? pureSenders[0] : pick(sent);
+    const sink = isChain ? pureReceivers[0] : pick(received);
+    const moved = source ? (sent.get(source[0]) || 0n) : 0n;
+    const template = hops[0];
+    /* Price per raw unit, taken from a hop that HAS a price, so a template hop
+       whose usd rounded away cannot zero out the movement's value. */
+    const priced = hops.find((h) => {
+        if (h.usd == null) return false;
+        try { return BigInt(h.raw) > 0n; } catch { return false; }
+    });
+    const ratio = priced ? priced.usd / Number(BigInt(priced.raw)) : null;
+
+    return [{
+        ...template,
+        from: source ? source[0] : template.from,
+        to: sink ? sink[0] : template.to,
+        raw: moved.toString(),
+        amount: formatTokenAmount(moved, template.decimals),
+        usd: ratio != null ? Math.round(ratio * Number(moved)) : template.usd,
+        hops: hops.length,
+        roundTrip: isRoundTrip,
+    }];
 }
 
 /* ---------------------------------------------------------------------------
@@ -356,12 +454,24 @@ function scanIssuanceLogs(logs, opts = {}) {
     return out.sort((a, b) => (b.units - a.units) || String(a.hash || '').localeCompare(String(b.hash || '')));
 }
 
-/** Net issuance per token over a set of events, for a spoken summary. */
+/**
+ * Net issuance per token over a set of events, for a spoken summary.
+ *
+ * `largest` is the biggest event of EITHER kind and was the only one reported,
+ * so a summary that said "largest mint" could be quoting a burn — a 2M mint
+ * alongside a 9M burn returned the burn. The two are now separate, and the
+ * combined one is kept because it answers "what was the biggest thing that
+ * happened", which is a different question.
+ */
 function summarizeIssuance(events) {
     const bySymbol = {};
     for (const e of events || []) {
-        const s = (bySymbol[e.symbol] = bySymbol[e.symbol] || { minted: 0, burned: 0, mints: 0, burns: 0, largest: null });
-        if (e.kind === 'mint') { s.minted += e.units; s.mints++; } else { s.burned += e.units; s.burns++; }
+        const s = (bySymbol[e.symbol] = bySymbol[e.symbol]
+            || { minted: 0, burned: 0, mints: 0, burns: 0, largest: null, largestMint: null, largestBurn: null });
+        const isMint = e.kind === 'mint';
+        if (isMint) { s.minted += e.units; s.mints++; } else { s.burned += e.units; s.burns++; }
+        const key = isMint ? 'largestMint' : 'largestBurn';
+        if (!s[key] || e.units > s[key].units) s[key] = e;
         if (!s.largest || e.units > s.largest.units) s.largest = e;
     }
     for (const s of Object.values(bySymbol)) s.net = s.minted - s.burned;
