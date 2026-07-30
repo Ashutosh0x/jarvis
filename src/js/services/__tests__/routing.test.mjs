@@ -476,5 +476,52 @@ routes('remind me about vines1vzrYbzLMRdu58ou5XTby4qAqVRLmqo36NKPTg', null);
         intentOf('news on micron') !== 'PORTFOLIO_QUERY', String(intentOf('news on micron')));
 }
 
+/* --- verbatim failures from the interaction log, 30 Jul 2026 ----------------
+   These are not invented cases. Each was typed at the running assistant and
+   got a wrong answer, recovered from userData/interactions.jsonl. */
+{
+    const router = Object.create(Cls.prototype);
+    router.settings = { get: () => null };
+    router._lastNewsSubject = null;
+    const intentOf = (s) => { try { return router.detectIntent(s)?.intent ?? null; } catch (e) { return `THREW ${e.message}`; } };
+    const quant = Cls.prototype.parseQuantQuery.bind(router);
+    const price = Cls.prototype.parsePriceQuery.bind(router);
+
+    /* Answered with "66 new items in the last 24 hours" — a digest of
+       everyone's filings instead of the company that was asked for. */
+    check('log: "show me google 10-K" reaches the filing, not the feed brief',
+        intentOf('show me google 10-k') === 'COMPANY_FILINGS', String(intentOf('show me google 10-k')));
+    check('log: "show me micron 10-K" likewise',
+        intentOf('show me micron 10-k') === 'COMPANY_FILINGS', String(intentOf('show me micron 10-k')));
+    check('log: the company survives extraction',
+        router.detectIntent('show me google 10-k')?.name === 'google',
+        JSON.stringify(router.detectIntent('show me google 10-k')?.name));
+    check('log: a form-only request still belongs to the feed brief',
+        intentOf('show me the latest sec filings') === 'FEED_BRIEF',
+        String(intentOf('show me the latest sec filings')));
+
+    /* Answered "I could not find enough price history for what's micron's." */
+    check('log: "what\'s micron\'s volatility" extracts the company, not the question',
+        quant("what's micron's volatility")?.entity === 'micron',
+        JSON.stringify(quant("what's micron's volatility")));
+    check('log: and keeps the metric', quant("what's micron's volatility")?.metric === 'volatility');
+    check('log: the possessive alone also resolves', quant("micron's sharpe")?.entity === 'micron');
+
+    /* Answered "The context does not contain information regarding NVIDIA's
+       performance" while the deterministic quote engine sat unused. */
+    check('log: "how is nvidia doing" is a price question',
+        intentOf('how is nvidia doing') === 'PRICE_QUERY', String(intentOf('how is nvidia doing')));
+    check('log: "what\'s MU at" is a price question',
+        intentOf("what's mu at") === 'PRICE_QUERY', String(intentOf("what's mu at")));
+    check('log: and the ticker survives', price('how is nvidia doing') === 'nvidia');
+
+    /* The guard that keeps the bare form narrow. Without the known-asset
+       check, any "how is X doing" becomes a ticker lookup. */
+    check('bare form: "how is my day going" is not a price query',
+        price('how is my day going') === null);
+    check('bare form: "how is the weather doing" is not a price query',
+        price('how is the weather doing') === null);
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

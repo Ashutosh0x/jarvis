@@ -628,6 +628,21 @@ const OF_FORM = /\b(?:sec\s+)?(?:filings?|forms?|disclosures?|submissions?|8-?ks
 const POSSESSIVE = /^(.+?)(?:'s|s')\s+(?:recent\s+|latest\s+|last\s+|new\s+)?(?:sec\s+)?(?:filings?|forms?|disclosures?|submissions?|8-?ks?|10-?ks?|10-?qs?|annual reports?|quarterly reports?|proxy statements?|prospectus(?:es)?)\b/i;
 const HAS_FILED = /\bwhat\s+(?:has|did)\s+(.+?)\s+(?:file|filed|filed with the sec)\b/i;
 
+/* COMPANY FIRST, FORM LAST — "show me google 10-K".
+   The three patterns above all put the form before the company ("filings of
+   google"), or use a possessive, or ask what someone filed. None of them match
+   the shape a person actually types, and the interaction log caught it: on
+   30 Jul 2026 both "show me micron 10-K" and "show me google 10-K" fell
+   through to the feed brief and were answered with "66 new items in the last
+   24 hours" — a digest of everyone's filings instead of the one that was
+   asked for. The feed brief claimed them because "show me" satisfies its
+   scoped test and "10-K" satisfies its finance-domain test.
+   Anchored to the END so a form word must close the sentence; the leading
+   verb and any "latest"/"the" are stripped by TRIM below, which is what makes
+   "show me the latest 10-K" resolve to an empty name and correctly fall
+   through to the feed brief. */
+const NAME_THEN_FORM = /^(.+?)\s+(?:sec\s+)?(?:10-?ks?|ten\s?ks?|10-?qs?|ten\s?qs?|8-?ks?|eight\s?ks?|20-?fs?|6-?ks?|s-?1s?|def ?14a|13-?fs?|annual reports?|quarterly reports?|proxy statements?)\s*$/i;
+
 /* Words that arrive attached to the company name and are not part of it. */
 const TRIM = /\b(?:the|any|all|some|recent|recently|latest|newest|last|new|most recent|sec|edgar|filings?|forms?|please|sir|for me|show me|list|give me|pull up|find|get|me)\b/gi;
 
@@ -648,9 +663,15 @@ export function parseCompanyFilingsQuery(text) {
     const m1 = raw.match(OF_FORM);
     const m2 = raw.match(POSSESSIVE);
     const m3 = raw.match(HAS_FILED);
+    /* Tried LAST so the prepositional forms keep priority: "10-K of google"
+       must resolve through OF_FORM, which knows the company follows the
+       preposition, rather than through this pattern, which would read
+       "10-K of google" as a company called "10-K of google". */
+    const m4 = raw.match(NAME_THEN_FORM);
     if (m1) candidate = m1[1];
     else if (m2) candidate = m2[1];
     else if (m3) candidate = m3[1];
+    else if (m4) candidate = m4[1];
     if (!candidate) return null;
 
     const forms = [];

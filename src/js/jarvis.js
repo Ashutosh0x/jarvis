@@ -2353,6 +2353,23 @@ class Jarvis {
         }
         if ((m = cmd.match(/\bwhat(?:'s| is)\s+(.+?)\s+(?:stock\s+)?(?:trading at|worth|at now|priced at)\b/i))) return clean(m[1]) || null;
         if ((m = cmd.match(/\bhow(?:'s| is)\s+(.+?)\s+(?:stock|shares?)\s+doing\b/i))) return clean(m[1]) || null;
+
+        /* THE BARE FORMS, gated on the asset actually being known.
+           "how is nvidia doing" and "what's MU at" are how people ask, and both
+           reached the model instead: the log for 30 Jul 2026 shows the first
+           answered "The context does not contain information regarding
+           NVIDIA's performance" while the deterministic quote engine sat
+           unused. The branches above require the word "stock" or "trading at",
+           which is not how the question gets asked.
+           The SYMBOL_MAP guard is what keeps this narrow — the same precedent
+           as "how much is bitcoin" above. Without it, "how is my day going"
+           becomes a ticker lookup. */
+        const bare = cmd.match(/\bhow(?:'s| is)\s+(.+?)\s+doing\b/i)
+            || cmd.match(/\bwhat(?:'s| is)\s+(.+?)\s+at\b\s*\??$/i);
+        if (bare) {
+            const ent = clean(bare[1]);
+            if (ent && (Jarvis.SYMBOL_MAP[ent.toLowerCase()] || /^[a-z]{1,5}$/i.test(ent))) return ent;
+        }
         return null;
     }
 
@@ -2361,7 +2378,18 @@ class Jarvis {
     // is spoken text (resolveSymbol maps it to a ticker on the main side).
     parseQuantQuery(cmd) {
         const clean = (s) => s && s.replace(/[?.!,]+$/, '')
+            /* LEADING INTERROGATIVE. The trailing form below captures
+               everything before the metric word, so "what's micron's
+               volatility" handed the resolver "what's micron's" and it
+               answered "I could not find enough price history for what's
+               micron's." Caught in the interaction log on 30 Jul 2026, twice
+               in twenty seconds. The question words are never part of a
+               company name. */
+            .replace(/^\s*(?:what'?s|what is|whats|how'?s|how is|show me|tell me|give me|get me|find)\s+/i, '')
             .replace(/\b(stock|shares?|the|a|please|now|right now|currently|over the (last|past) (year|month))\b/gi, '')
+            /* A possessive is how people name a company before a metric —
+               "micron's volatility" — and the 's is not part of the ticker. */
+            .replace(/(?:'s|s')\s*$/i, '')
             .replace(/^\s*(?:of|for)\s+/i, '').replace(/\s+/g, ' ').trim();
         const METRIC = {
             sharpe: /\bsharpe\b/i, sortino: /\bsortino\b/i,
