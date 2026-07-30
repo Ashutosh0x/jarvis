@@ -5,4 +5,39 @@
     <string name="accessibility_service_description">Lets JARVIS Desktop read the current screen and perform taps, swipes, and navigation on your behalf over your local Wi-Fi network. Only enable this if you trust the paired computer — it grants access to the content of every app you open.</string>
     <string name="link_channel_name">Desktop Link</string>
     <string name="link_channel_desc">Ongoing connection to JARVIS Desktop</string>
+
+    <!-- Offline APK share -->
+    <string name="share_activity_label">JARVIS Share</string>
+    <string name="share_title">Offline APK share</string>
+    <string name="share_subtitle">Phone to phone over the radio. No internet, no router, no cloud — the bytes never leave the two devices.</string>
+    <string name="share_transport_label">CONNECTION</string>
+    <string name="share_transport_direct">Wi-Fi Direct</string>
+    <string name="share_transport_lan">Same Wi-Fi</string>
+    <string name="share_hint_direct">Builds a private link between the two phones. Nothing else needs to exist.</string>
+    <string name="share_hint_lan">Use when both phones already sit on one network. Faster to start, and still local-only.</string>
+
+    <string name="share_send_self">Send JARVIS itself</string>
+    <string name="share_send_pick">Send another APK…</string>
+    <string name="share_receive">Receive an APK</string>
+    <string name="share_install">Install</string>
+    <string name="share_reset">Start over</string>
+
+    <string name="share_status_idle">Choose to send or receive.</string>
+    <string name="share_status_hashing">Reading and hashing the file…</string>
+    <string name="share_status_searching">Searching for a sender…</string>
+    <string name="share_status_joining">Joining %1$s…</string>
+    <string name="share_status_receiving">Receiving %1$s…</string>
+    <string name="share_status_sent">Sent %1$s. Digest matched on this side.</string>
+    <string name="share_status_verified">Received and verified. SHA-256 matches.</string>
+    <string name="share_status_failed">Failed: %1$s</string>
+    <string name="share_status_allow_installs">Android needs permission to install from JARVIS — allow it on the next screen.</string>
+
+    <string name="share_detail_offering">Offering %1$s (%2$s)</string>
+    <string name="share_detail_progress">%1$s of %2$s</string>
+    <string name="share_detail_sha">SHA-256 %1$s</string>
+    <string name="share_peer_row">%1$s\n%2$s · %3$s</string>
+
+    <string name="share_error_no_direct">This device does not support Wi-Fi Direct. Switch to \"Same Wi-Fi\".</string>
+    <string name="share_error_permission">Wi-Fi Direct needs the precise nearby-devices permission to find the other phone. Approximate is not enough.</string>
+    <string name="share_error_location_off">Turn location on. On this Android version Wi-Fi Direct cannot see nearby phones while it is off.</string>
 </resources>

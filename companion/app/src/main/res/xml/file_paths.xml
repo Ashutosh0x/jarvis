@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Received APKs live in the app's own external files dir. The package
+  installer runs in another process, so it cannot open that path directly —
+  it needs a content:// URI from this provider plus a one-shot read grant.
+-->
+<paths>
+    <external-files-path
+        name="incoming_apks"
+        path="Download/incoming/" />
+    <!-- Fallback: getExternalFilesDir returns null when external storage is
+         unavailable, and the download lands in internal storage instead. -->
+    <files-path
+        name="incoming_apks_internal"
+        path="incoming/" />
+</paths>

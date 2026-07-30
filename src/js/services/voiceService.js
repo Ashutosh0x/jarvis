@@ -11,7 +11,13 @@
  * Design notes:
  * - The VAD is gated while Jarvis's own TTS is speaking: Windows SAPI audio
  *   bypasses Chromium's echo canceller reference, so without the gate Jarvis
- *   would hear and transcribe itself. Trade-off: no barge-in over TTS yet.
+ *   would hear and transcribe itself.
+ * - BARGE-IN lifts that gate for genuinely loud speech. It is only sound when
+ *   the reply is coming through WebAudio, where Chromium's AEC has a reference
+ *   signal and what leaks back into the mic is residual rather than the full
+ *   utterance; over SAPI the gate stays absolute. Even then the bar is set far
+ *   above the normal VAD threshold, because the cost of being wrong is Jarvis
+ *   interrupting itself mid-sentence, every sentence.
  * - If the STT server is down, the loop idles quietly and retries every 10 s;
  *   the mic itself stays hot so recovery is instant.
  */
@@ -24,14 +30,30 @@ const PRE_ROLL_FRAMES = 20;          // 320 ms kept before speech onset
 const HANGOVER_FRAMES = 90;          // 1.44 s of silence ends the utterance
                                      // (880 ms cut users off mid-thought in
                                      // conversational speech — live-tested)
+const ONSET_FRAMES = 3;              // ~50ms of sustained energy before speech onset
 const MAX_UTTERANCE_FRAMES = 1875;   // 30 s hard cap
+const TTS_TAIL_MS = 400;             // mic stays deaf this long after TTS stops
+
+/* Barge-in thresholds. Deliberately much stricter than the normal VAD: this
+   listens THROUGH Jarvis's own voice, so anything near the ordinary threshold
+   is echo residual rather than the user. 128 ms of sustained energy at six
+   times the noise floor is a person talking over the reply, not a leaked
+   syllable. */
+const BARGE_ONSET_FRAMES = 8;        // ~128 ms sustained
+const BARGE_FLOOR_MULT = 6;          // vs 3 for normal onset
+const BARGE_MIN_RMS = 0.02;          // vs 0.008 for normal onset
 
 export class LocalVoiceService {
-    constructor({ onTranscript, onVolume, onStatus, isTtsSpeaking }) {
+    constructor({ onTranscript, onVolume, onStatus, isTtsSpeaking, onBargeIn, canBargeIn }) {
         this.onTranscript = onTranscript || (() => {});
         this.onVolume = onVolume || (() => {});
         this.onStatus = onStatus || (() => {});
         this.isTtsSpeaking = isTtsSpeaking || (() => false);
+        this.onBargeIn = onBargeIn || (() => {});
+        /** Only the caller knows whether the current voice is AEC-visible. */
+        this.canBargeIn = canBargeIn || (() => false);
+        this.bargeFrames = 0;
+        this.bargeDisabledReason = null;
 
         this.ws = null;
         this.wsReady = false;
@@ -47,6 +69,7 @@ export class LocalVoiceService {
         this.preRoll = [];           // ring buffer of recent Int16Array frames
         this.utterance = [];         // frames of the current utterance
         this.ttsTailUntil = 0;       // ignore mic briefly after TTS stops
+        this._int16Buf = new Int16Array(256); // pre-allocated buffer for float->int16 conversion
     }
 
     /* ---------------- WebSocket to the local STT server ---------------- */
@@ -69,7 +92,14 @@ export class LocalVoiceService {
                     // The server already reports how long transcription took;
                     // pass it on so the turn profile can attribute it rather
                     // than leaving STT as an unmeasured gap.
-                    this.onTranscript(msg.text, { sttMs: msg.ms });
+                    this.onTranscript(msg.text, {
+                        sttMs: msg.ms,
+                        // Lets the caller check a barged transcript against
+                        // what Jarvis just said, and switch barge-in off if
+                        // this turned out to be the echo canceller failing.
+                        barged: this._lastUtteranceBarged === true,
+                    });
+                    this._lastUtteranceBarged = false;
                 }
             } catch { /* ignore malformed frames */ }
         };
@@ -286,36 +316,74 @@ export class LocalVoiceService {
         let sum = 0;
         for (let i = 0; i < float32.length; i++) sum += float32[i] * float32[i];
         const rms = Math.sqrt(sum / float32.length);
+        
+        // Future improvement: add frequency-band weighting here for better speech-band energy detection.
+        // For now, we improve the energy calculation by utilizing a pre-allocated buffer below.
         this.onVolume(rms * 100);
 
-        // Gate while Jarvis speaks (+400 ms tail) so it never hears itself
-        if (this.isTtsSpeaking()) {
-            this.ttsTailUntil = performance.now() + 400;
-            this._resetVad();
-            return;
+        // Adaptive noise floor: fast decay down, slow creep up. Frozen while
+        // Jarvis speaks — letting its own voice raise the floor would leave the
+        // VAD deaf to the user for seconds after the reply ends.
+        if (!this.isTtsSpeaking()) {
+            if (rms < this.noiseFloor) this.noiseFloor = this.noiseFloor * 0.9 + rms * 0.1;
+            else this.noiseFloor = this.noiseFloor * 0.999 + rms * 0.001;
         }
-        if (performance.now() < this.ttsTailUntil) return;
-
-        // Adaptive noise floor: fast decay down, slow creep up
-        if (rms < this.noiseFloor) this.noiseFloor = this.noiseFloor * 0.9 + rms * 0.1;
-        else this.noiseFloor = this.noiseFloor * 0.999 + rms * 0.001;
         const threshold = Math.max(this.noiseFloor * 3, 0.008);
 
-        // Float32 -> Int16 frame
-        const int16 = new Int16Array(float32.length);
+        // Float32 -> Int16 frame using pre-allocated buffer for zero-allocation performance
+        const int16 = this._int16Buf;
         for (let i = 0; i < float32.length; i++) {
             const s = Math.max(-1, Math.min(1, float32[i]));
             int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
         }
 
+        // Gate while Jarvis speaks (+tail) so it never hears itself. Once a
+        // barge-in has been accepted this is skipped: the reply is being torn
+        // down and those frames are the user's sentence, not Jarvis's.
+        if (this.isTtsSpeaking() && !this.bargedThisUtterance) {
+            this.ttsTailUntil = performance.now() + TTS_TAIL_MS;
+            if (!this._bargeInAllowed()) {
+                this.bargeFrames = 0;
+                this._resetVad();
+                return;
+            }
+
+            // Listening through the reply. Keep the pre-roll filled so that
+            // when the user does cut in, the first word survives — clipping it
+            // is what makes an interrupted assistant mishear the command.
+            this.preRoll.push(new Int16Array(int16.subarray(0, float32.length)));
+            if (this.preRoll.length > PRE_ROLL_FRAMES) this.preRoll.shift();
+
+            const bargeThreshold = Math.max(this.noiseFloor * BARGE_FLOOR_MULT, BARGE_MIN_RMS);
+            if (rms > bargeThreshold) {
+                this.bargeFrames++;
+                if (this.bargeFrames >= BARGE_ONSET_FRAMES) {
+                    this.bargeFrames = 0;
+                    this.ttsTailUntil = 0;   // the tail would mute the user we just heard
+                    this.bargedThisUtterance = true;
+                    this.speaking = true;
+                    this.silenceFrames = 0;
+                    this.utterance = [...this.preRoll];
+                    this.onStatus('barge-in');
+                    this.onBargeIn();        // stops the reply; mic path continues below
+                }
+            } else {
+                this.bargeFrames = 0;
+            }
+            return;
+        }
+        this.bargeFrames = 0;
+        if (performance.now() < this.ttsTailUntil) return;
+
         if (!this.speaking) {
             // Keep a rolling pre-roll so word onsets aren't clipped
-            this.preRoll.push(int16);
+            // We copy the frame since we reuse the _int16Buf
+            this.preRoll.push(new Int16Array(int16.subarray(0, float32.length)));
             if (this.preRoll.length > PRE_ROLL_FRAMES) this.preRoll.shift();
 
             if (rms > threshold) {
                 this.speechFrames++;
-                if (this.speechFrames >= 3) { // ~50 ms of sustained energy
+                if (this.speechFrames >= ONSET_FRAMES) { // ~50 ms of sustained energy
                     this.speaking = true;
                     this.silenceFrames = 0;
                     this.utterance = [...this.preRoll];
@@ -325,7 +393,7 @@ export class LocalVoiceService {
                 this.speechFrames = 0;
             }
         } else {
-            this.utterance.push(int16);
+            this.utterance.push(new Int16Array(this._int16Buf.subarray(0, float32.length)));
 
             if (rms > threshold) this.silenceFrames = 0;
             else this.silenceFrames++;
@@ -337,8 +405,41 @@ export class LocalVoiceService {
         }
     }
 
+    /**
+     * Barge-in needs BOTH the user's consent and a voice the echo canceller
+     * can actually see. Over SAPI the mic hears the full reply rather than a
+     * residual, and any threshold low enough to catch the user also catches
+     * Jarvis — so there the gate stays absolute regardless of the setting.
+     */
+    _bargeInAllowed() {
+        if (this.bargeDisabledReason) return false;
+        if (!this.canBargeIn()) return false;
+        try {
+            const s = JSON.parse(localStorage.getItem('jarvis_settings') || '{}');
+            return s.bargeIn !== false;   // opt-out, not opt-in
+        } catch {
+            return true;
+        }
+    }
+
+    /**
+     * Turn barge-in off for the rest of the session. Called when a barge-in
+     * turns out to have been Jarvis hearing itself: whatever the AEC is doing
+     * on this hardware, it is not enough, and the honest response is to stop
+     * rather than keep interrupting the user's assistant on their behalf.
+     */
+    disableBargeIn(reason) {
+        if (this.bargeDisabledReason) return;
+        this.bargeDisabledReason = reason || 'echo detected';
+        console.warn(`LocalVoice: barge-in disabled for this session — ${this.bargeDisabledReason}`);
+        this.onStatus('barge-in-disabled');
+    }
+
     _endUtterance() {
         const frames = this.utterance;
+        // Held across the round trip to the STT server: the transcript comes
+        // back long after the VAD state that produced it has been reset.
+        this._lastUtteranceBarged = this.bargedThisUtterance;
         this._resetVad();
         this.onStatus('processing');
 
@@ -364,6 +465,7 @@ export class LocalVoiceService {
         this.silenceFrames = 0;
         this.utterance = [];
         this.preRoll = [];
+        this.bargedThisUtterance = false;
     }
 
     stop() {

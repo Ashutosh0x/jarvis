@@ -692,6 +692,44 @@ class RagService {
             .slice(0, MAX_SENTENCES);
     }
 
+    /**
+     * Reduce a block of RAW text to the sentences that answer a query.
+     *
+     * Public wrapper over the same selector recall() uses, for text that never
+     * entered the corpus — a filing body fetched during an investigation, for
+     * example. Measured on the real Goldman 424B2: 76,076 characters of
+     * prospectus, of which a handful of sentences carry the terms. Handing all
+     * of it to a 4B model produces a summary of the boilerplate.
+     *
+     * Falls back to the head of the document when nothing matches lexically,
+     * because a truncated real document still beats no document — which is the
+     * state that produced the 22 Jul fabrication.
+     *
+     * @param {string} text  raw document text
+     * @param {string} query
+     * @param {{maxChars?: number}} [opts]
+     * @returns {string}
+     */
+    selectRelevant(text, query, { maxChars = 6000 } = {}) {
+        const raw = String(text || '');
+        if (!raw.trim()) return '';
+        const queryTokens = tokenize(String(query || ''));
+        if (!queryTokens.length) return raw.slice(0, maxChars);
+
+        // Wrapped as one pseudo-passage so the existing scorer applies unchanged.
+        const picked = this._selectSentences([{ text: raw, source: 'document', score: 1 }], queryTokens);
+        if (!picked || !picked.length) return raw.slice(0, maxChars);
+
+        const out = [];
+        let used = 0;
+        for (const c of picked) {
+            if (used + c.sentence.length > maxChars) break;
+            out.push(c.sentence);
+            used += c.sentence.length + 1;
+        }
+        return out.length ? out.join(' ') : raw.slice(0, maxChars);
+    }
+
     /* ---------- hybrid recall: dense + sparse + PRF, RRF fusion ---------- */
 
     /**

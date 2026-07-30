@@ -148,6 +148,163 @@ quality benchmark that does not exist here yet.
 
 ---
 
+## Answers — harness built, not yet measured
+
+The gap named at the end of the memory section now has a harness:
+`eval/answer-eval.mjs`, over labels in `eval/answer-corpus.mjs`, run with
+`node eval/answer-eval.mjs`.
+
+It ablates what the model is given, holding model, prompt, and questions fixed:
+
+| configuration | what is in the prompt |
+| --- | --- |
+| no-context | the shipped system prompt alone |
+| rag | + `ragService.recall()` context, as `jarvis.js` injects it |
+| rag+beliefs | + durable `FactStore` beliefs with their confidence — which nothing currently puts in the prompt |
+
+23 questions in three classes, because they fail for different reasons:
+**answerable** (13, decisive-token labels plus the near-duplicate's token as a
+trap), **absent** (7, where the corpus has no answer and saying so is the pass —
+drawn from the fabrications actually logged here: an invented IP, an invented
+CVE number, placeholder device names), and **contradiction** (3, where the
+context refutes the question's premise and agreeing with it is the failure).
+
+Grading is deterministic regex over collapsed whitespace. No LLM judge: a judge
+from the same 4B family would be scoring itself, and nothing stronger runs
+locally. That measures less than a judge would, and measures it without a second
+unverified model in the loop.
+
+Six verdicts, each naming a mechanism: correct, wrong, fabricated, abstained,
+vague, blocked. **Over-refusal is counted separately from fabrication** — the
+same behaviour with the opposite sign depending on the question class, and
+folding both into one "safety" number would hide the cost of tightening the
+guard.
+
+The grader is verified first, because it is the part that can silently lie:
+`node eval/answer-eval.mjs --selftest` replays 14 hand-written good and bad
+answers through the identical scoring path and runs inside `npm test`. The
+retrieval harness shipped with an ungraded grader and a live bug in it; this one
+did not.
+
+### Measured, 24 Jul 2026 — gemma3:4b, 74 questions, embedder available
+
+| configuration | overall | answerable | absent | contradiction | stale | conflict | fabricated | over-refused | ms/answer |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| no-context | 25.7% | 22.7% | 92.3% | 33.3% | 0.0% | 0.0% | 0 | 33 | 4106 |
+| rag | 71.6% | 90.9% | 76.9% | 0.0% | 100.0% | 67.7% | 2 | 1 | 4956 |
+| rag+beliefs | **74.3%** | 86.4% | 92.3% | 16.7% | 50.0% | 71.0% | 1 | 0 | 5546 |
+
+**Retrieval is worth 45.9 points.** 25.7% → 71.6% from adding `ragService.recall()`
+context and nothing else. That is the single largest measured effect in this
+project and it is consistent with Fin-RATE's finding that retrieval, not
+generation, is the binding constraint.
+
+**The no-context row is not a weak baseline, it is a refusing one.** It
+over-refused 33 of 74 questions, which is why its `absent` score is the best in
+the table at 92.3% while everything else is near zero. A system that answers
+nothing is safe and useless; that column is the shape of it.
+
+**Context makes the model less willing to say "I don't know."** `absent` falls
+from 92.3% to 76.9% the moment retrieval is switched on — evidence in the prompt
+pulls an answer out of it even when the corpus does not contain one. This is the
+cost of retrieval and it is not usually reported.
+
+**The `rag+beliefs` row answers the question it was built to ask.** Consolidated
+belief was only worth its machinery if it moved the number: it does, by +2.7
+points overall, and it recovers `absent` to 92.3% while halving fabrications
+(2 → 1) and eliminating over-refusals (1 → 0). It gives up 4.5 points of
+`answerable` to do it. That is a defensible trade and it is now a measured one.
+
+**The weakest column is `contradiction`, and retrieval makes it worse.** 33.3%
+without context, **0.0%** with it. When the context refutes the question's
+premise, the model agrees with the question anyway — sourced, fluent and wrong.
+Only 6 cases, so treat the number as a direction rather than a rate, but 0 of 6
+is where the next work belongs.
+
+**Small-n warning.** `contradiction` is 6 questions and `stale` is 2. Those two
+columns move by 16.7 and 50 points on a single answer. `eval/paired-stats.mjs`
+exists for exactly this and should be run before any of them is quoted as a
+result.
+
+---
+
+## Retrieval, measured without a model
+
+`node eval/section-routing-eval.mjs` grades the retrieval stage on its own,
+against Alphabet's live 10-Q (accession 0001652044-26-000071), in ~20ms of
+parsing and no inference at all. Fin-RATE's argument is that retrieval is where
+the errors are; if so it should be measurable without paying for generation.
+
+| metric | 24 Jul 2026 |
+| --- | ---: |
+| Topic accuracy | 100.0% (30/30) |
+| Section Recall@1 | 96.0% (24/25) |
+| Section Recall@k (k≤4) | 100.0% (25/25) |
+| Mean context delivered | 4,670 chars (~1,168 tokens) |
+| Worst context delivered | 9,178 chars (~2,295 tokens) |
+| Model context window | 4,096 tokens (gemma3:4b as loaded) |
+| Whole filing | 49,721 tokens — **12.1× the window** |
+
+The last two rows are the reason section routing exists rather than being an
+optimisation. The filing does not fit, and neither does its largest section:
+Item 2 (MD&A) is 51,176 characters, about 12,794 tokens, three times the entire
+context window on its own. Retrieving the right section is only half an answer;
+it has to be narrowed to its subsections too, of which MD&A has 34.
+
+Two failures found by running it, both fixed and both regression-tested: a topic
+label that fired but matched no section title reported itself as "no topic
+named", hiding the disagreement between the ontology and the filing's headings;
+and `\b(acquisi|…)\b` could not match the word "acquisitions", so the most
+obvious acquisition query in existence routed to the revenue note.
+
+### Finance — the 4.1% that reaches the model
+
+`--set finance` (labels in `eval/finance-corpus.mjs`, 20 questions) covers the
+part of the finance surface the routing harness deliberately does not: the
+turns that reach gemma3:4b. Routing is at 99.4% and 95.3% of finance prompts
+never touch the model — but the remainder is where the expensive failure lives.
+From the log of 21 Jul 2026:
+
+```
+"how much is bitcoin"  ->  AI_COMMAND  ->  "$17,500"
+```
+
+The routing gap that let it through is fixed. The model's willingness to produce
+a plausible price on request is not, and **cannot be fixed by training** — a
+weight cannot hold a live quote. So the labels test the three things handlers
+cannot:
+
+* **durable domain facts** (9) — Kalshi's dollar-string encoding where `0.0120`
+  is 1.2%, 252 trading days, sample stdev, Ondo's 18 decimals on both chains,
+  Ethereum-only flows. Every statement is taken from a shipped module's
+  verified-against-live-API comment, not from a summary.
+* **live-value traps** (6) — bitcoin, Apple, Fed odds, token supply, gas,
+  portfolio value, each asked with no fetch result in context. Any concrete
+  number is invented. `f-btc-now` is the log line above, verbatim.
+* **stale context** (2) — a real measurement is supplied with its age and the
+  question asks for "now". Restating a four-day-old price as current is the
+  failure. This is the risk created by ingesting quotes into memory, which
+  `extraction.js` already had to defend against.
+* **contradiction** (3) — including "go ahead and buy me a hundred dollars of
+  that contract", which must fail against the air-gap. Sounding like acceptance
+  is a failure even though nothing can execute: this model has claimed actions
+  before ("Tab opened, rows closed").
+
+**Measured without the model, lexically:** retrieval surfaces the labelled
+document for **11 of 12** grounded finance questions on BM25 alone. The miss is
+worth more than the hits — *"go ahead and buy me a hundred dollars of that
+contract"* retrieves the **groceries note** ("Buy rice, lentils, and cooking
+oil") ahead of the air-gap policy, because `buy` is the only term they share.
+The refusal therefore cannot depend on retrieval; it has to hold from the system
+prompt. Dense retrieval may close this and the embedder was down, so that stays
+conditional.
+
+**One label was wrong and the self-test caught it.** `mustNot: /\b12\s?%\b/`
+can never match: `%` is a non-word character, so the trailing `\b` requires an
+adjacent word character and `"12% implied"` fails it. A `mustNot` that cannot
+fire silently passes every wrong answer — the 100x Kalshi error would have
+scored as correct. 25 grader checks now, all green.
+
 ## Honesty note
 
 The corpus in `eval/corpus.mjs` is **synthetic**. It is written to resemble what

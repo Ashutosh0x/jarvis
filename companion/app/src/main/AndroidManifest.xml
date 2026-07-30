@@ -1,13 +1,44 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- Networking: the companion dials OUT to the desktop, so no inbound
-         listener and no server socket permission is needed. -->
+    <!-- Networking: the companion dials OUT to the desktop. The one exception
+         is the offline APK share, which listens on an ephemeral port only
+         while a transfer is on screen. Android has no permission for binding
+         a socket, so nothing extra is needed for that. -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <!-- NsdManager needs this to see services on the local network (Android 12+). -->
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+
+    <!-- Offline APK share. Wi-Fi Direct forms the peer-to-peer group; before
+         API 33 the whole P2P API was gated on fine location, which is why the
+         two permissions below split at exactly that line. -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <uses-permission
+        android:name="android.permission.ACCESS_FINE_LOCATION"
+        android:maxSdkVersion="32" />
+    <!-- Android 12 shows one dialog for both and lets the user pick approximate.
+         Wi-Fi Direct discovery genuinely needs the precise grant, so declaring
+         coarse is about satisfying that dialog contract, not about settling for
+         it — the share screen says so plainly if only approximate comes back. -->
+    <uses-permission
+        android:name="android.permission.ACCESS_COARSE_LOCATION"
+        android:maxSdkVersion="32" />
+    <uses-permission
+        android:name="android.permission.NEARBY_WIFI_DEVICES"
+        android:usesPermissionFlags="neverForLocation"
+        tools:targetApi="tiramisu" />
+    <!-- Hands the verified APK to the system installer. The install itself is
+         still the user's decision, and Android verifies the signature. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
+    <!-- Wi-Fi Direct is optional: the share screen falls back to plain mDNS
+         over whatever Wi-Fi both phones are already on. -->
+    <uses-feature
+        android:name="android.hardware.wifi.direct"
+        android:required="false" />
 
     <!-- Mic drives the visualizer's FFT, exactly as it does on desktop. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
@@ -49,6 +80,42 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Offline APK share. Its own launcher entry rather than a control
+             inside MainActivity: that screen is a fullscreen WebGL orb with no
+             chrome to hang a button off. -->
+        <activity
+            android:name=".share.ApkShareActivity"
+            android:exported="true"
+            android:label="@string/share_activity_label"
+            android:launchMode="singleTop"
+            android:theme="@style/Theme.JarvisCompanion">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- Share an APK in from any file manager. Both MIME types are
+                 needed: plenty of file managers type an APK as a generic
+                 octet-stream and would otherwise never offer JARVIS. -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="application/vnd.android.package-archive" />
+                <data android:mimeType="application/octet-stream" />
+            </intent-filter>
+        </activity>
+
+        <!-- Grants the package installer a scoped, revocable read on exactly
+             the file that was just received. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
 
         <!-- Tier 1: holds the WebSocket link to the desktop while backgrounded. -->
         <service

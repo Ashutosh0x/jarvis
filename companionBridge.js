@@ -137,8 +137,21 @@ class CompanionBridge {
             this.wss = null;
         }
         if (this.bonjour) {
-            try { this.bonjour.unpublishAll(() => this.bonjour.destroy()); } catch { /* noop */ }
+            /* The reference is captured BEFORE the field is cleared, and the
+               callback uses the local one.
+
+               `unpublishAll` takes an asynchronous callback. Clearing
+               `this.bonjour` on the next line meant that by the time mDNS
+               finished unpublishing, the callback dereferenced null and threw
+               "Cannot read properties of null (reading 'destroy')". The
+               surrounding try/catch could not help: the throw happens inside a
+               later tick, not inside the try block, so it escaped as an
+               UNCAUGHT MAIN-PROCESS EXCEPTION and Electron replaced the Jarvis
+               window with an error dialog. Observed on restart, 24 Jul 2026. */
+            const bonjour = this.bonjour;
             this.bonjour = null;
+            const destroy = () => { try { bonjour.destroy(); } catch { /* already gone */ } };
+            try { bonjour.unpublishAll(destroy); } catch { destroy(); }
         }
     }
 

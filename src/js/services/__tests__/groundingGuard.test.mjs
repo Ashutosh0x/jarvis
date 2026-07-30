@@ -133,5 +133,41 @@ const check = (n, c) => { c ? pass++ : fail++; console.log(`${c ? 'PASS' : 'FAIL
         findUngrounded('Chrome 151 shipped on Tuesday.', noAdvisory).length === 0);
 }
 
+/* --- money: the 22 Jul 2026 fabrication ---------------------------------------
+   Replayed from the real interaction log. The context is what the feed store
+   ACTUALLY held for Goldman Sachs that day: a title, a form type and a date.
+   Everything the model said beyond that was invented. */
+{
+    const REAL_CONTEXT = `Relevant long-term memory (most relevant first):
+[2026-07-21] SEC XBRL financial filings: GOLDMAN SACHS GROUP INC (0000886982) (Filer). 424B2
+[2026-07-21] SEC XBRL financial filings: MORGAN STANLEY (0000895421) (Filer). 424B2`;
+
+    const FABRICATED = 'The Revenue Growth target is a minimum of $8.5 billion, Risk Adjusted Return requires a positive skew factor of 1.25, and Employee Retention necessitates maintaining at least 90% of key personnel.';
+
+    const g = guardOutput(FABRICATED, REAL_CONTEXT);
+    check('money: the real fabrication is blocked', g.blocked, JSON.stringify(g.found));
+    check('money: and the invented amount is named', g.found.some(f => /8\.5/.test(f.value)), JSON.stringify(g.found.map(f => f.value)));
+
+    check('money: an amount that IS in context passes',
+        !guardOutput('The filing lists $8.5 billion.', 'the filing lists $8.5 billion in fees').blocked);
+    check('money: phrasing may differ from the context',
+        !guardOutput('It was 8.5 billion dollars.', 'total of $8.5 billion').blocked);
+    check('money: a different amount is still blocked',
+        guardOutput('It was $9.2 billion.', 'total of $8.5 billion').blocked);
+
+    /* A guard that fires on trivial figures gets ignored when it matters. */
+    check('money: trivial round amounts are not blocked',
+        !guardOutput('It would cost about $10.', '').blocked);
+    check('money: an answer with no figures is untouched',
+        !guardOutput('Goldman Sachs filed a 424B2 on 21 July.', REAL_CONTEXT).blocked);
+
+    /* The handler paths speak fetched numbers directly and are not guarded;
+       what must keep working is the MODEL path quoting a fetched value that
+       was placed in its context. */
+    check('money: a fetched quote in context is speakable',
+        !guardOutput('Bitcoin is at $61,240.', 'BTC-USD last trade 61,240.00').blocked);
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
+

@@ -23,3 +23,7 @@ docs.md
 
 # Harness run artefacts: regenerate with node eval/agent-harness.mjs
 eval/results/
+
+# Python bytecode from the local STT/TTS servers
+__pycache__/
+*.pyc

@@ -1,5 +1,9 @@
 /**
  * Audio Capture Processor - Official Pattern
+ *
+ * AudioWorkletProcessor running on the Web Audio render thread. Buffers raw
+ * mic input into fixed 256-sample frames and posts them to the main thread
+ * via transferable ArrayBuffers for zero-copy delivery.
  */
 class AudioCaptureProcessor extends AudioWorkletProcessor {
     constructor() {
@@ -7,6 +11,7 @@ class AudioCaptureProcessor extends AudioWorkletProcessor {
         this.bufferSize = 256;
         this.buffer = new Float32Array(this.bufferSize);
         this.bufferIndex = 0;
+        this.framesProcessed = 0; // diagnostic counter
     }
 
     process(inputs, outputs, parameters) {
@@ -21,12 +26,17 @@ class AudioCaptureProcessor extends AudioWorkletProcessor {
 
                 // When buffer is full, send it to main thread
                 if (this.bufferIndex >= this.bufferSize) {
-                    // Send the buffered audio to the main thread
-                    // ✅ FIX: Use new Float32Array(this.buffer) for production-grade GC hygiene
+                    // Allocate a fresh ArrayBuffer and transfer ownership to
+                    // the main thread — zero-copy, no structured clone overhead.
+                    const outBuffer = new ArrayBuffer(this.bufferSize * 4);
+                    const outView = new Float32Array(outBuffer);
+                    outView.set(this.buffer);
+
                     this.port.postMessage({
                         type: "audio",
-                        data: new Float32Array(this.buffer),
-                    });
+                        data: outView,
+                        frames: ++this.framesProcessed
+                    }, [outBuffer]);
 
                     // Reset buffer
                     this.bufferIndex = 0;

@@ -13,13 +13,17 @@ export function base64ToUint8Array(base64) {
 
 /**
  * Encodes Uint8Array to base64 string.
+ * Uses chunked String.fromCharCode.apply to avoid O(n²) string
+ * concatenation and call-stack overflow on large buffers.
  */
 export function arrayBufferToBase64(buffer) {
     let binary = '';
     const bytes = new Uint8Array(buffer);
     const len = bytes.byteLength;
-    for (let i = 0; i < len; i++) {
-        binary += String.fromCharCode(bytes[i]);
+    const chunkSize = 8192;
+    for (let i = 0; i < len; i += chunkSize) {
+        const chunk = bytes.subarray(i, i + chunkSize);
+        binary += String.fromCharCode.apply(null, chunk);
     }
     return btoa(binary);
 }
@@ -39,14 +43,22 @@ export function float32To16BitPCM(float32Arr) {
 
 /**
  * Decodes raw PCM 16-bit data to AudioBuffer.
+ * Not async — contains no awaits and returns synchronously.
  */
-export async function pcm16ToAudioBuffer(
+export function pcm16ToAudioBuffer(
     pcmData,
     audioContext,
     sampleRate = 24000,
     channels = 1
 ) {
-    const dataInt16 = new Int16Array(pcmData.buffer, pcmData.byteOffset, pcmData.byteLength / 2);
+    // Guarantee Int16Array alignment: if byteOffset is odd, slice to a
+    // new aligned buffer. Without this, V8 throws RangeError on unaligned
+    // typed-array construction.
+    let bufferData = pcmData;
+    if (pcmData.byteOffset % 2 !== 0) {
+        bufferData = pcmData.slice();
+    }
+    const dataInt16 = new Int16Array(bufferData.buffer, bufferData.byteOffset, bufferData.byteLength / 2);
     const frameCount = dataInt16.length / channels;
     const buffer = audioContext.createBuffer(channels, frameCount, sampleRate);
 

@@ -30,6 +30,75 @@ Nothing is handed out once the pairing window closes — `/pair` and `/apk` both
 return 403. That window is the only thing standing between a LAN neighbour and
 your bridge token, so it is deliberately short and user-initiated.
 
+## Offline APK share
+
+The QR onboarding above needs the desktop. **JARVIS Share** (its own launcher
+icon, `share/ApkShareActivity`) needs nothing at all — no desktop, no router,
+no internet, no cloud. It hands the APK straight to another phone over the
+radio, and it can send itself, so one installed copy seeds the next.
+
+```
+sender                                             receiver
+  pick APK  ──►  SHA-256 the whole file
+  HTTP server on an ephemeral port
+  offer {port, token, name, size, sha256}
+        │
+        ├─ Wi-Fi Direct: DNS-SD TXT ─────────────►  discovers offer
+        │                                           joins the group
+        │                                           GET /apk  +  token header
+        └─ same Wi-Fi:   mDNS TXT ───────────────►  GET /apk  +  token header
+                                                    digest while writing
+                                                    match? ──► package installer
+```
+
+**Two transports.** Wi-Fi Direct builds a private link where no network
+exists. When both phones already share a Wi-Fi, plain mDNS skips the
+negotiation entirely and is quicker to start. Both stay on the local link;
+neither touches an ISP.
+
+**The sender is always the group owner.** A Wi-Fi Direct group owner is fixed
+at `192.168.49.1`, and the joining client reads that address out of
+`WifiP2pInfo` — so neither side has to tell the other where it is. Left to
+normal role negotiation, intent values decide it at connect time and the phone
+holding the file lands as a client half the time, reachable only at an address
+nobody advertised. Hence `createGroup()` on the sender and
+`groupOwnerIntent = 0` on the receiver.
+
+**Why HTTP and not raw sockets.** OkHttp is already a dependency, so the
+receiving side needs no protocol code, and a browser on the other phone can
+fetch the same URL when something needs debugging. The server is ~200 lines:
+two routes, `GET` only, one payload chosen before the socket opens. There is
+no request path that maps onto the filesystem.
+
+**What guards it.** The listener is up only while the screen is, it closes
+after one complete transfer, and every request must carry the token from the
+TXT record — compared with `MessageDigest.isEqual`, not `==`. The digest is
+computed by the sender before serving and recomputed by the receiver while
+writing; a mismatch deletes the file rather than offering it for install.
+Downloads land in the app's own external files dir, which needs no storage
+permission on any supported API level, and reach the installer through a
+`FileProvider` grant.
+
+**Install is still Android's call.** `REQUEST_INSTALL_PACKAGES` plus the
+per-app *unknown sources* toggle plus the installer's own dialog plus
+signature verification. Same wall as [self-update](#self-update-is-not-possible-the-way-chrome-does-it),
+and for the same reason — this moves the file, nothing more.
+
+**Permissions split at API 33.** Wi-Fi Direct needs `NEARBY_WIFI_DEVICES`
+(`neverForLocation`) from 33 up, and `ACCESS_FINE_LOCATION` below it —
+declared with `maxSdkVersion="32"` so newer devices never see a location
+prompt. `ACCESS_COARSE_LOCATION` rides along only because Android 12 refuses
+to offer the precise option unless both are requested; coarse alone finds no
+peers, and the screen says so. On those same versions the location *master
+switch* must also be on or discovery returns an empty list with no error
+anywhere, so the screen checks that up front instead of spinning.
+
+**Bluetooth is not in the path.** The usual write-up starts with Bluetooth
+discovery, then switches to Wi-Fi for speed. Wi-Fi Direct already does its own
+service discovery and carries the offer in the TXT record, so a Bluetooth leg
+would add a second permission tree and a second pairing step to learn
+something the receiver is about to be told anyway.
+
 ## The visualizer is copied, not reimplemented
 
 | Asset | Origin | State |

@@ -28,6 +28,11 @@ export const SOURCES = {
     'nvd': { terms: /\bCVE-\d{4}-\d{4,7}\b|\b(vulnerabilit(y|ies)|cvss|severity)\b/i, domain: 'security', ms: 400, ok: 1 },
     'sec-8k': { terms: /\b(sec|8-?k|10-?[kq]|filing|edgar|earnings|disclosure)\b/i, domain: 'finance', ms: 24, ok: 1 },
     'fed': { terms: /\b(fed|federal reserve|fomc|rate|monetary|inflation)\b/i, domain: 'finance', ms: 18, ok: 1 },
+    /* Morningstar's own IR feeds. `morning star` as two words is deliberate:
+       input arrives from speech recognition and the company name is exactly the
+       kind of compound it splits. Seed 190ms is the mean of two measured probes
+       on 22 Jul 2026 (press 122ms, filings 254ms) and observe() replaces it. */
+    'morningstar': { terms: /\bmorning\s?star\b/i, domain: 'finance', ms: 190, ok: 1 },
     'arxiv-cr': { terms: /\b(arxiv|paper|preprint)\b.*\b(security|crypto)\b|\bcs\.CR\b/i, domain: 'research', ms: 71, ok: 1 },
     'arxiv-ai': { terms: /\b(arxiv|paper|preprint|research)\b/i, domain: 'research', ms: 238, ok: 1 },
     'chain': { terms: /\b(gas|balance|wallet|0x[0-9a-f]{6,}|whale|on.?chain|ethereum|arbitrum|base|bsc|solana)\b/i, domain: 'chain', ms: 300, ok: 1 },

@@ -80,7 +80,45 @@ const PATTERNS = [
         // it is the model's own and is not evidence of anything.
         normalise: (s) => (s.match(/\d{1,2}\.\d(?!.*\d{1,2}\.\d)/) || [s])[0],
     },
+    {
+        name: 'money',
+        /* MONETARY AMOUNTS. Added after the worst fabrication this project has
+           recorded, from the live session of 22 Jul 2026.
+
+           The user asked about new SEC filings. The only Goldman Sachs events
+           in the feed store were three 424B2 prospectus filings whose entire
+           summary text is the literal string "424B2" — a title, a date and a
+           link. Over eight turns the model produced, with rising specificity:
+
+             "a change in executive compensation ... stock awards and cash
+              bonuses for the fiscal year ending December 31st, 2026"
+             "the listed metrics are: Revenue Growth, Risk Adjusted Return,
+              and Employee Retention"
+             "the Revenue Growth target is a minimum of $8.5 billion, Risk
+              Adjusted Return requires a positive skew factor of 1.25, and
+              Employee Retention necessitates maintaining at least 90% of key
+              personnel in the Investment Banking division"
+
+           None of it exists. The user believed it and asked where the revenue
+           came from. Every earlier pattern in this file caught an identifier;
+           this is the class where the harm is largest, because a figure
+           attributed to a named filing is acted on directly.
+
+           Matches "$8.5 billion", "$8,500,000", "8.5 billion dollars". The
+           amount must appear in the context that was actually retrieved. */
+        re: /(?:[$€£₹]\s?\d[\d,]*(?:\.\d+)?\s*(?:billion|million|thousand|bn|mn|k)?)|(?:\b\d[\d,]*(?:\.\d+)?\s*(?:billion|million|trillion)\s+(?:dollars|euros|pounds|rupees|usd)\b)/gi,
+        // Compare on digits alone: "$8.5 billion" and "8.5 billion dollars"
+        // are the same claim, and the currency mark is the model's phrasing.
+        normalise: (s) => s.replace(/[$€£₹,\s]/g, '').toLowerCase()
+            .replace(/dollars|euros|pounds|rupees|usd/g, '')
+            .replace(/\bbn\b/, 'billion').replace(/\bmn\b/, 'million'),
+    },
 ];
+
+/* Amounts that carry no claim about the world. "$0" and small round figures
+   appear in explanations and examples; blocking them would train the user to
+   ignore the guard, which is worse than letting them through. */
+const TRIVIAL_MONEY = /^0*(?:0|1|2|5|10|100|1000)$/;
 
 /**
  * Normalise context once so every lookup is a cheap substring test. Spaces are
@@ -93,12 +131,27 @@ function buildHaystack(context) {
         lower: raw.toLowerCase(),
         // Address-normalised copy: whitespace around dots and colons removed.
         tight: raw.toLowerCase().replace(/\s*([.:-])\s*/g, '$1'),
+        /* Money-normalised copy. The token normaliser strips currency marks,
+           commas and spaces ("$8.5 billion" -> "8.5billion"), so the haystack
+           has to be reduced the same way or a correctly-grounded figure is
+           never found and the guard blocks a true answer. Normalising one side
+           only is how the first version of this failed its own tests. */
+        money: raw.toLowerCase()
+            .replace(/[$€£₹,\s]/g, '')
+            .replace(/dollars|euros|pounds|rupees|usd/g, ''),
     };
 }
 
 function isGrounded(token, pattern, hay) {
     if (pattern.alwaysUngrounded) return false;
     const n = pattern.normalise(token).toLowerCase();
+    /* A trivial amount is treated as grounded: it is not a claim about a
+       filing, and a guard that fires on "$10" gets ignored when it fires on
+       "$8.5 billion". */
+    if (pattern.name === 'money') {
+        if (TRIVIAL_MONEY.test(n.replace(/[^\d]/g, ''))) return true;
+        return hay.money.includes(n) || hay.tight.includes(n) || hay.lower.includes(n);
+    }
     return hay.tight.includes(n) || hay.lower.includes(n);
 }
 

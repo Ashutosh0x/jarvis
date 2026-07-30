@@ -10,9 +10,27 @@ class MicrophoneAudio {
     }
 
     async initialize() {
+        // Prevent stream/context leak on re-initialization
+        if (this.isRecording) {
+            this.stop();
+        }
+
         try {
-            this.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            // Add audio constraints to getUserMedia
+            this.stream = await navigator.mediaDevices.getUserMedia({ 
+                audio: { 
+                    echoCancellation: true, 
+                    noiseSuppression: true, 
+                    autoGainControl: true 
+                } 
+            });
             this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            
+            // Handle suspended AudioContext (resume if needed)
+            if (this.audioContext.state === 'suspended') {
+                await this.audioContext.resume();
+            }
+            
             this.analyser = this.audioContext.createAnalyser();
             this.microphone = this.audioContext.createMediaStreamSource(this.stream);
             
@@ -28,10 +46,11 @@ class MicrophoneAudio {
             return this.analyser;
         } catch (error) {
             console.error('Microphone initialization error:', error);
-            // Return a dummy analyser that returns 0
+            // Return a dummy analyser that returns 0, including getFrequencyData to prevent TypeError
             return {
                 getAverageFrequency: () => 0,
-                getByteFrequencyData: () => {}
+                getByteFrequencyData: () => {},
+                getFrequencyData: () => null
             };
         }
     }
@@ -73,4 +92,3 @@ class MicrophoneAudio {
 }
 
 export default MicrophoneAudio;
-

@@ -33,9 +33,69 @@ export const FEEDS = [
 
     // --- finance: SEC requires a declared User-Agent -------------------------
     { id: 'sec-8k', domain: 'finance', title: 'SEC latest 8-K filings', url: 'https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&company=&dateb=&owner=include&count=40&output=atom', verified: true, items: 40, needsUserAgent: true },
-    { id: 'sec-xbrl', domain: 'finance', title: 'SEC XBRL financial filings', url: 'https://www.sec.gov/Archives/edgar/xbrlrss.all.xml', verified: true, items: 200, needsUserAgent: true },
+    { id: 'sec-xbrl', domain: 'finance', title: 'SEC XBRL financial filings', url: 'https://www.sec.gov/Archives/edgar/xbrlrss.all.xml', verified: true, items: 200, needsUserAgent: true, heavy: true },
+
+    /* --- SEC newsroom and enforcement (probed 22 Jul 2026) -------------------
+       THE OLD PATHS ALL MOVED. sec.gov/news/speeches.rss and the three
+       sec.gov/rss/litigation/*.xml URLs still 301 — but two of those redirects
+       land on a 404, so following the redirect is not enough and a naive
+       "it redirects, fine" check would register two dead feeds. The
+       post-redirect paths below were each fetched and counted. */
+    { id: 'sec-press', domain: 'finance', title: 'SEC press releases', url: 'https://www.sec.gov/news/pressreleases.rss', verified: true, items: 25, needsUserAgent: true },
+    { id: 'sec-speeches', domain: 'finance', title: 'SEC speeches and statements', url: 'https://www.sec.gov/news/speeches-statements.rss', verified: true, items: 25, needsUserAgent: true },
+    /* Kept ALONGSIDE speeches-statements rather than folded into it: the two
+       feeds share ZERO of their 25 titles, measured, so treating either as a
+       superset of the other would silently drop 25 items. */
+    { id: 'sec-statements', domain: 'finance', title: 'SEC statements', url: 'https://www.sec.gov/news/statements.rss', verified: true, items: 25, needsUserAgent: true },
+    { id: 'sec-litigation', domain: 'finance', title: 'SEC litigation releases', url: 'https://www.sec.gov/enforcement-litigation/litigation-releases/rss', verified: true, items: 25, needsUserAgent: true },
+    { id: 'sec-admin', domain: 'finance', title: 'SEC administrative proceedings', url: 'https://www.sec.gov/enforcement-litigation/administrative-proceedings/rss', verified: true, items: 25, needsUserAgent: true },
+    { id: 'sec-suspensions', domain: 'finance', title: 'SEC trading suspensions', url: 'https://www.sec.gov/enforcement-litigation/trading-suspensions/rss', verified: true, items: 25, needsUserAgent: true },
+    /* Live and current, but LOW VOLUME by nature: newest item at probe was 12
+       Feb 2026. Congressional testimony is rare, so an empty week is the feed
+       working. Recorded so a future probe does not mistake quiet for broken —
+       the opposite of the Morningstar presentations feed, which is frozen. */
+    { id: 'sec-testimony', domain: 'finance', title: 'SEC testimony', url: 'https://www.sec.gov/news/testimony.rss', verified: true, items: 25, needsUserAgent: true },
+
+    /* --- XBRL structured-disclosure firehoses --------------------------------
+       Updated every ten minutes, 200 items each, and BIG: 957KB and 822KB per
+       fetch, measured. `heavy` keeps them out of the routine cycle — a personal
+       assistant's corpus does not benefit from 400 "Company X filed a 10-Q"
+       notices every cycle, and 1.8MB per cycle is real bandwidth.
+       NOT redundant with sec-xbrl, which was the assumption until it was
+       checked: usgaap shares only 57 of 201 accession numbers with
+       xbrlrss.all, because each is a different 200-item slice of the same
+       firehose rather than a subset of the other. */
+    { id: 'sec-usgaap-xbrl', domain: 'finance', title: 'SEC US-GAAP XBRL filings', url: 'https://www.sec.gov/Archives/edgar/usgaap.rss.xml', verified: true, items: 200, needsUserAgent: true, heavy: true },
+    { id: 'sec-inline-xbrl', domain: 'finance', title: 'SEC Inline XBRL filings', url: 'https://www.sec.gov/Archives/edgar/xbrl-inline.rss.xml', verified: true, items: 200, needsUserAgent: true, heavy: true },
     { id: 'fed-press', domain: 'finance', title: 'Federal Reserve press', url: 'https://www.federalreserve.gov/feeds/press_all.xml', verified: true, items: 20 },
     { id: 'fed-monetary', domain: 'finance', title: 'FOMC and monetary policy', url: 'https://www.federalreserve.gov/feeds/press_monetary.xml', verified: true, items: 15 },
+
+    /* --- Morningstar investor relations (probed 22 Jul 2026) -----------------
+       WHAT THESE ARE, because the name invites the opposite assumption: these
+       are Morningstar, INC.'s OWN investor-relations feeds, served by Q4 Inc's
+       IR platform. CIK 0001289419 is Morningstar the listed company (MORN).
+       They carry Morningstar's dividend announcements, its product press, and
+       its own 8-K/4/144 filings. They are NOT Morningstar research, NOT star
+       ratings, NOT fair-value estimates, and NOT analyst coverage of any other
+       security. Nothing here helps answer "what does Morningstar think of
+       Apple" — that is a paid data licence, not an RSS feed.
+
+       THE Symbol PARAMETER IS IGNORED. `SECFiling.aspx?Exchange=CIK&Symbol=`
+       looks like a per-company filings endpoint and is not: requesting Apple's
+       CIK 0000320193 returns Morningstar, Inc. filings, and omitting Symbol
+       entirely still returns Morningstar. Probed both. The URL is kept in its
+       original form because that is what the site publishes, but no caller
+       should ever template a CIK into it expecting another company. For real
+       per-company filings the SEC's own EDGAR endpoints above are the source. */
+    { id: 'morningstar-sec', domain: 'finance', title: 'Morningstar Inc SEC filings', url: 'https://suppliers.morningstar.com/rss/SECFiling.aspx?Exchange=CIK&Symbol=0001289419', verified: true, items: 20, note: 'Morningstar Inc only; the Symbol parameter is ignored. Newest item at probe: 25 Jun 2026.' },
+
+    /* Live and parseable, but the CONTENT lags badly: at probe time the channel
+       advertised lastBuildDate 21 Jul 2026 while its newest item was 18 Dec
+       2025 — seven months of staleness behind a fresh-looking build date.
+       Harmless here only because parseFeed reads each item's own pubDate and
+       never the channel's lastBuildDate; anything that judged freshness from
+       the channel would call this feed current every single day. */
+    { id: 'morningstar-press', domain: 'finance', title: 'Morningstar Inc press releases', url: 'https://suppliers.morningstar.com/rss/pressrelease.aspx', verified: true, items: 10, note: 'lastBuildDate refreshes daily but items do not; newest item at probe was 18 Dec 2025.' },
 
     // --- research ------------------------------------------------------------
     { id: 'arxiv-cscr', domain: 'research', title: 'arXiv cs.CR (security)', url: 'http://export.arxiv.org/rss/cs.CR', verified: true, items: 89 },
@@ -45,14 +105,36 @@ export const FEEDS = [
        silently vanishes from a registry looks like it was never considered,
        and the next person re-probes it from scratch. */
     { id: 'treasury-press', domain: 'finance', title: 'US Treasury press', url: 'https://home.treasury.gov/system/files/126/rss.xml', verified: false, error: 'timed out at 15s on this network' },
+    /* Serves 200 OK and eight well-formed items, so a liveness check passes it.
+       It is dead anyway: lastBuildDate EQUALS its newest pubDate, both 18 May
+       2018 — frozen for eight years, not merely quiet. Polling it forever would
+       cost a request per cycle to re-learn the 2018 shareholder meeting. Left
+       visible rather than deleted so it is not re-probed from scratch; the
+       descriptions also carry escaped SlideShare iframes, which is why the
+       stripTags path matters if it is ever revived. */
+    { id: 'morningstar-presentations', domain: 'finance', title: 'Morningstar Inc presentations', url: 'https://suppliers.morningstar.com/rss/presentation.aspx', verified: false, error: 'live but frozen since 18 May 2018 (newest item == lastBuildDate)' },
     { id: 'cisa-kev', domain: 'security', title: 'CISA Known Exploited Vulnerabilities', url: 'https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json', verified: false, error: 'JSON, not RSS — needs its own parser' },
+    /* Both are listed on the SEC's own Structured Disclosure RSS page and both
+       404. Documented endpoints that do not exist is the same class of error as
+       Kalshi's non-existent "Culture" category: the page is not the territory. */
+    { id: 'sec-ifrs-xbrl', domain: 'finance', title: 'SEC IFRS XBRL filings', url: 'https://www.sec.gov/Archives/edgar/ifrs.rss.xml', verified: false, error: '404 — listed on the SEC RSS page but the endpoint does not exist' },
+    { id: 'sec-rrsummary', domain: 'finance', title: 'SEC mutual fund risk/return', url: 'https://www.sec.gov/Archives/edgar/rrsummary.rss.xml', verified: false, error: '404 — listed on the SEC RSS page but the endpoint does not exist' },
 ];
 
 export const DOMAINS = ['security', 'finance', 'research'];
 
-/** Only feeds a live probe accepted. */
-export function activeFeeds(domain = null) {
-    return FEEDS.filter(f => f.verified && (!domain || f.domain === domain));
+/**
+ * Only feeds a live probe accepted.
+ *
+ * `heavy` feeds are excluded by default: they are the 200-item XBRL firehoses,
+ * ~900KB each, refreshed every ten minutes. Including them in the routine cycle
+ * costs megabytes to learn that routine filings happened. They stay one
+ * argument away for when a question actually needs them.
+ */
+export function activeFeeds(domain = null, { includeHeavy = false } = {}) {
+    return FEEDS.filter(f => f.verified
+        && (!domain || f.domain === domain)
+        && (includeHeavy || !f.heavy));
 }
 
 /* --- parsing ----------------------------------------------------------------
