@@ -19,6 +19,15 @@ jobs:
         with:
           node-version: '22'
 
+      # src/config.js holds real credentials and is gitignored, but
+      # toolService.js imports it at module load, so two suites cannot even be
+      # imported on a fresh clone. The committed template has the same shape
+      # with placeholder values. This is what a new contributor does by hand;
+      # doing it here means the suite runs on a clean checkout, which is the
+      # only way this workflow tests what it claims to.
+      - name: Seed the placeholder config
+        run: cp src/config.example.js src/config.js
+
       # The suites import only source files, so a full install is not needed to
       # run them. Electron alone is a ~100MB download and nothing under test
       # touches it.

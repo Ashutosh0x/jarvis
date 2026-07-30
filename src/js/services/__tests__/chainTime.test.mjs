@@ -49,7 +49,11 @@ check('no timestamp yields null, never a guessed time',
 {
     const t = clockTime(NOW);
     check('clock time is zero-padded HH:MM:SS', /^\d{2}:\d{2}:\d{2}$/.test(t), t);
-    const midnightish = clockTime(Date.parse('2026-07-21T00:05:09+05:30'));
+    /* Built from LOCAL components, not a fixed +05:30 offset. clockTime
+       formats in the runtime's zone, so pinning the offset asserted the
+       author's timezone rather than the padding: under UTC this read
+       18:35:09 and the suite only passed in IST. */
+    const midnightish = clockTime(new Date(2026, 6, 21, 0, 5, 9).getTime());
     check('early hours keep their padding', midnightish === '00:05:09', midnightish);
     check('no timestamp yields no clock', clockTime(null) === null && clockTime(0) === null);
 }
