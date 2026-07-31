@@ -372,17 +372,15 @@ class Jarvis {
                 this.settings.set('voiceName', femaleVoice.name);
                 console.log('Selected female voice (fallback):', femaleVoice.name);
             } else {
-                /* No female voice installed at all. The system default is left
-                   in place because there is nothing better to pick — on a stock
-                   Windows install that default is male, so this is warned about
-                   rather than logged quietly. It is only ever reached when the
-                   neural server is also down; installing a voice under
-                   Settings > Time & language > Speech fixes it. */
-                this.selectedVoice = voices.find(v => v.default) || voices[0];
-                if (this.selectedVoice) {
-                    console.warn('No female system voice installed — falling back to',
-                        this.selectedVoice.name);
-                }
+                /* No female voice installed. Deliberately leaves selectedVoice
+                   null rather than taking the system default — on a stock
+                   Windows install that default is David, and speaking as him
+                   because a server was down is worse than not speaking. The
+                   neural server is the voice; this path only matters when it is
+                   unavailable AND systemVoiceFallback was turned on. */
+                this.selectedVoice = null;
+                console.warn('No female system voice installed — the system fallback will stay silent. '
+                    + 'Install one under Settings > Time & language > Speech.');
             }
         };
 
@@ -971,8 +969,31 @@ class Jarvis {
         }
     }
 
-    /** SAPI TTS fallback — the original speak path, preserved for resilience. */
+    /**
+     * System-voice fallback. Disabled by default — see `systemVoiceFallback`.
+     *
+     * Reports the outage once per session instead of speaking in a different
+     * voice. Going silent with no explanation would be its own bug, so the
+     * text stays on screen and the reason is stated.
+     */
+    _systemVoiceAllowed() {
+        if (!this.settings.get('systemVoiceFallback')) {
+            if (!this._warnedNoVoice) {
+                this._warnedNoVoice = true;
+                console.warn('Neural TTS is unavailable and the system-voice fallback is off, '
+                    + 'so replies are text-only. Enable systemVoiceFallback to use a system voice.');
+                try { this.displayText('Voice server unavailable — replies are text-only.', null); }
+                catch { /* display is best-effort */ }
+            }
+            return false;
+        }
+        // Enabled, but nothing acceptable installed: still never speak as David.
+        return Boolean(this.selectedVoice);
+    }
+
+    /** System-voice fallback — off by default, female voices only. */
     _speakSAPI(clean) {
+        if (!this._systemVoiceAllowed()) return;
         // Flush the queue: the newest information wins
         this.synthesis.cancel();
         this._flushSpeechQueue();
@@ -7628,9 +7649,13 @@ class Jarvis {
         this._drainSpeechViaSAPI(line, finish);
     }
 
-    /** Speak one queued line through SAPI. Only reached when the neural server
-        is down — it is the fallback for the queue, not the normal path. */
+    /** Speak one queued line through the system voice.
+
+        OFF unless `systemVoiceFallback` was explicitly enabled, and even then
+        only with a voice that passed isFemaleVoice. Jarvis speaks as Emma; a
+        dead neural server must not quietly change that. */
     _drainSpeechViaSAPI(line, finish) {
+        if (!this._systemVoiceAllowed()) { finish(); return; }
         const u = new SpeechSynthesisUtterance(line);
         if (this.selectedVoice) u.voice = this.selectedVoice;
         u.rate = this.settings.get('speechRate') || 1.0;

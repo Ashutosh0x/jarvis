@@ -72,9 +72,13 @@ async def handle(ws):
             elif msg_type == "voices":
                 try:
                     voices = await edge_tts.list_voices()
+                    # Female only. Jarvis has one voice and it is Emma; a
+                    # picker that offers male voices is a picker that will
+                    # eventually be used to select one.
                     en_voices = [
                         {"name": v["ShortName"], "gender": v["Gender"]}
-                        for v in voices if v["Locale"].startswith("en-")
+                        for v in voices
+                        if v["Locale"].startswith("en-") and v["Gender"] == "Female"
                     ]
                     await ws.send(json.dumps({"type": "voices", "voices": en_voices}))
                 except Exception as e:

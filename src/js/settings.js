@@ -13,7 +13,16 @@ class SettingsManager {
                fact before the next arrives. The gap sits INSIDE the microphone
                gate, so Jarvis cannot hear its own next line during it. */
             speechGapMs: 450,
-            voiceName: null, // SAPI fallback voice; set automatically to a female voice
+            voiceName: null, // system fallback voice; only ever set to a female one
+
+            /* OFF by default. The neural server speaks as Emma; a Windows
+               system voice is a different voice entirely, and on a stock
+               install the default one is male. Falling back to it silently
+               meant a dead TTS server changed who Jarvis sounded like without
+               saying so. Turn this on to keep a voice at all when the neural
+               server is down, and even then only a female system voice is
+               ever selected. */
+            systemVoiceFallback: false,
             /* edge-tts neural voice used by the local TTS server — the voice
                you actually hear. Emma is cheerful and conversational;
                en-US-AriaNeural is a more clipped assistant register,
@@ -46,7 +55,7 @@ class SettingsManager {
 
             /* Bumped whenever a default below must beat the copy already in
                localStorage. See MIGRATED_KEYS. */
-            settingsVersion: 2
+            settingsVersion: 3
         };
         this.settings = this.loadSettings();
     }
@@ -59,7 +68,7 @@ class SettingsManager {
        persisted at whatever the default was on the day it was first saved, and
        is pinned there forever. */
     static get MIGRATED_KEYS() {
-        return ['neuralVoice'];
+        return ['neuralVoice', 'voiceName', 'systemVoiceFallback'];
     }
 
     // Load settings from localStorage
