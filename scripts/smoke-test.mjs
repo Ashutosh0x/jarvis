@@ -118,6 +118,14 @@ if (fatal) {
 }
 if (!evidence.length) {
     console.error('smoke: FAILED — the app produced no recognisable startup output.');
+    // A clean, instant exit with no output is what the single-instance lock
+    // looks like: a second Jarvis hands its window to the first and leaves.
+    // Indistinguishable from a crash unless it is named, and on a developer
+    // machine with Jarvis already running it is by far the likelier cause.
+    if (code === 0 && out.trim().length < 64) {
+        console.error('smoke: an already-running Jarvis would produce exactly this —');
+        console.error('smoke: quit it from the tray and run this again.');
+    }
     console.error(out.slice(0, 4000) || '(no output at all)');
     process.exit(1);
 }

@@ -25,6 +25,7 @@ const suites = [
     path.join(root, 'visionRouter.test.mjs'),
     path.join(root, 'sectorMove.test.mjs'),
     path.join(root, 'webSearch.test.mjs'),
+    path.join(root, 'packaging.test.mjs'),
 ];
 
 /* The answer benchmark's grader is the part of it that can silently lie, so its

@@ -34,10 +34,12 @@ files:
   # Root CommonJS modules. The main process cannot import the renderer's ES
   # modules, so its pure logic lives at the root; all of it must ship.
   - adbService.js
+  - autostart.js
   - chainProviders.js
   - chainWatch.js
   - companionBridge.js
   - edgarGuard.js
+  - googleCalendar.js
   - metricStore.js
   - rpcHedge.js
   - sectorMove.js

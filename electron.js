@@ -26,6 +26,15 @@ const adbService = require('./adbService');
 const { hedgedRace, createStickyOrder } = require('./rpcHedge');
 const webSearch = require('./webSearch');
 const chainProviders = require('./chainProviders');
+/* Required at the TOP, with the other root modules, rather than beside its
+   handlers further down. A require that throws mid-file aborts evaluation
+   after `app.whenReady()` has already been registered, so the ready callback
+   still fires into a half-initialised module and reports a temporal-dead-zone
+   error on whatever `let` it reaches first. That is what a missing
+   googleCalendar.js actually looked like: "Cannot access 'telemetryInterval'
+   before initialization", pointing at telemetry and thousands of lines from
+   the real fault. */
+const { GoogleCalendar } = require('./googleCalendar.js');
 const {
     BACKENDS: VISION_BACKENDS,
     chooseBackend: chooseVisionBackend,
@@ -896,8 +905,6 @@ ipcMain.handle('reveal-in-folder', async (event, requestedPath) => {
    fetch. See googleCalendar.js for why there is no `googleapis` dependency.
    Credentials come from .env and are NEVER handed to the renderer.
 ========================= */
-const { GoogleCalendar } = require('./googleCalendar.js');
-
 const googleCal = new GoogleCalendar({
     clientId: process.env.GOOGLE_CLIENT_ID || '',
     clientSecret: process.env.GOOGLE_CLIENT_SECRET || '',

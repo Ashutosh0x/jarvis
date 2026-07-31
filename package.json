@@ -106,6 +106,8 @@
     "server/",
     "companion/",
     "build/icon.png",
+    "autostart.js",
+    "googleCalendar.js",
     "electron.js",
     "preload.js",
     "webSearch.js",
