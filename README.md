@@ -28,8 +28,104 @@
   <img src="https://img.shields.io/badge/platform-Windows%2011-0078D6?style=flat-square&logo=windows&logoColor=white" alt="Platform" />
   <img src="https://img.shields.io/badge/runs-100%25%20offline-success?style=flat-square" alt="Offline" />
   <img src="https://img.shields.io/badge/cloud%20API-none-critical?style=flat-square" alt="No cloud" />
-  <img src="https://img.shields.io/badge/license-ISC-blue?style=flat-square" alt="License" />
 </p>
+
+<p align="center">
+  <a href="https://www.npmjs.com/package/@ashutosh0x/jarvis"><img src="https://img.shields.io/npm/v/@ashutosh0x/jarvis?style=flat-square&color=CB3837&logo=npm&logoColor=white" alt="npm version" /></a>
+  <a href="https://www.npmjs.com/package/@ashutosh0x/jarvis"><img src="https://img.shields.io/npm/dm/@ashutosh0x/jarvis?style=flat-square&color=CB3837&logo=npm&logoColor=white" alt="npm downloads" /></a>
+  <img src="https://img.shields.io/badge/node-%E2%89%A522-339933?style=flat-square&logo=node.js&logoColor=white" alt="Node 22+" />
+  <img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License" />
+</p>
+
+## Install
+
+```bash
+npm install -g @ashutosh0x/jarvis
+jarvis
+```
+
+Or without installing anything permanently:
+
+```bash
+npx @ashutosh0x/jarvis
+```
+
+**No API key is required to start.** Web search works out of the box. Every key
+you add unlocks a feature, and the app degrades honestly without one rather than
+erroring — run `jarvis doctor` to see exactly what is and is not available on
+your machine:
+
+```
+  Jarvis 0.1.0
+
+  Runtime
+    ✓ Node                   v22.14.0
+    ✓ Platform               win32 x64
+    ✓ Electron               installed
+    ✓ Interface built
+
+  Optional services
+    · GEMINI_API_KEY         unset — conversational answers disabled
+    ✓ Ollama                 http://127.0.0.1:11434
+    · SearXNG                unset — using public search providers
+```
+
+Everything marked `·` is optional.
+
+> The package bundles Electron, so the first install downloads a platform
+> binary (~100 MB). That is the price of `npm i -g` producing a working app
+> instead of a list of instructions. Prefer a native installer? See
+> [releases](https://github.com/Ashutosh0x/jarvis/releases) for signed `.exe`,
+> `.dmg`, `.AppImage`, `.deb` and `.rpm` builds, each with a SHA-256 checksum.
+
+### Use the search engine as a library
+
+The search engine has **no Electron dependency and no DOM** — it is plain Node,
+independently tested, and installable on its own terms:
+
+```js
+import { search } from '@ashutosh0x/jarvis';
+
+const { results, answer, providers } = await search('rust async runtime comparison');
+console.log(answer);      // extracted answer, or null
+console.log(providers);   // ['crates', 'github', 'hn', …]
+```
+
+<details>
+<summary><b>Individual exports</b></summary>
+
+```js
+import {
+  rrfFuse,          // Reciprocal Rank Fusion, k=60
+  bm25Search,       // BM25, k1=1.2 b=0.75
+  editDistance,     // Damerau-Levenshtein
+  isTimeSensitive,  // does this answer change by the hour?
+  gatherAll,        // parallel provider fan-out, returns on quorum
+  SearchCache,
+  hedgedRace,       // race N RPC endpoints, take the first good one
+} from '@ashutosh0x/jarvis';
+
+import { stats, rollup } from '@ashutosh0x/jarvis/metrics';
+```
+
+**Search** — `search`, `buildProviders`, `detectIntents`, `isTimeSensitive`,
+`gatherAll`, `rrfFuse`, `bm25Search`, `rankResults`, `dedupeResults`,
+`extractAnswer`, `verifyAnswer`, `providerWeights`, `editDistance`,
+`shouldApplyCorrection`, `htmlToText`, `SearchCache`
+
+**Metrics** — `stats`, `windowed`, `rollup`, `rollupByDay`, `pruneRaw`, `makeSample`
+
+**Networking** — `hedgedRace`, `createStickyOrder`, `backoffDelay`,
+`createDedup`, `createBlockTracker`, `prioritizeAlerts`
+
+**Market analytics** — `dailyReturns`, `correlation`, `beta`, `peerIndex`,
+`realizedVol`, `trailingReturn`, `drawdown`, `PEER_GROUPS`
+
+</details>
+
+The full architecture, feature reference and configuration guide follow below.
+
+---
 
 JARVIS is a desktop assistant whose intelligence runs entirely on your own
 machine. Speech recognition, language understanding, retrieval, and vision all
@@ -49,6 +145,7 @@ extends the same interface and control surface to a paired phone over Wi-Fi.
 
 ## Contents
 
+- [Install](#install)
 - [What makes this different](#what-makes-this-different)
 - [Architecture](#architecture)
 - [Feature reference](#feature-reference)

@@ -1,7 +1,7 @@
 {
-  "name": "jarvis",
-  "version": "1.0.0",
-  "description": "JARVIS - Advanced Audio Visualizer and AI Assistant",
+  "name": "@ashutosh0x/jarvis",
+  "version": "0.1.0",
+  "description": "A local-first desktop AI assistant: federated live web search with no API key, on-device vision and OCR, neural TTS, and a self-healing supervisor. Ships as an Electron app and an importable search library.",
   "main": "electron.js",
   "scripts": {
     "test": "node scripts/run-tests.mjs",
@@ -22,20 +22,41 @@
     "smoke": "node scripts/smoke-test.mjs",
     "release": "npm run build && electron-builder --publish always",
     "favicons": "node scripts/make-favicons.mjs",
-    "icons": "npm run icon && npm run favicons"
+    "icons": "npm run icon && npm run favicons",
+    "prepack": "npm run build",
+    "jarvis": "node bin/jarvis.mjs"
   },
-  "keywords": [],
+  "keywords": [
+    "ai",
+    "assistant",
+    "electron",
+    "desktop",
+    "voice-assistant",
+    "web-search",
+    "search-engine",
+    "rrf",
+    "bm25",
+    "gemini",
+    "ollama",
+    "local-first",
+    "tts",
+    "ocr",
+    "rag",
+    "offline-first",
+    "jarvis"
+  ],
   "author": {
     "name": "Ashutosh Kumar Singh",
     "email": "ashutoshkumarsingh0x@gmail.com"
   },
-  "license": "ISC",
+  "license": "MIT",
   "dependencies": {
     "@google/genai": "^1.34.0",
     "axios": "^1.6.0",
     "bonjour-service": "^1.4.3",
     "chokidar": "^5.0.0",
     "dat.gui": "^0.7.9",
+    "electron": "^39.2.4",
     "electron-updater": "^6.6.2",
     "pdf-to-img": "^6.2.0",
     "qrcode": "^1.5.4",
@@ -45,7 +66,6 @@
   "devDependencies": {
     "@electron/notarize": "^2.5.0",
     "@parcel/config-default": "^2.4.0",
-    "electron": "^39.2.4",
     "electron-builder": "^26.0.12",
     "parcel": "^2.7.0",
     "parcel-reporter-static-files-copy": "^1.3.4",
@@ -59,8 +79,51 @@
     "type": "git",
     "url": "git+https://github.com/Ashutosh0x/jarvis.git"
   },
-  "homepage": "https://github.com/Ashutosh0x/jarvis",
+  "homepage": "https://github.com/Ashutosh0x/jarvis#readme",
   "bugs": {
     "url": "https://github.com/Ashutosh0x/jarvis/issues"
-  }
+  },
+  "type": "commonjs",
+  "bin": {
+    "jarvis": "bin/jarvis.mjs"
+  },
+  "exports": {
+    ".": {
+      "import": "./lib/index.mjs",
+      "require": "./webSearch.js"
+    },
+    "./search": "./webSearch.js",
+    "./metrics": "./metricStore.js",
+    "./package.json": "./package.json"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "bin/",
+    "lib/",
+    "dist/",
+    "src/",
+    "server/",
+    "companion/",
+    "build/icon.png",
+    "electron.js",
+    "preload.js",
+    "webSearch.js",
+    "metricStore.js",
+    "rpcHedge.js",
+    "sectorMove.js",
+    "visionRouter.js",
+    "streamGuard.js",
+    "edgarGuard.js",
+    "chainProviders.js",
+    "chainWatch.js",
+    "companionBridge.js",
+    "adbService.js",
+    "vite.config.js",
+    ".env.example",
+    "README.md",
+    "LICENSE",
+    "!dist/*.mp3"
+  ]
 }
