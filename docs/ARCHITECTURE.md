@@ -1,770 +1,332 @@
-# JARVIS Architecture
+# Architecture diagrams
 
-Internal reference for the desktop assistant, its local service mesh, the
-retrieval engine, and the Android companion protocol.
+Extracted from the README because npmjs.com does not render mermaid —
+on the package page these appeared as raw code. GitHub renders them here.
 
-Audience: someone modifying the system. For installation and usage, see the
-[README](../README.md).
+## 1. System overview
 
----
+```mermaid
+flowchart TB
+    MIC(["Microphone"]):::io
+    SPK(["Speech out plus visualizer"]):::io
 
-## Contents
+    subgraph REN["Renderer process - DOM and WebGL, no Node APIs"]
+        direction TB
+        VOICE["voiceService.js<br/>VAD, mic selection, echo guard"]:::renderer
+        ROUTER{"jarvis.js<br/>intent router"}:::router
+        REGEX["Regex intents<br/>apps, wifi, volume, files"]:::renderer
+        PHONE["phoneTools.js<br/>NL to structured intent"]:::renderer
+        LLM["toolService.js<br/>chat, vision, JSON routing"]:::renderer
+        RAG["ragService.js<br/>hybrid retrieval"]:::renderer
+        VIZ["scripts.js<br/>Three.js scene"]:::renderer
+    end
 
-- [Process model](#process-model)
-- [Service lifecycle](#service-lifecycle)
-- [IPC surface](#ipc-surface)
-- [Voice pipeline](#voice-pipeline)
-- [Intent routing](#intent-routing)
-- [Web search](#web-search)
-- [Retrieval engine](#retrieval-engine)
-- [Companion protocol](#companion-protocol)
-- [Security model](#security-model)
-- [Performance characteristics](#performance-characteristics)
-- [Extending the system](#extending-the-system)
+    subgraph MAIN["Electron main - electron.js, Node APIs, no DOM"]
+        direction TB
+        SUP["Service supervisor"]:::main
+        IPC["IPC handlers<br/>preload.js bridge"]:::main
+        BRIDGE["companionBridge.js<br/>WS server plus mDNS"]:::main
+        ADB["adbService.js<br/>tier 3 control"]:::main
+    end
 
----
+    subgraph LOCAL["Local services - loopback only"]
+        direction TB
+        STT["faster-whisper<br/>port 8770"]:::ai
+        OLLAMA["Ollama<br/>port 11434"]:::ai
+        GEMMA["Gemma 3<br/>chat and vision"]:::ai
+        EMBED["nomic-embed-text<br/>embeddings"]:::ai
+        OCR["Unlimited-OCR<br/>port 10000, optional"]:::ai
+    end
 
-## Process model
+    subgraph PHONEDEV["Android companion - over Wi-Fi"]
+        direction TB
+        LINK["LinkService<br/>WebSocket client"]:::android
+        EXEC["DeviceCommandExecutor<br/>tier 1 and 2"]:::android
+        A11Y["AccessibilityService<br/>UI automation"]:::android
+        AVIZ["WebView<br/>copied visualizer"]:::android
+    end
 
-Three cooperating processes plus supervised children.
+    WEB(["DuckDuckGo HTML<br/>only outbound traffic"]):::external
+    DISK[("Local disk<br/>rag-store, vault, settings")]:::store
 
-```
-+-----------------------------------------------------------+
-|  Electron main            electron.js                      |
-|                                                            |
-|  Owns: OS integration, service supervision, LAN listeners  |
-|  Node.js APIs available. No DOM.                           |
-+-----------------------------------------------------------+
-        |  contextBridge, preload.js
-        |  contextIsolation: true
-        v
-+-----------------------------------------------------------+
-|  Renderer                 src/js/*                         |
-|                                                            |
-|  Owns: visualizer, voice loop, retrieval, intent routing   |
-|  DOM and WebGL available. No Node.js APIs.                 |
-+-----------------------------------------------------------+
+    MIC --> VOICE
+    VOICE -->|"PCM16 16kHz"| STT
+    STT -->|transcript| ROUTER
 
-Supervised children:
-  ollama serve            spawned only if 11434 is idle
-  uv run stt-server.py    faster-whisper, port 8770
-```
+    ROUTER --> REGEX
+    ROUTER --> PHONE
+    ROUTER --> LLM
 
-### Why this split
+    LLM --> RAG
+    RAG <-->|"dense vectors"| EMBED
+    RAG -->|"context block"| LLM
+    LLM -->|"streaming tokens"| GEMMA
+    GEMMA --> SPK
+    EMBED -.-> OLLAMA
+    GEMMA -.-> OLLAMA
 
-The renderer owns retrieval rather than the main process. Retrieval is
-latency-coupled to the conversation loop, and crossing the IPC boundary per
-query would add serialisation cost to a path already measured in milliseconds.
-The tradeoff is that BM25 scoring runs on the render thread, which is why the
-inverted index matters: the previous implementation blocked the visualizer for
-104.8ms per query at 5,000 chunks.
+    REGEX --> IPC
+    PHONE --> IPC
+    RAG <-->|"persist"| IPC
+    IPC --> DISK
+    IPC --> ADB
+    IPC --> BRIDGE
+    IPC -->|"web search"| WEB
 
-Persistence still crosses IPC, because the renderer has no filesystem access.
-Writes are debounced by 2 seconds.
+    SUP -.->|"spawn and respawn"| STT
+    SUP -.->|"spawn or reuse"| OLLAMA
+    SUP -.-> OCR
 
----
+    BRIDGE <-->|"ws 8766, token"| LINK
+    LINK --> EXEC
+    EXEC --> A11Y
+    LINK --> AVIZ
+    ADB -.->|"tier 3, optional"| PHONEDEV
 
-## Service lifecycle
+    VOICE --> VIZ
+    VIZ --> SPK
 
-### Ollama supervision
+    classDef io fill:#1f2933,stroke:#7b8794,stroke-width:2px,color:#ffffff
+    classDef renderer fill:#5b21b6,stroke:#a78bfa,stroke-width:2px,color:#ffffff
+    classDef router fill:#7c2d12,stroke:#fb923c,stroke-width:3px,color:#ffffff
+    classDef main fill:#164e63,stroke:#22d3ee,stroke-width:2px,color:#ffffff
+    classDef ai fill:#065f46,stroke:#34d399,stroke-width:2px,color:#ffffff
+    classDef android fill:#14532d,stroke:#4ade80,stroke-width:2px,color:#ffffff
+    classDef external fill:#7f1d1d,stroke:#f87171,stroke-width:2px,color:#ffffff
+    classDef store fill:#422006,stroke:#d97706,stroke-width:2px,color:#ffffff
 
-```
-app.whenReady()
-    |
-    v
-startOllamaServer()
-    |
-    +-- GET /api/tags, 1.5s timeout
-    |       |
-    |       +-- 200 --> reuse. Do not spawn. Do not kill on quit.
-    |       |
-    |       +-- fail --> spawn `ollama serve`
-    |                        |
-    |                        v
-    |                   poll /api/tags every 1s, up to 30 attempts
-    |                        |
-    |                        v
-    |                   preloadLocalModel()
-    |                   POST /api/generate {keep_alive: "60m"}
-    |
-    +-- on exit, and not quitting --> respawn after 15s
-```
-
-Two invariants:
-
-1. **Only kill what you spawned.** `ollamaProcess` is non-null only when this
-   process created the server. An Ollama the user started stays running.
-2. **Preload is not optional.** Ollama's default `keep_alive` is 5 minutes.
-   Without the 60-minute preload, the first question after any idle period pays
-   a multi-second cold load, which reads as a broken assistant.
-
-### STT supervision
-
-The server must be invoked as:
-
-```
-uv run --python 3.12 --with faster-whisper --with websockets python -I server/stt-server.py
+    style REN fill:#2e1065,stroke:#8b5cf6,stroke-width:2px,color:#ffffff
+    style MAIN fill:#083344,stroke:#06b6d4,stroke-width:2px,color:#ffffff
+    style LOCAL fill:#022c22,stroke:#10b981,stroke-width:2px,color:#ffffff
+    style PHONEDEV fill:#052e16,stroke:#22c55e,stroke-width:2px,color:#ffffff
 ```
 
-The `-I` flag is load-bearing. Without isolated mode, user site-packages enter
-`sys.path` and numpy, ctranslate2, or onnxruntime crash with `0xC0000005`.
+## 2. Voice pipeline
 
-Port conflicts exit with code 1 and land in the same respawn path. The retry is
-harmless because the second instance exits immediately while another holds 8770.
+```mermaid
+flowchart LR
+    A(["Microphone"]):::io --> B["_pickMicDevice<br/>excludes loopback<br/>ranks headset, internal"]:::step
+    B --> C["AudioContext graph<br/>highpass 80Hz<br/>compressor"]:::step
+    C --> D["Analyser<br/>FFT bands"]:::viz
+    C --> E["capture-processor<br/>PCM16 16kHz"]:::step
+    D -->|"bass, mid, treble"| F["Three.js orb<br/>vertex displacement"]:::viz
 
-**Known gap:** `before-quit` does not fire on force-kill, so the Python child is
-orphaned and keeps 8770. The next launch then crash-loops every 15 seconds until
-the orphan is stopped.
+    E --> G{"Adaptive VAD<br/>3x noise floor"}:::gate
+    G -->|"below threshold"| H["Discard"]:::drop
+    G -->|"speech detected"| I["Buffer<br/>320ms preroll<br/>1.44s hangover"]:::step
+    I --> J["faster-whisper<br/>ws 8770"]:::ai
+    J --> K{"Echo guard<br/>60 percent overlap<br/>with spoken text"}:::gate
+    K -->|"self-talk"| L["Drop, show ECHO IGNORED"]:::drop
+    K -->|"user speech"| M["processCommand"]:::router
+    M --> N["Streaming TTS<br/>speak per sentence"]:::step
+    N -.->|"sets ttsActive<br/>gates mic"| G
+    N -.->|"_rememberSpoken"| K
 
----
-
-## IPC surface
-
-All renderer-to-main communication passes through `preload.js` under
-`contextIsolation`. The renderer never receives Node.js primitives.
-
-### Channel categories
-
-| Category | Channels | Notes |
-| --- | --- | --- |
-| System | `open-app`, `system-command`, `get-os-info`, `get-system-telemetry` | Allowlisted |
-| Capture | `capture-screen`, `perform-ocr`, `check-ocr-server` | |
-| Memory | `rag-load`, `rag-save`, `log-trajectory` | Debounced writes |
-| Phone bridge | `get-phone-bridge-info`, `phone-notification` | |
-| Companion | `companion-open-pairing`, `companion-close-pairing`, `companion-devices`, `companion-command` | |
-| ADB | `adb-command` | Curated methods only |
-| Vault | `secure-cred-set`, `secure-cred-list`, `secure-cred-delete` | No read channel exists |
-| Network | `wifi-scan`, `wifi-connect`, `wifi-disconnect`, `wifi-info`, `web-search` | |
-| Finance | `watchlist-get`, `watchlist-add`, `watchlist-remove`, `get-quote`, `get-history`, `get-sector-move`, `get-portfolio-series` | Read-only. No order-placement channel exists |
-| SEC | `sec-company-feed`, `sec-document`, `sec-tickers`, `edgar-search` | Host, port, path and credentials pinned in `edgarGuard.js` |
-
-### Listener hygiene
-
-Event channels use `createSafeListener`, which returns a disposer:
-
-```js
-const createSafeListener = (channel) => (callback) => {
-    const handler = (event, ...args) => callback(event, ...args);
-    ipcRenderer.on(channel, handler);
-    return () => ipcRenderer.removeListener(channel, handler);
-};
+    classDef io fill:#1f2933,stroke:#7b8794,stroke-width:2px,color:#ffffff
+    classDef step fill:#5b21b6,stroke:#a78bfa,stroke-width:2px,color:#ffffff
+    classDef gate fill:#7c2d12,stroke:#fb923c,stroke-width:3px,color:#ffffff
+    classDef ai fill:#065f46,stroke:#34d399,stroke-width:2px,color:#ffffff
+    classDef viz fill:#0c4a6e,stroke:#38bdf8,stroke-width:2px,color:#ffffff
+    classDef drop fill:#450a0a,stroke:#ef4444,stroke-width:2px,color:#ffffff
+    classDef router fill:#134e4a,stroke:#2dd4bf,stroke-width:2px,color:#ffffff
 ```
 
-Without the disposer, repeated subscription leaks handlers across reloads.
+## 3. Process supervision
 
-### Deliberate omissions
+```mermaid
+stateDiagram-v2
+    [*] --> Probe: app.whenReady
 
-- **No credential read channel.** The vault exposes set, list, and delete. Raw
-  values cannot cross into the renderer, so they cannot reach the model or
-  conversation memory.
-- **No raw ADB passthrough.** `adb-command` rejects the `adb` and `shell`
-  methods explicitly. Only curated wrappers are reachable.
+    state "Probe port 11434" as Probe
+    state "Reuse existing instance" as Reuse
+    state "Spawn ollama serve" as Spawn
+    state "Poll readiness, 30x1s" as Poll
+    state "Preload model" as Preload
+    state "Serving" as Serving
+    state "Wait 15s" as Wait
+    state "Degraded, BM25 only" as Degraded
 
----
+    Probe --> Reuse: 200 within 1.5s
+    Probe --> Spawn: no response
 
-## Voice pipeline
+    Reuse --> Preload: never killed on quit
+    Spawn --> Poll
+    Poll --> Preload: ready
+    Poll --> Degraded: all attempts fail
 
-```
-getUserMedia
-    |
-    v
-_pickMicDevice()
-    excludes: stereo mix, loopback, vb-audio, voicemeeter
-    ranks:    micPreference -> headset -> internal -> first real
-    |
-    v
-AudioContext graph
-    source -> highpass 80Hz -> compressor -> analyser -> worklet
-    |
-    +--> analyser  --> window.jarvisFrequencyData  (visualizer)
-    |
-    v
-capture-processor.js   PCM16 at 16kHz
-    |
-    v
-adaptive noise-floor VAD
-    threshold: 3x floor
-    preroll:   320ms
-    hangover:  1.44s
-    cap:       30s
-    gate:      suppressed while ttsActive
-    |
-    v
-ws://127.0.0.1:8770   binary frames, then {"type":"end"}
-    |
-    v
-faster-whisper base int8
-    |
-    v
-{"type":"final", "text": "...", "ms": 919}
+    Preload --> Serving: keep_alive 60m
+
+    Serving --> Wait: process exit
+    Wait --> Spawn: still running
+    Wait --> [*]: app quitting
+    Serving --> [*]: quit, kill only if spawned
+    Degraded --> [*]
+
+    classDef probe fill:#374151,stroke:#9ca3af,stroke-width:2px,color:#ffffff
+    classDef good fill:#065f46,stroke:#34d399,stroke-width:2px,color:#ffffff
+    classDef work fill:#1e3a8a,stroke:#60a5fa,stroke-width:2px,color:#ffffff
+    classDef warn fill:#7c2d12,stroke:#fb923c,stroke-width:2px,color:#ffffff
+    classDef bad fill:#7f1d1d,stroke:#f87171,stroke-width:2px,color:#ffffff
+
+    class Probe probe
+    class Reuse,Serving good
+    class Spawn,Poll,Preload work
+    class Wait warn
+    class Degraded bad
 ```
 
-### Two failure modes worth understanding
+## 4. Real-time whale stream
 
-**The TTS gate must not use `synthesis.speaking`.** Chromium can leave that flag
-stuck true indefinitely, which permanently deafens the microphone. An explicit
-`ttsActive` flag is used instead, cleared on `onend`, on `onerror`, and by a
-word-count-derived safety timeout.
-
-**The gate alone is insufficient.** SAPI audio bypasses Chromium's echo
-cancellation, and the tail of an utterance can land after the flag clears.
-Conversation logs contained JARVIS's own sentences appearing as user turns. The
-text-level echo guard is the actual defence:
-
-```
-_rememberSpoken(text)   store word set, 20s window
-_isEchoOfSelf(cmd)      drop if >= 60% overlap with anything recent
-```
-
-Transcripts under three content words are exempt, since short utterances
-overlap by chance.
-
----
-
-## Intent routing
-
-`jarvis.js` `detectIntent()` matches in a deliberate order. Order is behaviour.
-
-```
- 1. Phone-targeted        targetsPhone() && routePhoneCommand()
- 2. Companion status      /(phone|mobile|companion)/ && /(status|online|why)/
- 3. Companion pairing     "connect to my mobile"
- 4. System control        open app, shutdown, volume, brightness
- 5. Wi-Fi                 scan, connect, info
- 6. Memory                remember, recall
- 7. Screen                read screen, what is on my display
- 8. Calendar              reminders, schedule
- 9. Portfolio risk        parsePortfolioQuery()  -- a BOOK, not a security
-10. Watchlist             add / remove / show
-11. On-chain              parseOnchainQuery()
-12. Peer decomposition    parseSectorQuery()     -- sector vs own move
-13. Single-security quant parseQuantQuery()
-14. Price                 parsePriceQuery()
-15. News                  parseNewsQuery()       -- RSS, 542-1188ms
-16. Web search            parseWebSearchQuery()  -- live internet
-17. Fallthrough           handleLocalAICommand()
+```mermaid
+flowchart LR
+    WS(["newHeads over wss"]) --> BLK["eth_getBlockByNumber"]
+    WS --> LOGS["eth_getLogs<br/>Transfer topic, verified tokens"]
+    BLK --> NAT["scanBlockTxs<br/>native transfers >= 100 ETH"]
+    LOGS --> TOK["scanTokenLogs<br/>token transfers >= $1M"]
+    LOGS --> ISS["scanIssuanceLogs<br/>mints and burns"]
+    TOK --> AGG["aggregateTokenWhales<br/>one transaction = one movement"]
+    NAT --> RANK["prioritizeAlerts<br/>ranked by measured USD"]
+    AGG --> RANK
+    RANK --> SAY["Announce top 2, summarise the rest"]
+    ISS --> SAY
 ```
 
-### The ordering bug that proves the rule
+## 5. Pipeline
 
-"Order is behaviour" is not an abstraction. `inputControl.parseInputCommand()`
-runs at step 4, and it used to claim `search X`, `google X` and `look up X`,
-converting them to `TYPE_TEXT` — *type this into whatever window has focus, then
-press Enter*. Web search sits at step 16. It was therefore **unreachable**:
-every "search ..." in the interaction log was typed somewhere instead of
-answered, and Jarvis behaved as a keyboard macro.
+```mermaid
+flowchart TB
+    Q(["Question"]):::io --> INT["detectIntents<br/>code / academic / security /<br/>discuss / book / news / general"]:::prep
+    INT --> CACHE{{"SearchCache<br/>3 min TTL"}}:::fuse
+    CACHE -->|hit| OUT
+    CACHE -->|miss| PLAN["buildProviders<br/>intent-gated"]:::prep
 
-Only `type` and `dictate` produce keystrokes now. `type search foo` still
-dictates, so explicit dictation is unaffected.
+    PLAN --> GEN["duckduckgo-instant<br/>wikipedia<br/>google-news"]:::sparse
+    PLAN --> SPEC["github / npm / crates<br/>arxiv / nvd / stackoverflow<br/>hackernews / openlibrary"]:::dense
+    PLAN --> LOCAL["local index<br/>BM25 over crawled feeds"]:::prf
 
-The same failure recurred one step later in the opposite direction. Web search
-at 16 runs *before* `SEARCH_FILE`, so `search my files` was answered by
-Wikipedia. The guard against that (`my files|notes|system|history|...`) had
-lived inside the `inputControl` branch and was lost when the branch was removed;
-it now lives in `parseWebSearchQuery` where the interception happens.
+    GEN --> GATHER["gatherAll<br/>2s budget, minProviders 3"]:::fuse
+    SPEC --> GATHER
+    LOCAL --> RRF
+    GATHER --> RRF{{"rrfFuse<br/>k = 60, provider weights"}}:::fuse
 
-Both were found by running the real router over a table of phrases rather than
-by reading it. `routing.test.mjs` pins the outcomes, including five phrasings of
-`search my *` asserting they never reach the web.
+    RRF --> ANS["extractAnswer<br/>+ verifyAnswer"]:::prep
+    ANS --> OUT(["Spoken answer + sources"]):::io
 
-Phone routing is checked first because "open chrome on my phone" must not match
-the desktop application launcher. The suffix carries the target, so a matcher
-that runs earlier and ignores it will silently do the wrong thing.
+    CORR["suggestCorrection<br/>runs concurrently"]:::prf -.->|"only if < 3 results"| RRF
 
-The finance block, 9 to 14, is ordered by how specific the question is, and
-every step of that ordering was forced by a real misroute:
-
-- **Portfolio before watchlist.** "How risky is my watchlist" contains the word
-  *watchlist*, so the watchlist block claimed it and answered with a list of
-  prices. The portfolio parser requires a risk word and rejects add/remove
-  wording, so "what's on my watchlist" and "add micron to my watchlist" still
-  fall through to it.
-- **On-chain before price.** "What are the odds bitcoin hits 200k" is a
-  prediction-market question, not a spot price. A parser that reads the ticker
-  first answers a different question with a confident number.
-- **Sector before quant.** "Decompose Micron's move" carries no metric word, so
-  the single-security parser took it as a plain risk summary and answered an
-  absolute move to a relative question.
-
-Each parser is anchored so a verb appearing mid-sentence cannot capture the rest
-of the line as a ticker — the log entry that forced this shows *"investigate
-what might be his future plans next move analyze and tell me"* becoming a quant
-query for the ticker "and tell me". Every phrase in the published command
-reference is now an assertion in `routing.test.mjs` (145 checks), so the
-documentation cannot drift from the parser without the suite failing.
-
-### The local model path
-
-```
-handleLocalAICommand(query)
-    |
-    +-- checkOllama()  --> unavailable? say so plainly, stop
-    |
-    +-- imperative prefix? --> routeLocalAction()  JSON mode, temp 0
-    |       open_app | open_website | web_search | remember | recall | none
-    |
-    +-- ragService.recall(query, {rerank: !voice})
-    |
-    +-- system telemetry, if query mentions this machine
-    |
-    +-- web search, if query is search-shaped
-    |
-    v
-build messages:
-    system prompt + sysContext + memoryContext + webContext
-    + last 10 turns, trailing user turn removed
-    + current query
-    |
-    v
-generateContentLocal()  streaming
-    |
-    +-- per chunk: display, then speak each completed sentence
+    classDef io fill:#1f2937,stroke:#111827,color:#f9fafb
+    classDef prep fill:#eef2ff,stroke:#4338ca,color:#1e1b4b
+    classDef sparse fill:#ecfdf5,stroke:#047857,color:#064e3b
+    classDef dense fill:#fef3c7,stroke:#b45309,color:#451a03
+    classDef prf fill:#fae8ff,stroke:#a21caf,color:#4a044e
+    classDef fuse fill:#e0f2fe,stroke:#0369a1,color:#082f49
 ```
 
-### Three prompt-level corrections
+## 6. Retrieval engine
 
-Each came from reading actual conversation history, not from theory.
+```mermaid
+flowchart TB
+    Q(["Query"]):::io --> TOK["tokenize<br/>stopwords, min length 2"]:::prep
 
-**The user message was sent twice.** `processAICommand` pushes the turn into
-memory, then the messages array spread history *and* appended `query`. Gemma
-described its input accurately: "the duplicate search query", "I have executed
-the repeated command to close Chrome twice". Fixed by popping the trailing user
-turn from history, keeping the append, because `query` may have been rewritten
-by action routing.
+    TOK --> BM25["BM25<br/>inverted index<br/>k1 1.5, b 0.75"]:::sparse
+    TOK --> DENSE["Dense<br/>nomic-embed-text<br/>cosine, cutoff 0.3"]:::dense
+    BM25 -->|"top 4 chunks"| PRFX["PRF<br/>top 6 non-query terms"]:::prf
+    PRFX --> PRF2["BM25 second pass"]:::sparse
 
-**A literal `[n]` leaked into speech.** The web-search instruction contained the
-token `[n]`, which the model copied into answers. Text-to-speech read it aloud as
-"and one and two", the microphone transcribed it, and it re-entered as a user
-turn. Fixed in the prompt and stripped in both speech paths. `speak()` and
-`_speakQueued()` had drifted apart; the streaming path, which is the one Gemma
-actually uses, lacked the filter.
+    BM25 -->|"weight 1.0"| RRF{{"Reciprocal Rank Fusion<br/>k equals 60<br/>tie-break on chunk index"}}:::fuse
+    DENSE -->|"weight 1.0"| RRF
+    PRF2 -->|"weight 0.5"| RRF
 
-**The model narrated actions it never took.** "Executing commands, Sir. Tab
-opened, rows closed." It receives no execution feedback, so it pattern-matched an
-obedient reply. The system prompt now states it cannot act and must never claim
-it did.
+    RRF --> TOP["Top 5 passages"]:::result
 
----
+    TOP --> GATE{"Ambiguity gate<br/>top1 minus top2<br/>over top1 under 0.15"}:::gate
+    GATE -->|"clear winner<br/>about 50 percent<br/>90ms"| SENT
+    GATE -->|"ambiguous<br/>and rerank opt-in<br/>4800ms"| RERANK["LLM rerank<br/>Gemma 3, JSON, temp 0"]:::ai
+    RERANK -->|"timeout or bad JSON"| SENT
+    RERANK -->|"reordered"| SENT
 
-## Web search
+    SENT["Late sentence selection<br/>IDF-weighted overlap<br/>lead bias, budget 10"]:::select
+    SENT --> ENT["Entity context<br/>Levenshtein 0.25<br/>relation-grouped"]:::select
+    ENT --> CTX(["Context block<br/>best result first"]):::io
 
-### The process split
+    Q -.->|"exact miss"| ENT
 
-`webSearch.js` is CommonJS in the main process; `src/js/services/webSearchIntent.js`
-is an ES module in the renderer. The split is by **process**, not topic, and it
-is forced twice over: the renderer cannot fetch these origins because CORS
-blocks it, and Rollup cannot take named imports from a CommonJS file. Main
-fetches, parses, ranks and fuses; the renderer routes and speaks.
-
-### Gather, not race
-
-`hedgedRace` (used for RPC endpoints) resolves on first success, which is right
-when endpoints are interchangeable. Search providers are complementary — a Rust
-question wants crates.io *and* GitHub *and* Stack Overflow — so `gatherAll`
-keeps everything that lands inside a 2 s budget.
-
-Its early exit counts **providers, not results**. Counting results was
-implemented first and degenerated the feature into a race: Google News alone
-returns six, satisfying a result quota before any other provider replied.
-Measured as `answered 1: google-news` on every query. `webSearch.test.mjs`
-pins this with *"one prolific provider cannot end the gather alone"*.
-
-### Fusion
-
-`rrfFuse` scores by rank position only, `k = 60`. Raw scores across GitHub
-stars, Stack Overflow votes and news recency are not comparable and normalising
-them is where hand-tuned weighting goes wrong.
-
-Provider weights are derived per query, because plain RRF lets an off-target
-index's rank-1 beat a relevant index's rank-2 — measured: npm's
-`uniffi-bindgen-react-native` took first place for *"best rust crate for async
-runtime"*.
-
-### Answers are extractive and verified
-
-`htmlToText` is the `w3m -dump` idea written natively. Order matters: script,
-style, nav and footer **bodies** are removed first, while their delimiters still
-exist. Stripping tags before that leaves raw JavaScript in the output.
-
-`extractAnswer` scores sentences rather than taking the first paragraph, since
-the opening text of a modern page is usually a cookie notice. `verifyAnswer`
-then checks the claim against the text it came from before it is spoken.
-
-Nothing is passed to a model to summarise. A model summarising retrieved results
-is precisely how the fabricated CVE numbers entered the interaction log.
-
-### Guards worth knowing about
-
-- `MAX_PAGE_BYTES` caps input at 1 MB. Every regex is linear in input size; a
-  642 KB Wikipedia article parses in 183 ms.
-- Whitespace collapsing avoids `/ *\n *(?:\n *)+/` — a quantifier inside a
-  quantified group, the shape that backtracks catastrophically. The flat
-  two-pass replacement handles 137 KB of pathological whitespace in 15 ms.
-- The `web-search` IPC channel accepts a bare query **string** as well as
-  `{ query, limit }`. Two renderer call sites use different shapes, and reading
-  only `opts.query` turned every string call into `empty query` — a silently
-  broken feature that still reported success.
-
-### Background work
-
-Indexing search results into RAG is a side effect of answering, never part of
-it. It was six sequential awaited `ragService.ingest()` calls, each an embedding
-round trip, running after the answer had already been spoken: `firstWord` at
-1930 ms with a turn that stayed open for 32 185 ms, holding the microphone gate
-and blocking the follow-up question that indexing exists to support. It is now
-one batched, non-awaited call.
-
----
-
-## Retrieval engine
-
-### Storage model
-
-```js
-chunk = {
-    id:     "<base36 time>-<hash>",
-    text:   "...",          // <= 800 chars, paragraph aligned
-    hash:   "<djb2>",       // dedup key
-    source: "<origin>",
-    ts:     1721000000000,
-    vector: [768] | null    // null until an embedder is reachable
-}
+    classDef io fill:#1f2933,stroke:#7b8794,stroke-width:2px,color:#ffffff
+    classDef prep fill:#374151,stroke:#9ca3af,stroke-width:2px,color:#ffffff
+    classDef sparse fill:#1e3a8a,stroke:#60a5fa,stroke-width:2px,color:#ffffff
+    classDef dense fill:#065f46,stroke:#34d399,stroke-width:2px,color:#ffffff
+    classDef prf fill:#0c4a6e,stroke:#38bdf8,stroke-width:2px,color:#ffffff
+    classDef fuse fill:#5b21b6,stroke:#a78bfa,stroke-width:3px,color:#ffffff
+    classDef result fill:#3f3f46,stroke:#a1a1aa,stroke-width:2px,color:#ffffff
+    classDef gate fill:#7c2d12,stroke:#fb923c,stroke-width:3px,color:#ffffff
+    classDef ai fill:#831843,stroke:#f472b6,stroke-width:2px,color:#ffffff
+    classDef select fill:#134e4a,stroke:#2dd4bf,stroke-width:2px,color:#ffffff
 ```
 
-Chunks are append-only. Array index is therefore a stable document id, which is
-what allows the inverted index to store integer postings.
+## 7. Pairing
 
-### Index structure
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as User
+    participant D as Desktop<br/>electron.js
+    participant B as Bridge<br/>port 8765
+    participant P as Phone<br/>LinkService
+    participant W as WebSocket<br/>port 8766
 
-```js
-_index:    Map<term, {df: number, postings: Map<chunkIdx, tf>}>
-_docLen:   Array<number>
-_totalLen: number
+    rect rgb(46, 16, 101)
+    Note over U,D: Onboarding, once per device
+    U->>D: "Jarvis, connect to my mobile"
+    D->>B: openPairingWindow, 5 minutes
+    D-->>U: QR code on HUD
+    U->>P: scan with camera
+    P->>B: GET /install
+    B-->>P: landing page
+    P->>B: GET /apk
+    B-->>P: app-debug.apk
+    U->>P: tap Install, then open
+    end
+
+    rect rgb(2, 44, 34)
+    Note over P,W: Discovery and pairing, automatic
+    P->>P: NSD discover _jarvis._tcp
+    B-->>P: resolved, filtered addresses
+    Note right of P: drops 169.254.x<br/>and 192.168.56.x
+    P->>B: POST /pair
+    alt window still open
+        B-->>P: 200 token plus wsPort
+    else window closed
+        B-->>P: 403 pairing window is closed
+        Note right of P: retry every 10s
+    end
+    end
+
+    rect rgb(8, 51, 68)
+    Note over P,W: Persistent link
+    P->>W: connect, X-Jarvis-Token
+    W->>W: timingSafeEqual
+    alt token valid
+        W-->>P: accepted
+        P->>W: hello plus capabilities
+        W-->>D: companion-devices event
+        D-->>U: "Linked: Xiaomi M2101K6P"
+    else token invalid
+        W-->>P: close 4001
+    end
+    end
+
+    rect rgb(19, 78, 74)
+    Note over U,W: Steady state
+    U->>D: "open settings on my phone"
+    D->>D: routePhoneCommand
+    D->>W: id, open_app_by_name, name settings
+    W->>P: forward
+    P->>P: resolve name to package
+    P-->>W: ok, com.android.settings
+    W-->>D: result
+    D-->>U: "Settings is now open on your phone, Sir."
+    end
+
+    Note over P,W: on disconnect, reconnect with<br/>exponential backoff capped at 30s
 ```
 
-Built once on load, updated incrementally on ingest. Never rebuilt per query.
-
-### BM25
-
-```
-score(d, q) = sum over t in q of
-    idf(t) * (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * |d| / avgdl))
-
-idf(t) = ln(1 + (N - df + 0.5) / (df + 0.5))
-k1 = 1.5,  b = 0.75
-```
-
-Iteration is over postings, not documents, so only chunks containing a query
-term are touched.
-
-**Determinism matters here.** Equal scores are common, and postings-order
-traversal ranked them differently between runs. Since rank position drives
-faithfulness, the same question could receive a differently ordered context each
-time. Both the BM25 sort and the RRF sort tie-break on chunk index.
-
-### Fusion
-
-```
-RRF(d) = sum over enabled lists of  weight / (60 + rank(d))
-
-sparse  weight 1.0
-dense   weight 1.0
-PRF     weight 0.5
-```
-
-PRF is a separate list rather than merged into the query. A poor feedback pool
-can then dilute the fusion but cannot corrupt the original query's ranking.
-
-### Late sentence selection
-
-After the top 5 passages are chosen, sentences are scored individually:
-
-```
-score(s) = sum of idf(t) for unique query terms t in s
-score(s) *= 1 + max(0, 3 - position) * 0.08     // lead bias
-```
-
-The top 10 sentences form the context. If nothing matches lexically, which
-happens on a purely dense hit, the passages are kept whole rather than returning
-an empty context.
-
-Scoring is lexical rather than neural. There is no cross-encoder in the
-renderer, and a per-sentence embedding round trip costs more latency than it
-returns.
-
-### Reranking gate
-
-```
-needsRerank = (top1.score - top2.score) / top1.score < 0.15
-```
-
-When the gap is wide there is nothing to fix. When it is narrow, rank order is
-fragile and worth roughly 4.8 seconds to correct. Opt-in via `{rerank: true}`;
-typed input opts in, voice does not.
-
-Failure is non-fatal by construction: timeout, non-200, unparseable JSON, or an
-empty order array all return the original ordering.
-
-### Measured baselines
-
-| Property | Value |
-| --- | --- |
-| BM25 at 5,000 chunks | 0.456 ms |
-| Speedup over per-query tokenisation | 230x to 320x |
-| Ranking equivalence | top-10 bit-identical |
-| Context reduction from sentence selection | 81 percent |
-| Rerank gate firing rate | ~50 percent |
-| Rerank cost when fired | ~4,800 ms |
-| Gemma 3 rerank top-1 on labelled data | 3 of 3 |
-| Gemma 3 source routing accuracy | 11 of 12 |
-| Gemma 3 single planning call | ~3,024 ms |
-
-The last two explain why agentic retrieval was rejected. Accuracy is adequate;
-latency is not. Published A-RAG loops run 5 to 20 steps, which is 15 to 60
-seconds before the first spoken word.
-
----
-
-## Companion protocol
-
-### Transport
-
-The phone dials outward to `ws://<desktop>:8766/ws` with
-`X-Jarvis-Token: <bridge token>`. The desktop compares using
-`crypto.timingSafeEqual` after a length check.
-
-Outbound-only avoids Doze restrictions, handset address churn, and the need for
-a listener on the phone.
-
-### Discovery
-
-```
-Desktop advertises:  _jarvis._tcp on port 8765
-                     TXT: {ws: "8766", v: "1"}
-
-Phone resolves, filters, and tries each address in turn.
-```
-
-Filtering happens on both sides. The desktop ranks interfaces so the Wi-Fi
-address precedes virtual adapters; the phone drops `169.254.x` and
-`192.168.56.x` outright, since each unreachable candidate costs a five second
-connect timeout.
-
-### Pairing
-
-```
-POST /pair
-    body:  {"model": "...", "android": "..."}
-    200:   {"token": "...", "wsPort": 8766}
-    403:   {"error": "pairing window is closed"}
-```
-
-Open for five minutes, user-initiated. `/apk` shares the same gate.
-
-The phone retries every 10 seconds while unpaired, and re-kicks NSD when nothing
-has resolved. Pairing was originally attempted only inside the NSD callback,
-which made the flow unusable: the first attempt normally arrives before the user
-opens the window, receives 403, and never retried.
-
-### Message format
-
-Command, desktop to phone:
-
-```json
-{"id": "<hex>", "action": "open_app_by_name", "params": {"name": "settings"}}
-```
-
-Reply, phone to desktop:
-
-```json
-{"id": "<hex>", "ok": true, "result": {"package": "com.android.settings"}}
-{"id": "<hex>", "ok": false, "error": "no installed app matching 'x'"}
-```
-
-Event, phone to desktop, unsolicited:
-
-```json
-{"event": "hello", "payload": {"model": "...", "capabilities": {...}}}
-```
-
-Commands carry a 20 second timeout. Pending promises are keyed by id and settled
-on reply.
-
-### Command reference
-
-| Action | Tier | Parameters | Result |
-| --- | --- | --- | --- |
-| `ping` | 1 | | `{pong}` |
-| `device_info` | 1 | | model, android, sdk, capabilities |
-| `capabilities` | 1 | | capability map |
-| `battery` | 1 | | `{level, charging}` |
-| `clipboard_get` | 1 | | `{text}` |
-| `clipboard_set` | 1 | `text` | |
-| `tts` | 1 | `text` | |
-| `list_apps` | 1 | | launchable packages |
-| `open_app_by_name` | 1 | `name` | `{package, label}` |
-| `flashlight` | 1 | `on` | `{on}` |
-| `volume` | 1 | `percent` or `delta` | `{level, max, percent}` |
-| `get_layout` | 2 | | UI tree as JSON |
-| `click` | 2 | `x`, `y` | |
-| `long_press` | 2 | `x`, `y`, `duration` | |
-| `swipe` | 2 | `x1`, `y1`, `x2`, `y2`, `duration` | |
-| `input_text` | 2 | `text` | |
-| `global` | 2 | `action` | home, back, recents, notifications, lock, screenshot |
-| `screenshot` | 2 | `quality` | `{jpeg_base64}` |
-
-Tier 2 commands return a specific, actionable error when the accessibility
-service is disabled, rather than failing silently.
-
-### App name resolution
-
-Spoken names are matched against launchable activities, ranked exact, prefix,
-contains, then package id. Ranking matters: a bare substring match would let
-"play" resolve to "Play Store".
-
-### Screenshots
-
-`AccessibilityService.takeScreenshot()` on API 30 and above, not MediaProjection.
-It returns the bitmap directly, requires no foreground service, no
-`mediaProjection` service type, and no per-session consent dialog. The
-accessibility grant already covers it.
-
-`android.permission.PROJECT_MEDIA` is deliberately absent from the manifest. It
-is a signature permission that a normal application cannot hold.
-
-### Asset serving
-
-Visualizer assets load from `https://appassets.androidplatform.net/assets/...`
-through `WebViewAssetLoader`, not `file://`.
-
-The page uses `<script type="module">` with an import map. Module scripts are
-fetched with CORS semantics, and a `file://` page has an opaque origin, so the
-fetch is blocked and the result is a black screen with only a console error.
-`allowFileAccess` and `allowContentAccess` are disabled once the loader is in
-place.
-
----
-
-## Security model
-
-### Trust boundaries
-
-```
-Untrusted:  LAN peers, web search results, OCR'd document text
-Trusted:    local user, main process, spawned services
-```
-
-### Controls
-
-| Surface | Control |
-| --- | --- |
-| Companion WebSocket | Token, constant-time compare, closes 4001 on mismatch |
-| Phone bridge | Token in header or query, except pairing routes |
-| Pairing routes | Time-boxed window, user-initiated, 403 when closed |
-| Application launch | Allowlist |
-| ADB | Argument arrays, never string concatenation; raw passthrough disabled |
-| Package names | `^[A-Za-z0-9._]+$` |
-| Pairing codes | `^\d{6}$` |
-| Credentials | DPAPI via `safeStorage`, no read channel |
-| Clipboard secrets | Detected in main, masked hint only, never stored |
-| Renderer | `contextIsolation` on, no Node.js primitives exposed |
-
-### Residual risk, accepted
-
-- LAN traffic is cleartext. The bridge address is DHCP-assigned and cannot be
-  pinned by CIDR, so `network_security_config.xml` permits cleartext.
-  Authentication is the shared token. Untrusted networks are out of scope.
-- Tier 2 grants the desktop the ability to read and act on any screen, including
-  banking applications. This is inherent to accessibility automation and is
-  stated plainly in the service description the user must accept.
-
----
-
-## Performance characteristics
-
-Measured on the development machine, Windows 11, gemma3:4b.
-
-| Operation | Latency |
-| --- | --- |
-| BM25 at 5,000 chunks | 0.5 ms |
-| Full recall, no rerank | ~90 ms |
-| Full recall, rerank fired | ~4,800 ms |
-| STT, short utterance | 816 to 4,371 ms |
-| Time to first spoken word, streaming | 1 to 2 s |
-| Time to first spoken word, unstreamed | 5 to 10 s |
-| Gemma planning call, JSON mode | ~3,024 ms |
-| Companion command round trip | under 100 ms |
-| Companion reconnect after desktop restart | 16 to 30 s, backoff |
-| Companion app cold start | 1,272 ms |
-
-### Where the time goes
-
-The dominant cost is always local inference. Retrieval is sub-millisecond;
-generation is seconds. Optimisation effort belongs on how much text reaches the
-model, not on how fast candidates are found. This is why late sentence selection
-matters more than any retrieval improvement: an 81 percent context reduction
-translates directly into generation time.
-
----
-
-## Extending the system
-
-### Adding a voice command
-
-1. Add a matcher in `detectIntent()`. Mind the ordering rules above.
-2. Add a `case` in the `switch` in `processCommand()`.
-3. Implement the handler. If it touches the OS, add an IPC channel rather than
-   reaching for Node.js in the renderer.
-
-### Adding a phone command
-
-1. Implement it in `DeviceCommandExecutor.execute()` in Kotlin.
-2. If it depends on a permission or hardware, report it in `capabilities()`.
-   Probe, do not assume.
-3. Add the wire name to `WIRE` and a tool entry in `PHONE_TOOLS` in
-   `phoneTools.js`.
-4. Add a matcher in `routePhoneCommand()` and a phrasing in `describeResult()`.
-
-Spoken confirmations must be built from values the phone returned. Do not let
-the model narrate an outcome it cannot observe.
-
-### Adding a retrieval source
-
-Implement a ranked list of `{i, score}` and fuse it in `recall()`:
-
-```js
-fuse(myRanks, 0.5);
-```
-
-Weight below 1.0 for derived or lower-confidence evidence. Keep the list
-separate rather than merging terms into the query, so a weak source cannot
-corrupt the primary ranking.
-
-### Testing without the UI
-
-The bridge exposes token-gated routes for headless driving:
-
-```powershell
-$token = (Get-Content "$env:APPDATA\jarvis\phone-bridge.json" -Raw | ConvertFrom-Json).token
-$h = @{ "X-Jarvis-Token" = $token }
-
-Invoke-WebRequest -Uri "http://127.0.0.1:8765/pair-window" -Method POST -Headers $h
-Invoke-WebRequest -Uri "http://127.0.0.1:8765/companion/devices" -Headers $h
-
-$body = @{ action = "battery"; params = @{} } | ConvertTo-Json
-Invoke-WebRequest -Uri "http://127.0.0.1:8765/companion/command" -Method POST -Headers $h -Body $body -ContentType 'application/json'
-```
-
-The retrieval engine can be exercised outside Electron by copying
-`ragService.js` to a `.mjs` file and stubbing two globals:
-
-```js
-global.localStorage = { getItem: () => null, setItem: () => {} };
-global.window = { electronAPI: { ragLoad: async () => null, ragSave: async () => {} } };
-const { default: rag } = await import('./ragServiceCopy.mjs');
-```
-
-This is how the index speedup and context reduction figures in this document
-were produced. Prefer measuring over assuming; several entries in the roadmap
-this system was built from turned out to be wrong for a 4B local model, and only
-benchmarking revealed it.
