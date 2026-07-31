@@ -2115,7 +2115,15 @@ class Jarvis {
             const superseded = turnId !== this._turnSeq;
 
             // Persist the turn for later analysis, from ITS OWN buffer.
-            this._logInteraction(command, intent, _turnStartedAt, _turnOk && !superseded, _buf);
+            //
+            // `ok` and `superseded` are recorded separately. Folding them
+            // together logged genuine successes as failures whenever the user
+            // spoke again before the turn finished — the 31 Jul log has
+            // "Opening notepad" stored with ok:false after the action had
+            // already happened — which both corrupts the success rate and, via
+            // reflectionService's ok!==false filter, quietly drops the turn
+            // from memory consolidation.
+            this._logInteraction(command, intent, _turnStartedAt, _turnOk, _buf, superseded);
             /* Remember answers that came from MEASUREMENT rather than the model,
                so a bare follow-up is grounded in them. AI_COMMAND is excluded
                on purpose: feeding a model's own output back as "factual" is how
@@ -6635,7 +6643,7 @@ class Jarvis {
     // Append one local turn to the persistent interaction log. Best-effort and
     // fully guarded — telemetry must never break or slow a turn. Secret-bearing
     // commands are dropped here so a key never reaches disk via this path.
-    _logInteraction(input, intent, startedAt, ok, buf) {
+    _logInteraction(input, intent, startedAt, ok, buf, superseded = false) {
         try {
             if (!window.electronAPI?.logInteraction) return;
             const name = (intent && intent.intent) || 'AI';
@@ -6647,6 +6655,11 @@ class Jarvis {
                 intent: name,
                 latencyMs: Date.now() - startedAt,
                 ok: ok !== false,
+                // Whether a NEWER turn replaced this one. Distinct from ok: the
+                // user interrupting is not the turn failing, and only the
+                // interrupted turn can have a truncated response. Omitted when
+                // false so the common row stays as it was.
+                ...(superseded ? { superseded: true } : {}),
                 response: String((buf ? buf.text : this._activeBuffer?.text) || '').slice(0, 500),
                 // Per-stage breakdown: which command is slow was already
                 // answerable; this says where inside it the time went.

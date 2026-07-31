@@ -39,8 +39,15 @@ const sameFact = factsMatch;
 
 // A turn only teaches something if the user actually engaged with it; pure
 // errors and empty responses are noise for fact distillation.
+//
+// Superseded turns are excluded explicitly rather than by relying on them
+// having been recorded as failures. They used to arrive here as ok:false, so
+// this filter dropped them by accident — along with every genuine success that
+// happened to be interrupted. A superseded turn's response can be truncated
+// mid-stream, so it is still not safe to distil facts from; it just needs to be
+// excluded for that reason, and only that reason.
 function usefulRows(rows) {
-    return rows.filter((r) => r && r.input && r.ok !== false);
+    return rows.filter((r) => r && r.input && r.ok !== false && r.superseded !== true);
 }
 
 // Render rows into a compact transcript for the distiller. Only the fields that
