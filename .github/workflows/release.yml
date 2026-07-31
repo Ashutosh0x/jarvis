@@ -120,6 +120,9 @@ jobs:
       # this repo before certificates are configured, still produces complete
       # unsigned artifacts rather than a failed release.
       - name: Package
+        # bash on every runner, Windows included, so the unset below behaves the
+        # same way three times instead of needing a PowerShell variant.
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Windows + macOS code signing
@@ -131,7 +134,30 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           # Without a certificate, tell electron-builder not to hunt for one.
           CSC_IDENTITY_AUTO_DISCOVERY: ${{ secrets.CSC_LINK && 'true' || 'false' }}
-        run: npx electron-builder ${{ matrix.target }} --publish never
+        run: |
+          # An absent secret is not an absent variable. GitHub still DEFINES
+          # every key in the block above, with the empty string as its value,
+          # and electron-builder distinguishes the two:
+          #
+          #   getCscLink()      -> chooseNotNull(...)  // `v == null ? v2 : v1`
+          #   importCertificate('') -> path.resolve(cwd, '') -> the repo root
+          #   -> "⨯ /Users/runner/work/jarvis/jarvis not a file"
+          #
+          # An empty string reads as "a certificate was configured, at no path",
+          # so the macOS build failed at signing on a repo that has deliberately
+          # never had one. The Windows signer guards `cscLink === ""` explicitly
+          # and the macOS one does not, which is why only that job failed.
+          # Removing the empty variables restores the unsigned path.
+          # `if`, not `[ -z ... ] && unset`. That form leaves the loop's exit
+          # status at 1 whenever the last variable is non-empty (verified: the
+          # failing `[` is exempt from -e inside an && list, but its status is
+          # still the loop's). Harmless only while a command follows the loop —
+          # which makes it a trap for whoever edits this next, and it would fire
+          # on the day a real certificate is configured.
+          for v in CSC_LINK CSC_KEY_PASSWORD APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID; do
+            if [ -z "${!v}" ]; then unset "$v"; echo "unset empty $v"; fi
+          done
+          npx electron-builder ${{ matrix.target }} --publish never
 
       # Chromium's setuid sandbox helper must be root-owned and mode 4755.
       # dpkg/rpm set that when the package is INSTALLED; the unpacked directory
