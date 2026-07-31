@@ -1221,6 +1221,12 @@ class Jarvis {
            this, "project review" mid-flow would be classified as a web search. */
         if (this.scheduler?.isActive) return { intent: 'SCHEDULING_TURN', text: command };
 
+        if (/(?:start|launch|run|open).*(?:with|on|at).*(?:windows|boot|startup|login|start ?up)/.test(cmd)
+            || /autostart|start automatically/.test(cmd))
+            return { intent: 'AUTOSTART', enable: !/(?:don'?t|do not|stop|disable|never|no longer)/.test(cmd) };
+        if (/(?:hide yourself|go to the tray|minimi[sz]e yourself|get out of the way|hide the window)/.test(cmd))
+            return { intent: 'HIDE_WINDOW' };
+
         if (/(?:connect|link|set ?up).*calendar/.test(cmd)) return { intent: 'CALENDAR', action: 'connect' };
         if (/schedule.*(?:meeting|call|meet)|set ?up a (?:meeting|call)|book a (?:meeting|call)/.test(cmd))
             return { intent: 'CALENDAR', action: 'schedule' };
@@ -1983,6 +1989,13 @@ class Jarvis {
                     break;
                 case 'SCHEDULING_TURN':
                     await this.continueScheduling(intent.text);
+                    break;
+                case 'AUTOSTART':
+                    await this.handleAutostart(intent.enable);
+                    break;
+                case 'HIDE_WINDOW':
+                    this.speak('Hiding, Sir. I will still be listening.');
+                    await window.electronAPI.hideWindow?.();
                     break;
                 case 'CALENDAR':
                     await this.handleCalendarCommand(intent.action);
@@ -6048,6 +6061,26 @@ class Jarvis {
      * meetingScheduler.js for why the model does not decide any field that
      * lands in the calendar.
      */
+    /** Turn "start when I sign in" on or off by voice. */
+    async handleAutostart(enable) {
+        const api = window.electronAPI;
+        if (!api?.autostartSet) {
+            this.speak('That is not available in this environment, Sir.');
+            return;
+        }
+        const res = await api.autostartSet(enable);
+        if (!res.ok) {
+            // Never claim it worked. In a development run there is no
+            // installed executable to register, and a confident "done" would
+            // be discovered as false only at the next reboot.
+            this.speak(`I could not change that, Sir. ${res.reason || ''}`);
+            return;
+        }
+        this.speak(res.enabled
+            ? 'I will start with your machine, Sir, and wait in the tray.'
+            : 'I will no longer start on its own, Sir.');
+    }
+
     async handleCalendarCommand(action, payload) {
         const api = window.electronAPI;
         if (!api?.gcalStatus) {

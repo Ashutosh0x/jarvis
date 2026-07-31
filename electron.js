@@ -1,4 +1,18 @@
 const { app, BrowserWindow, ipcMain, desktopCapturer, clipboard, shell } = require('electron');
+const autostart = require('./autostart.js');
+
+/* SINGLE INSTANCE — claimed before any other startup work.
+
+   Not a nicety once autostart exists. Jarvis spawns a speech server, a TTS
+   server, a vision server and Ollama, each on a fixed port, and runs a
+   microphone listener and an alarm scheduler. Autostart plus a manual launch
+   is the ordinary case on day one, and a second instance would fight the first
+   for every one of those. Losing the lock means another Jarvis is already
+   running, so hand the user that one and leave. */
+if (!autostart.claimSingleInstance(() => mainWindow)) {
+    app.quit();
+    process.exit(0);
+}
 const path = require('path');
 const { exec, execFile, spawn } = require('child_process');
 const os = require('os');
@@ -112,10 +126,43 @@ const ALLOWED_APPS = {
     paint: { path: 'mspaint.exe', args: [] }
 };
 
+/* Extra directories the user has explicitly granted, from
+   JARVIS_EXTRA_ROOTS (semicolon-separated absolute paths).
+
+   This is how "let Jarvis reach more of my system" is done here: you name the
+   directories, rather than the allowlist being removed. Jarvis acts on speech
+   recognition, which mishears; the guarantee worth keeping is not "Jarvis
+   cannot write" but "a misheard word cannot write somewhere you did not
+   choose".
+
+   Set it to a drive root if you genuinely want that. The point is that it is
+   your decision, recorded in a file, rather than an implicit consequence of
+   turning on autostart. */
+const EXTRA_ROOTS = (process.env.JARVIS_EXTRA_ROOTS || '')
+    .split(';')
+    .map((p) => p.trim())
+    .filter(Boolean)
+    .map((p) => {
+        // ABSOLUTE ONLY. path.resolve() would quietly turn a typo'd "Work"
+        // into <cwd>/Work and grant write access to a directory nobody chose.
+        // A malformed entry is reported and dropped, never guessed at.
+        if (!path.isAbsolute(p)) {
+            console.warn(`[fs] ignoring JARVIS_EXTRA_ROOTS entry "${p}" — not an absolute path`);
+            return null;
+        }
+        try { return path.resolve(p); } catch { return null; }
+    })
+    .filter(Boolean);
+
+if (EXTRA_ROOTS.length) {
+    console.log(`[fs] ${EXTRA_ROOTS.length} extra root(s) granted via JARVIS_EXTRA_ROOTS`);
+}
+
 // Validate and sanitize file paths to prevent path traversal
 function validatePath(requestedPath) {
     const homedir = os.homedir();
     const allowedRoots = [
+        ...EXTRA_ROOTS,
         path.join(homedir, 'Downloads'),
         path.join(homedir, 'Documents'),
         path.join(homedir, 'Desktop'),
@@ -207,7 +254,10 @@ function createWindow() {
     });
 
     mainWindow.once('ready-to-show', () => {
-        mainWindow.show();
+        // Launched by the OS at login: load, warm the services, and stay in
+        // the tray. Someone who wanted a window on every boot would not have
+        // needed autostart in the first place.
+        if (!autostart.launchedAtLogin()) mainWindow.show();
         mainWindow.setBackgroundColor('#00000000');
     });
 
@@ -230,6 +280,12 @@ function createWindow() {
 
 app.whenReady().then(async () => {
     createWindow();
+
+    /* Tray first, THEN close-to-tray. Hiding a window with no tray icon would
+       leave Jarvis running with no way to reach it and no way to stop it short
+       of Task Manager. */
+    autostart.installTray(() => mainWindow);
+    autostart.keepAliveInTray(mainWindow);
     startTelemetry();
     phoneBridgeToken = await loadPhoneBridgeToken();
     startPhoneBridge();
@@ -276,10 +332,14 @@ app.whenReady().then(async () => {
 });
 
 app.on('window-all-closed', () => {
-    if (process.platform !== 'darwin') {
+    // Closing the window hides it; the tray keeps Jarvis alive so alarms still
+    // fire and meetings are still watched. Only an explicit Quit exits.
+    if (autostart.isQuitting() && process.platform !== 'darwin') {
         app.quit();
     }
 });
+
+app.on('before-quit', () => autostart.beginQuit());
 
 /* =========================
    IPC / SYSTEM HANDLERS
@@ -844,6 +904,22 @@ const googleCal = new GoogleCalendar({
     tokenPath: path.join(app.getPath('userData'), 'google-token.json'),
 });
 googleCal.loadTokens().catch(() => {});
+
+/* Autostart and background running. `canRegister` is false in development,
+   where process.execPath is electron.exe — registering there would put a bare
+   Electron runtime in the user's startup that launches and shows nothing. */
+ipcMain.handle('autostart-status', async () => ({
+    supported: autostart.canRegister(),
+    enabled: autostart.isEnabled(),
+    launchedAtLogin: autostart.launchedAtLogin(),
+}));
+
+ipcMain.handle('autostart-set', async (event, enabled) => autostart.setEnabled(enabled));
+
+ipcMain.handle('window-hide', async () => {
+    if (mainWindow) mainWindow.hide();
+    return { hidden: true };
+});
 
 ipcMain.handle('gcal-status', async () => ({
     configured: googleCal.isConfigured,

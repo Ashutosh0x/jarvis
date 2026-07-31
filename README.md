@@ -396,6 +396,58 @@ JARVIS Creating it now, Sir.
 > personal Gmail the event is created without one — the API returns no link and
 > no error — and JARVIS says so rather than implying a link exists.
 
+### Running in the background
+
+```
+"start with windows"     ·   "don't start with windows"
+"hide yourself"          ·   click the tray icon to bring it back
+```
+
+Closing the window hides JARVIS to the tray rather than quitting, so alarms
+still fire and meetings are still watched. Only **Quit Jarvis** from the tray
+menu actually exits.
+
+- Autostart is registered through the OS login-items API, and starts hidden —
+  someone who wanted a window on every boot would not need autostart
+- A **single-instance lock** is claimed before anything else. This is not a
+  nicety: JARVIS spawns a speech server, a TTS server, a vision server and
+  Ollama on fixed ports, and runs a microphone listener and an alarm scheduler.
+  Autostart plus a manual launch is the ordinary case on day one, and a second
+  instance would fight the first for all of it. Launching again surfaces the
+  running window instead
+- Autostart can only be registered from an **installed build**. In a
+  development run `process.execPath` is `electron.exe`, and registering there
+  would put a bare Electron runtime in your startup that launches and shows
+  nothing. JARVIS refuses and says so, rather than leaving an entry that looks
+  installed and does nothing
+
+### What JARVIS can reach
+
+JARVIS runs as **you**, not as Administrator, and that is deliberate.
+
+Unelevated already covers everything you do day to day: your files, launching
+programs, reading the process list and network state, the microphone and the
+screen. What it does not cover is writing to `Program Files`, the Windows
+directory, or another user's data — none of which JARVIS has a reason to touch.
+
+Running it elevated would mean a misheard word, or anything that reached the
+renderer through a web result, inherits Administrator. JARVIS acts on speech
+recognition, which mishears; that is the whole reason the file commands are
+rule-parsed and the write path is allowlisted in the first place.
+
+To widen its reach, name the directories:
+
+```
+JARVIS_EXTRA_ROOTS=D:\Projects;C:\Work
+```
+
+Absolute paths, semicolon-separated. A relative entry is dropped with a warning
+rather than resolved against the working directory, because a typo'd `Work`
+becoming `<cwd>/Work` would grant a directory nobody chose. Point it at a drive
+root if you genuinely want that — the difference that matters is that it is
+your decision, written down, rather than an implicit consequence of enabling
+autostart.
+
 ### Screen and documents
 
 - Screen reading through Gemma 3 vision, fully offline. The captured question is

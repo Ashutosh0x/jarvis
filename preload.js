@@ -195,6 +195,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
     openEditor: (filePath, editor) => ipcRenderer.invoke('open-editor', filePath, editor),
     // Google Calendar. Credentials live in the main process only — the
     // renderer can ask for events and create them, never see a token.
+    // Autostart and background running
+    autostartStatus: () => ipcRenderer.invoke('autostart-status'),
+    autostartSet: (enabled) => ipcRenderer.invoke('autostart-set', enabled),
+    hideWindow: () => ipcRenderer.invoke('window-hide'),
     gcalStatus: () => ipcRenderer.invoke('gcal-status'),
     gcalConnect: () => ipcRenderer.invoke('gcal-connect'),
     gcalDisconnect: () => ipcRenderer.invoke('gcal-disconnect'),
