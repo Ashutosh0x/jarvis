@@ -17,12 +17,24 @@ const features = [
   },
   {
     number: "03",
+    title: "Does the work, not just the talking",
+    description: "Say it and it happens. Files and folders written where you asked, code authored by Gemma straight into a new file and opened in your editor, alarms and timers that survive a restart — every path and filename decided by rule, never by a model.",
+    visual: "collab",
+  },
+  {
+    number: "04",
+    title: "Aware of your day",
+    description: "Connect Google Calendar and JARVIS keeps track. It asks what to call a meeting and what it is about, then schedules it with a Meet link. Warnings escalate as the hour approaches — thirty minutes, ten, five, one — rather than repeating the same reminder until you stop hearing it.",
+    visual: "ai",
+  },
+  {
+    number: "05",
     title: "Android companion",
     description: "Pair your phone over Wi-Fi and control JARVIS from anywhere in the room. The same voice interface, plus phone battery, notifications, and device actions relayed securely over a local WebSocket link.",
     visual: "collab",
   },
   {
-    number: "04",
+    number: "06",
     title: "Private by design",
     description: "No hosted model, no model API keys, no conversation data leaving your disk. Outbound traffic is limited to live-data lookups — a search, a quote, a block — each carrying only the subject of the question. Per-query cost is zero.",
     visual: "security",

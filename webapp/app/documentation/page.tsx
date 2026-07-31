@@ -99,6 +99,8 @@ const toc = [
   { id: "issuance", label: "Stablecoin issuance" },
   { id: "providers", label: "Provider keys" },
   { id: "tracer", label: "Fund-flow tracer" },
+  { id: "doing", label: "Doing the work" },
+  { id: "calendar", label: "Calendar and meetings" },
   { id: "companion", label: "Android companion" },
   { id: "ports", label: "Network ports" },
   { id: "privacy", label: "Privacy model" },
@@ -741,7 +743,116 @@ detectConsistentChains(...)   // structurally coherent paths`}</Code>
             </p>
           </Section>
 
-          <Section id="companion" eyebrow="17" title="Android companion">
+          <Section id="doing" eyebrow="17" title="Doing the work">
+            <p>
+              Saying something and having it happen. Files written, code
+              authored, alarms armed — with one rule throughout: everything that
+              determines <em>what lands on your disk or in your calendar</em> is
+              parsed by rule, never decided by a model. The model writes
+              contents; it does not choose filenames, directories or times.
+            </p>
+            <Code>{`"create a folder called notes on the desktop"
+"make a file called shopping list saying milk and eggs"
+"open vscode and write a binary search in java"`}</Code>
+            <p>
+              Writes are confined to Desktop, Documents, Downloads, Pictures,
+              Videos and Music, and containment is checked at a path-separator
+              boundary — <Term>~/Desktop-evil</Term> is not{" "}
+              <Term>~/Desktop</Term>. An existing file is never silently
+              overwritten. Executable types are refused; source files are not,
+              because writing <Term>.js</Term> is the point and a{" "}
+              <Term>.js</Term> is only dangerous when something runs it, which
+              JARVIS never does.
+            </p>
+            <p>
+              For code, Gemma writes the file body after the filename and
+              language are already fixed. Java and C# get PascalCase names
+              because those languages resolve the type by filename. If the model
+              returns nothing, no file is created — an empty file reported as
+              success would be a lie.
+            </p>
+
+            <h3 className="text-lg font-medium mt-10 mb-3">Alarms and timers</h3>
+            <Code>{`"set a timer for 40 minutes"
+"set an alarm for tomorrow at 2:30 pm"
+"set a timer for twenty minutes to check the oven"`}</Code>
+            <p>
+              Scheduled to the exact instant rather than polled, so a
+              thirty-second timer works. They persist across restarts, and a
+              missed one is announced on return rather than silently dropped —
+              quietly deleting an alarm you set is the same failure as never
+              setting it, except you do not find out. An unresolvable time is
+              refused: &quot;set a timer for the pasta&quot; asks how long
+              instead of choosing.
+            </p>
+            <p>
+              These fire only while JARVIS is running. It is a renderer-side
+              scheduler, not an OS-level alarm.
+            </p>
+          </Section>
+
+          <Section id="calendar" eyebrow="18" title="Calendar and meetings">
+            <p>
+              Connect Google Calendar and JARVIS stays aware of your day. Setup
+              is one visit to the Cloud Console: enable the Calendar API, create
+              a <Term>Desktop app</Term> OAuth client, and put the ID and secret
+              in <Term>.env</Term>. Then say &quot;connect my calendar&quot;.
+            </p>
+            <p>
+              Authorisation opens your system browser, not an embedded view, so
+              you can see Google&apos;s real origin when handing over calendar
+              access. The exchange uses PKCE — the client secret is not secret
+              for a desktop app, as Google&apos;s own flow puts it in the binary.
+              The refresh token is stored by the main process at mode{" "}
+              <Term>0600</Term> and never reaches the interface layer.
+            </p>
+
+            <h3 className="text-lg font-medium mt-10 mb-3">Scheduling is a conversation</h3>
+            <Code>{`You     schedule a meeting
+JARVIS  Of course, Sir. What should I call this meeting?
+You     project review
+JARVIS  "Project review". And what is this meeting about?
+You     Q3 roadmap and hiring
+JARVIS  Noted. When should I schedule it, Sir?
+You     tomorrow at 3 pm
+JARVIS  3:00 PM tomorrow. How long should it run?
+You     an hour
+JARVIS  Anyone to invite? Say their emails, or "no one".
+You     no one
+JARVIS  "Project review", 3:00 PM tomorrow for 1 hour, ending 4:00 PM.
+        About: Q3 roadmap and hiring. Shall I create it, Sir?
+You     yes`}</Code>
+            <p>
+              Spoken email addresses work — &quot;john at example dot com&quot; —
+              and one that cannot be parsed is refused rather than quietly
+              inviting nobody. The model is asked for exactly one thing: a better
+              title when you gave a generic one, which you then confirm.
+            </p>
+
+            <h3 className="text-lg font-medium mt-10 mb-3">Warnings that escalate</h3>
+            <p>
+              Reminding every five minutes from forty minutes out produces eight
+              identical warnings, and the one at two minutes — the only one that
+              matters — sounds exactly like the seven that did not. JARVIS
+              escalates instead: thirty minutes, ten, five, one, each phrased
+              differently.
+            </p>
+            <p>
+              The calendar is fetched every five minutes but checked against
+              local clocks every twenty seconds, so alert timing does not depend
+              on when a network call happened to land. A failed poll keeps the
+              last known schedule — announcing &quot;no meetings today&quot;
+              because one fetch failed would be a fabrication.
+            </p>
+            <p>
+              Creating a <Term>Google Meet link</Term> requires a paid Google
+              Workspace account. On a personal Gmail the API returns an event
+              with no link and no error, so JARVIS reports that plainly instead
+              of implying a link exists.
+            </p>
+          </Section>
+
+          <Section id="companion" eyebrow="19" title="Android companion">
             <p>
               The companion pairs over Wi-Fi and mirrors the same voice interface to a
               phone. Discovery is by mDNS; the link is a token-authenticated WebSocket with a
@@ -755,7 +866,7 @@ detectConsistentChains(...)   // structurally coherent paths`}</Code>
             </p>
           </Section>
 
-          <Section id="ports" eyebrow="18" title="Network ports">
+          <Section id="ports" eyebrow="20" title="Network ports">
             <p>
               Every listener binds locally or to the LAN. None is exposed to the internet.
             </p>
@@ -771,7 +882,7 @@ detectConsistentChains(...)   // structurally coherent paths`}</Code>
             />
           </Section>
 
-          <Section id="privacy" eyebrow="19" title="Privacy model">
+          <Section id="privacy" eyebrow="21" title="Privacy model">
             <p>
               Privacy is the architecture, not a setting. Your microphone, screen captures,
               and conversations stay on local disk because there is no provider server to
@@ -794,7 +905,7 @@ detectConsistentChains(...)   // structurally coherent paths`}</Code>
             </p>
           </Section>
 
-          <Section id="install" eyebrow="20" title="Install & run">
+          <Section id="install" eyebrow="22" title="Install & run">
             <p>
               The fastest path is npm. This installs the app and its Electron runtime,
               and puts a <Term>jarvis</Term> command on your PATH.

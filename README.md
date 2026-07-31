@@ -17,6 +17,14 @@
 </p>
 
 <p align="center">
+  <img src="https://img.shields.io/badge/Google%20Calendar-4285F4?style=for-the-badge&logo=googlecalendar&logoColor=white" alt="Google Calendar API" />
+  <img src="https://img.shields.io/badge/Google%20Meet-00897B?style=for-the-badge&logo=googlemeet&logoColor=white" alt="Google Meet API" />
+  <img src="https://img.shields.io/badge/OAuth%202.0%20%2B%20PKCE-EB5424?style=for-the-badge&logo=auth0&logoColor=white" alt="OAuth 2.0 with PKCE" />
+  <img src="https://img.shields.io/badge/Web%20Audio-FF3E00?style=for-the-badge&logo=webaudio&logoColor=white" alt="Web Audio API" />
+  <img src="https://img.shields.io/badge/npm-CB3837?style=for-the-badge&logo=npm&logoColor=white" alt="npm" />
+</p>
+
+<p align="center">
   <img src="https://img.shields.io/badge/Android-34A853?style=for-the-badge&logo=android&logoColor=white" alt="Android" />
   <img src="https://img.shields.io/badge/Kotlin-7F52FF?style=for-the-badge&logo=kotlin&logoColor=white" alt="Kotlin" />
   <img src="https://img.shields.io/badge/Gradle-02303A?style=for-the-badge&logo=gradle&logoColor=white" alt="Gradle" />
@@ -149,6 +157,7 @@ extends the same interface and control surface to a paired phone over Wi-Fi.
 - [What makes this different](#what-makes-this-different)
 - [Architecture](#architecture)
 - [Feature reference](#feature-reference)
+- [Calendar and meetings](#calendar-and-meetings)
 - [On-chain intelligence](#on-chain-intelligence)
 - [Web search](#web-search)
 - [Retrieval engine](#retrieval-engine)
@@ -272,6 +281,120 @@ is required. Leading "Jarvis" and common mis-hearings are stripped.
 - File operations, clipboard read and write
 - Windows Settings deep links
 - Live CPU, RAM, uptime, and active window telemetry in the HUD
+
+### Files and folders
+
+Create folders and files by voice, anywhere inside your own user folders.
+
+```
+"create a folder called notes on the desktop"
+"make a file called todo.txt in documents"
+"make a file called shopping list saying milk and eggs"
+```
+
+- Parsing is rule-based, never model-driven. These commands write to disk, and
+  a model deciding what "create a file called that thing" means is a model
+  deciding what to name a file on your Desktop
+- Confined to Desktop, Documents, Downloads, Pictures, Videos and Music.
+  Containment is checked at a path-separator boundary, so `~/Desktop-evil` is
+  not treated as `~/Desktop`
+- An existing file is never silently overwritten
+- Executable types (`.exe`, `.bat`, `.vbs`) are refused. Source files are not —
+  writing `.js` is the point, and a `.js` is only dangerous when something runs
+  it, which JARVIS never does
+- A name that does not survive sanitising is reported, not replaced with a
+  fallback. A file called `untitled` appearing because a name was misheard is
+  worse than being told the name was not understood
+
+### Writing code
+
+```
+"open vscode and write a binary search in java"
+"write a quicksort in python on the desktop"
+```
+
+Gemma writes the file contents; the filename, directory and language are fixed
+by rule before the model is asked anything. Java and C# get PascalCase names
+because those languages resolve the type by filename. The file opens in VS Code
+when an editor was named, and VS Code is resolved to the real `Code.exe` rather
+than shelling out to the `code` shim.
+
+If the model returns nothing, no file is created — an empty file reported as
+success would be a lie.
+
+### Alarms and timers
+
+```
+"set a timer for 40 minutes"
+"set an alarm for tomorrow at 2:30 pm"
+"set an alarm for an hour and a half"
+"set a timer for twenty minutes to check the oven"
+"cancel the timer"   ·   "what timers do I have"   ·   "stop"
+```
+
+- Scheduled to the exact instant rather than polled, so a 30-second timer works
+- Persists across restarts, and a missed alarm is announced on return rather
+  than silently dropped
+- Fires with speech, a synthesised tone and a notification; each is independent,
+  so a suspended AudioContext does not suppress the other two
+- Repeats every five seconds until dismissed, stopping after two minutes
+- An unresolvable time is refused. "Set a timer for the pasta" asks how long
+  instead of choosing a duration
+
+> [!NOTE]
+> Alarms fire only while JARVIS is running. This is a renderer-side scheduler,
+> not an OS-level alarm.
+
+### Calendar and meetings
+
+```
+"connect my calendar"
+"what are my meetings"        ·   "when is my next meeting"
+"schedule a meeting"
+"create a meet room"
+"I know about the meeting"
+```
+
+Scheduling is a conversation. JARVIS asks what to call it, what it is about,
+when, how long, and who to invite, then reads the whole thing back before
+creating anything:
+
+```
+You    schedule a meeting
+JARVIS Of course, Sir. What should I call this meeting?
+You    project review
+JARVIS "Project review". And what is this meeting about?
+You    Q3 roadmap and hiring
+JARVIS Noted. When should I schedule it, Sir?
+You    tomorrow at 3 pm
+JARVIS 3:00 PM tomorrow. How long should it run?
+You    an hour
+JARVIS Anyone to invite? Say their email addresses, or "no one".
+You    no one
+JARVIS "Project review", 3:00 PM tomorrow for 1 hour, ending 4:00 PM.
+       About: Q3 roadmap and hiring. Shall I create it, Sir?
+You    yes
+JARVIS Creating it now, Sir.
+```
+
+- Background awareness escalates rather than repeats: one warning at 30 minutes,
+  then 10, 5 and 1, each phrased differently. Eight identical five-minute
+  reminders train you to ignore the one that matters
+- The calendar is fetched every five minutes, but checked against local clocks
+  every twenty seconds, so alert timing does not depend on when a network call
+  landed
+- A failed poll keeps the last known schedule. Announcing "no meetings today"
+  because one fetch failed would be a fabrication
+- Spoken email addresses work — "john at example dot com" — and an address that
+  cannot be parsed is refused rather than quietly inviting nobody
+- The model is asked for exactly one thing: a better title when you gave a
+  generic one, which you then confirm. Nothing that lands in your calendar is
+  model-decided
+
+> [!IMPORTANT]
+> Creating a **Google Meet link** requires a paid Google Workspace account. On a
+> personal Gmail the event is created without one — the API returns no link and
+> no error — and JARVIS says so rather than implying a link exists.
 
 ### Screen and documents
 
@@ -1025,7 +1148,39 @@ ALCHEMY_API_KEY=      # EVM RPC, portfolio, prices
 HELIUS_API_KEY=       # Solana RPC, assets, activity
 # DUNE_API_KEY=       # aggregate analytics
 # ARKHAM_API_KEY=     # entity labels, spoken with attribution
+
+GOOGLE_CLIENT_ID=     # Calendar and Meet
+GOOGLE_CLIENT_SECRET=
 ```
+
+### Connecting Google Calendar
+
+One-time setup, then `"connect my calendar"` does the rest.
+
+1. [Google Cloud Console](https://console.cloud.google.com/) -> new project
+2. **APIs & Services -> Library** -> enable **Google Calendar API**
+   (and **Google Meet API** if you want instant Meet rooms)
+3. **OAuth consent screen** -> External -> add yourself as a test user
+4. **Credentials -> Create credentials -> OAuth client ID ->
+   Application type: Desktop app**
+5. Put the client ID and secret in `.env`
+
+Then say **"connect my calendar"**. Your system browser opens Google's real
+consent screen; JARVIS receives the code on a loopback port and stores a refresh
+token in the app's user-data directory at mode `0600`. The renderer never sees a
+token.
+
+The client "secret" is not secret for a desktop app — Google's own installed-app
+flow puts it in the binary — which is why the exchange also uses PKCE. See
+[OAuth 2.0 for native apps](https://developers.google.com/identity/protocols/oauth2/native-app).
+
+To revoke: **"disconnect my calendar"**, or remove the app at
+[myaccount.google.com/permissions](https://myaccount.google.com/permissions).
+
+> [!IMPORTANT]
+> Programmatic **Google Meet link** creation requires a paid Google Workspace
+> account. With a personal Gmail, events are created normally but without a Meet
+> link, and JARVIS tells you so rather than pretending one exists.
 
 At startup the log states exactly what was found and what it can reach:
 
