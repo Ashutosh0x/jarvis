@@ -27,6 +27,10 @@ jobs:
     outputs:
       version: ${{ steps.v.outputs.version }}
       prerelease: ${{ steps.v.outputs.prerelease }}
+      # The tag being released. Published from here rather than read from
+      # github.ref_name downstream, which is the BRANCH on a workflow_dispatch
+      # and would tag the release "master".
+      tag: ${{ steps.v.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
 
@@ -37,6 +41,7 @@ jobs:
           [ "${{ github.event_name }}" = "workflow_dispatch" ] && TAG="${{ inputs.tag }}"
           VERSION="${TAG#v}"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
           # Semver, optionally with a prerelease suffix.
           if ! echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|nightly)\.[0-9]+)?$'; then
@@ -229,7 +234,10 @@ jobs:
         id: changelog
         shell: bash
         run: |
-          PREV=$(git describe --tags --abbrev=0 --exclude="${GITHUB_REF#refs/tags/}" 2>/dev/null || true)
+          # Same reason as tag_name: GITHUB_REF is the branch on a manual run,
+          # so excluding it would exclude nothing and `describe` would return
+          # the tag being released, producing an empty changelog.
+          PREV=$(git describe --tags --abbrev=0 --exclude="${{ needs.verify.outputs.tag }}" 2>/dev/null || true)
           if [ -n "$PREV" ]; then
             RANGE="$PREV..HEAD"
             echo "changes since $PREV"
@@ -268,7 +276,7 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ needs.verify.outputs.tag }}
           name: Jarvis ${{ needs.verify.outputs.version }}
           body_path: NOTES.md
           prerelease: ${{ needs.verify.outputs.prerelease == 'true' }}
