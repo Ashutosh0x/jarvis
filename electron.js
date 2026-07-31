@@ -128,19 +128,27 @@ function validatePath(requestedPath) {
         path.join(homedir, 'OneDrive', 'Pictures')
     ];
 
-    // Normalize and resolve the path
+    // Reject traversal BEFORE resolving. Checking afterwards would compare an
+    // already-collapsed path and miss what the caller actually asked for.
+    if (requestedPath.includes('..') || requestedPath.includes('%')) {
+        throw new Error('Invalid path: Path traversal not allowed');
+    }
+
     const resolvedPath = path.resolve(requestedPath);
 
-    // Check if path is within allowed directories
-    const isAllowed = allowedRoots.some(root => resolvedPath.startsWith(root));
+    // Containment must be tested at a path-SEPARATOR boundary, not by prefix.
+    // A bare startsWith lets ~/Desktop-evil through as if it were ~/Desktop,
+    // because the string genuinely does start with the allowed root. That was
+    // survivable while these operations were read-only; it is not now that the
+    // same validator gates writing files.
+    const isAllowed = allowedRoots.some(root => {
+        const normalisedRoot = path.resolve(root);
+        if (resolvedPath === normalisedRoot) return true;
+        return resolvedPath.startsWith(normalisedRoot + path.sep);
+    });
 
     if (!isAllowed) {
         throw new Error(`Access denied: Path '${requestedPath}' is outside allowed directories`);
-    }
-
-    // Block path traversal attempts
-    if (requestedPath.includes('..') || requestedPath.includes('%')) {
-        throw new Error('Invalid path: Path traversal not allowed');
     }
 
     return resolvedPath;
@@ -625,6 +633,58 @@ ipcMain.handle('file-operation', async (event, operation, ...args) => {
                 return { success: true, path: folderPath };
             }
 
+            case 'write-file': {
+                // Creating and authoring files by voice. Confined by
+                // validatePath to the same user folders as every other
+                // operation here — "any path I say" means any path inside
+                // Desktop/Documents/Downloads/Pictures/Videos/Music, not any
+                // path on the disk.
+                const filePath = validatePath(args[0]);
+                const content = String(args[1] ?? '');
+                const { overwrite = false } = args[2] || {};
+
+                // A misheard filename must not silently destroy an existing
+                // file. The caller has to ask for overwrite explicitly, and
+                // the voice path never does.
+                if (!overwrite) {
+                    try {
+                        await fs.access(filePath);
+                        return {
+                            success: false,
+                            code: 'EEXIST',
+                            path: filePath,
+                            error: `${path.basename(filePath)} already exists.`
+                        };
+                    } catch { /* absent, which is what we want */ }
+                }
+
+                // Refuse types whose only purpose is to be executed. Voice is a
+                // lossy channel and a misheard filename should not be able to
+                // leave something runnable on the Desktop.
+                //
+                // Source files ARE allowed — .js, .ts, .py, .sh, .java and the
+                // rest. Writing source is the entire point of the feature, and
+                // a .js file is only dangerous when something runs it, which
+                // Jarvis never does. The list below is things nobody authors by
+                // dictation and Windows will happily launch on a double-click.
+                const ext = path.extname(filePath).toLowerCase();
+                const RUNNABLE = new Set([
+                    '.exe', '.dll', '.com', '.scr', '.msi', '.cpl', '.pif',
+                    '.lnk', '.reg', '.hta', '.vbs', '.vbe', '.jse', '.wsf',
+                    '.wsh', '.bat', '.cmd'
+                ]);
+                if (RUNNABLE.has(ext)) {
+                    throw new Error(
+                        `Refusing to write '${ext}' by voice — that type runs when opened. ` +
+                        `Source files (.js, .py, .java, .sh, …) are fine.`
+                    );
+                }
+
+                await fs.mkdir(path.dirname(filePath), { recursive: true });
+                await fs.writeFile(filePath, content, 'utf-8');
+                return { success: true, path: filePath, bytes: Buffer.byteLength(content) };
+            }
+
             case 'delete-file': {
                 const filePath = validatePath(args[0]);
                 // Extra safety: only allow deletion of files in Downloads
@@ -682,6 +742,93 @@ function resolveChromePath() {
     _chromePathCache = candidates.find((p) => { try { return fsSync.existsSync(p); } catch { return false; } }) || null;
     return _chromePathCache;
 }
+
+// Resolve VS Code the same way, and for the same reason: `code` on Windows is
+// a .cmd shim, and Node refuses to spawn .cmd without a shell. Going through a
+// shell to open a user-named file is exactly the injection surface worth
+// avoiding, so probe for the real Code.exe and hand it an argument array.
+let _codePathCache;
+function resolveVsCodePath() {
+    if (_codePathCache !== undefined) return _codePathCache;
+    const home = os.homedir();
+    const candidates = [
+        path.join(home, 'AppData', 'Local', 'Programs', 'Microsoft VS Code', 'Code.exe'),
+        'C:\\Program Files\\Microsoft VS Code\\Code.exe',
+        'C:\\Program Files (x86)\\Microsoft VS Code\\Code.exe',
+        // macOS and Linux, for when this stops being Windows-only.
+        '/Applications/Visual Studio Code.app/Contents/MacOS/Electron',
+        '/usr/share/code/code',
+        '/usr/bin/code',
+    ];
+    _codePathCache = candidates.find((p) => { try { return fsSync.existsSync(p); } catch { return false; } }) || null;
+    return _codePathCache;
+}
+
+/**
+ * Open an allowlisted editor on a specific file.
+ *
+ * Separate from `open-app` because that one is fire-and-forget and takes no
+ * arguments. This one has to report back — the voice flow writes a file and
+ * then says what happened, and "I opened it" must not be said when the editor
+ * is not installed.
+ *
+ * The path is run through validatePath, so this cannot be used to open an
+ * arbitrary file on disk in an editor.
+ */
+ipcMain.handle('open-editor', async (event, requestedPath, editor = 'vscode') => {
+    try {
+        const filePath = validatePath(requestedPath);
+        const which = String(editor).toLowerCase().replace(/[^a-z]/g, '');
+
+        if (which === 'vscode') {
+            const code = resolveVsCodePath();
+            if (code) {
+                // Argument array, never a shell string.
+                execFile(code, [filePath], (error) => {
+                    if (error) console.warn('VS Code launch warning:', error.message);
+                });
+                return { success: true, editor: 'vscode', path: filePath };
+            }
+            // Not installed. Say so rather than silently opening something else
+            // and letting the user believe VS Code is running.
+            const opened = await shell.openPath(filePath);
+            return {
+                success: !opened,
+                editor: 'default',
+                path: filePath,
+                note: 'VS Code was not found, so this opened in the default editor.',
+                error: opened || undefined,
+            };
+        }
+
+        if (which === 'notepad') {
+            execFile('notepad.exe', [filePath], (error) => {
+                if (error) console.warn('Notepad launch warning:', error.message);
+            });
+            return { success: true, editor: 'notepad', path: filePath };
+        }
+
+        if (which === 'default') {
+            const opened = await shell.openPath(filePath);
+            return { success: !opened, editor: 'default', path: filePath, error: opened || undefined };
+        }
+
+        return { success: false, error: `Editor '${editor}' is not allowed.` };
+    } catch (error) {
+        return { success: false, error: error.message };
+    }
+});
+
+/** Reveal a file or folder in the OS file manager. */
+ipcMain.handle('reveal-in-folder', async (event, requestedPath) => {
+    try {
+        const target = validatePath(requestedPath);
+        shell.showItemInFolder(target);
+        return { success: true, path: target };
+    } catch (error) {
+        return { success: false, error: error.message };
+    }
+});
 
 // Website Opening Handler - SECURITY: validateUrl() enforces http/https only.
 // Opens in Chrome specifically (the user's default browser preference); the URL

@@ -27,6 +27,7 @@ import * as netInspect from './services/netInspect.js';
 import * as netDiscovery from './services/netDiscovery.js';
 import * as sysInspect from './services/sysInspect.js';
 import * as inputControl from './services/inputControl.js';
+import { parseFileCommand, inferCodeFilename } from './services/fileCommands.js';
 import { LocalVoiceService } from './services/voiceService.js';
 import { NeuralTTSService } from './services/ttsService.js';
 import { guardOutput } from './services/groundingGuard.js';
@@ -1498,6 +1499,14 @@ class Jarvis {
            asking for a search started typing instead. Anything that reached the
            local model instead was answered with invented citations, which is
            what this exists to stop. */
+        /* Filesystem authoring. Sits BEFORE web search deliberately: "write a
+           quicksort in python" is search-shaped and would otherwise be sent to
+           the web instead of producing a file. Rule-based (fileCommands.js) and
+           returns null unless the phrasing is unambiguous, so a sentence that
+           merely mentions a folder still reaches conversation. */
+        const fileCmd = parseFileCommand(cmd);
+        if (fileCmd) return { intent: 'FILE_COMMAND', command: fileCmd };
+
         const websearch = parseWebSearchQuery(cmd);
         if (websearch) return { intent: 'WEB_SEARCH', query: websearch.query };
 
@@ -1865,6 +1874,9 @@ class Jarvis {
                     break;
                 case 'NEWS_QUERY':
                     await this.handleNewsQuery(intent.topic);
+                    break;
+                case 'FILE_COMMAND':
+                    await this.handleFileCommand(intent.command);
                     break;
                 case 'WEB_SEARCH':
                     await this.handleWebSearch(intent.query);
@@ -5313,6 +5325,192 @@ class Jarvis {
      * only — nothing is passed to the model to summarise, because a model
      * summarising search results is how the fabricated citations got in.
      */
+    /**
+     * Spoken file and folder authoring.
+     *
+     * The command has already been parsed by rules (fileCommands.js) — the
+     * filename, the location and the language are all fixed before we get
+     * here. This method only carries them out, and for `write-code` asks the
+     * local model for the file CONTENTS.
+     *
+     * Every path goes through the main process's validatePath, so the worst a
+     * misheard command can do is create a badly-named file in one of the
+     * user's own folders.
+     */
+    async handleFileCommand(command) {
+        const api = window.electronAPI;
+        if (!api?.fileOperation) {
+            this.speak('File operations are not available in this environment.');
+            return;
+        }
+
+        const root = await this._resolveLocation(command.location);
+        if (!root) {
+            this.speak(`I could not find your ${command.location} folder, Sir.`);
+            return;
+        }
+
+        try {
+            if (command.kind === 'create-folder') {
+                const res = await api.fileOperation('create-folder', this._join(root, command.name));
+                if (!res?.success) throw new Error(res?.error || 'Could not create the folder.');
+                this.displayText(`Created ${command.name} in ${command.location}.`, null);
+                this.speak(`Created the folder ${command.name} on your ${command.location}.`);
+                return;
+            }
+
+            if (command.kind === 'create-file') {
+                const res = await api.fileOperation(
+                    'write-file', this._join(root, command.name), command.content ?? ''
+                );
+                if (res?.code === 'EEXIST') {
+                    // Never silently overwrite something the user already has.
+                    this.speak(`${command.name} already exists on your ${command.location}. I have not touched it.`);
+                    return;
+                }
+                if (!res?.success) throw new Error(res?.error || 'Could not create the file.');
+                this.displayText(`Created ${command.name} in ${command.location}.`, null);
+                this.speak(`Created ${command.name} on your ${command.location}.`);
+                return;
+            }
+
+            if (command.kind === 'write-code') {
+                await this._writeCodeFile(command, root);
+            }
+        } catch (e) {
+            console.error('File command failed:', e);
+            this.speak(`I could not do that, Sir. ${e.message}`);
+        }
+    }
+
+    _join(dir, name) {
+        return `${String(dir).replace(/[\\/]+$/, '')}\\${name}`;
+    }
+
+    /**
+     * Absolute path for a spoken location.
+     *
+     * Probed, not hardcoded. Windows redirects Desktop/Documents/Pictures under
+     * OneDrive when it is enabled, and a guess-map that assumes one layout is
+     * exactly the kind of thing that works on the author's machine and nowhere
+     * else. The probe asks the filesystem which one exists.
+     */
+    async _resolveLocation(location) {
+        this._locationCache = this._locationCache || {};
+        if (this._locationCache[location]) return this._locationCache[location];
+
+        const info = await window.electronAPI.getOsInfo?.().catch(() => null);
+        const home = info?.homedir;
+        if (!home) return null;
+
+        const candidates = {
+            desktop: [`${home}\\OneDrive\\Desktop`, `${home}\\Desktop`],
+            documents: [`${home}\\OneDrive\\Documents`, `${home}\\Documents`],
+            pictures: [`${home}\\OneDrive\\Pictures`, `${home}\\Pictures`],
+            downloads: [`${home}\\Downloads`],
+            videos: [`${home}\\Videos`],
+            music: [`${home}\\Music`],
+        }[location];
+        if (!candidates) return null;
+
+        for (const dir of candidates) {
+            const probe = await window.electronAPI.fileOperation('list-files', dir).catch(() => null);
+            if (probe?.success) {
+                this._locationCache[location] = dir;
+                return dir;
+            }
+        }
+        return null;
+    }
+
+    /** Ask the local model for a file's contents, then write and open it. */
+    async _writeCodeFile(command, root) {
+        const filename = command.name || inferCodeFilename(command.prompt, command.language);
+        const target = this._join(root, filename);
+
+        this.displayText(`Writing ${filename}...`, null);
+        this.speak(`Writing ${command.prompt} in ${command.language.label}.`);
+
+        // The model writes ONLY the file body. It does not choose the filename,
+        // the directory, or whether to write at all — the rules decided those
+        // before this ran, which is what keeps a misheard word from becoming a
+        // file in an unexpected place.
+        const stem = filename.replace(/\.[^.]+$/, '');
+        const instructions = [
+            `You are writing the complete contents of one ${command.language.label} source file.`,
+            'Output ONLY code. No markdown fences, no commentary before or after.',
+            command.language.ext === 'java' || command.language.ext === 'cs'
+                ? `The public class MUST be named ${stem} so the file compiles.`
+                : '',
+            'Start with a one-line comment saying what it does. Make it runnable as written.',
+        ].filter(Boolean).join(' ');
+
+        let code = '';
+        try {
+            code = await generateContentLocal(
+                [{ role: 'user', parts: [{ text: `${instructions}\n\nWrite: ${command.prompt}` }] }],
+                null,
+                { temperature: 0.2 }
+            );
+        } catch (e) {
+            console.error('Local model failed while writing code:', e);
+            this.speak('The local model is not responding, so I have not created the file.');
+            return;
+        }
+
+        code = this._stripCodeFences(code);
+        if (!code.trim()) {
+            // Creating an empty file and announcing success would be a lie.
+            this.speak('The model returned nothing, so I have not created the file.');
+            return;
+        }
+
+        const res = await window.electronAPI.fileOperation('write-file', target, code);
+        if (res?.code === 'EEXIST') {
+            this.speak(`${filename} already exists on your ${command.location}. I have not overwritten it.`);
+            return;
+        }
+        if (!res?.success) {
+            this.speak(`I could not write the file, Sir. ${res?.error || ''}`);
+            return;
+        }
+
+        this.displayText(`Wrote ${filename} to ${command.location}.`, null);
+
+        if (command.openIn) {
+            const opened = await window.electronAPI.openEditor?.(target, command.openIn);
+            if (opened?.success) {
+                const where = opened.editor === 'vscode' ? 'VS Code' : opened.editor;
+                this.speak(`${filename} is written and open in ${where}.`);
+            } else {
+                this.speak(`${filename} is on your ${command.location}, but I could not open the editor.`);
+            }
+            return;
+        }
+        this.speak(`Written to your ${command.location} as ${filename}.`);
+    }
+
+    /**
+     * Strip markdown fences the model adds despite being told not to.
+     *
+     * Instructing a model is not the same as it complying, and a fence on line
+     * one makes the file fail to compile. Measured, not assumed: Gemma emits
+     * them for code requests most of the time.
+     */
+    _stripCodeFences(text) {
+        let out = String(text || '').trim();
+        const FENCE = String.fromCharCode(96, 96, 96);
+        if (!out.startsWith(FENCE)) return out;
+
+        const firstNewline = out.indexOf('\n');
+        if (firstNewline === -1) return '';
+        out = out.slice(firstNewline + 1);
+
+        const closing = out.lastIndexOf(FENCE);
+        if (closing !== -1) out = out.slice(0, closing);
+        return out.trim();
+    }
+
     async handleWebSearch(query) {
         if (!window.electronAPI?.webSearch) {
             this.speak('Web search is not available in this environment.');

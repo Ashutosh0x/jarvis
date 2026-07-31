@@ -189,6 +189,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
     predictionWatchlistRemove: (id) => ipcRenderer.invoke('prediction-watchlist-remove', id),
     onPredictionAlert: createSafeListener('prediction-alert'),
     fileOperation: (operation, ...args) => ipcRenderer.invoke('file-operation', operation, ...args),
+    // Opening a written file in an editor, and revealing it in the file
+    // manager. Both validate the path in the main process; the renderer cannot
+    // reach outside the allowed user folders through either.
+    openEditor: (filePath, editor) => ipcRenderer.invoke('open-editor', filePath, editor),
+    revealInFolder: (filePath) => ipcRenderer.invoke('reveal-in-folder', filePath),
     openWebsite: (url) => ipcRenderer.send('open-website', url),
     readClipboard: () => ipcRenderer.invoke('read-clipboard'),
     writeClipboard: (text) => ipcRenderer.invoke('write-clipboard', text),
