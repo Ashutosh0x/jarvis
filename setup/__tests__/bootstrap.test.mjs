@@ -11,8 +11,9 @@ import { fileURLToPath } from 'node:url';
 
 const require = createRequire(import.meta.url);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const { planSteps } = require(path.join(root, 'bootstrap.js'));
-const { chooseModels, ALLOWED_HOSTS } = require(path.join(root, 'install.js'));
+const { planSteps, describeOutcome } = require(path.join(root, 'bootstrap.js'));
+const { chooseModels, ALLOWED_HOSTS, modelMatches, hasModel, REQUIRED_MODELS } =
+    require(path.join(root, 'install.js'));
 
 let pass = 0, fail = 0;
 const check = (n, c) => { c ? pass++ : fail++; console.log(`${c ? 'PASS' : 'FAIL'}  ${n}`); };
@@ -83,20 +84,39 @@ const ids = (d) => planSteps(d).steps.filter((s) => !s.skip).map((s) => s.id);
     check('an existing jarvis command is not replaced', !todo.includes('terminal-command'));
 }
 
-// --- idempotence: model tags with a suffix still count as present ----------
+// --- idempotence: an untagged request is satisfied by :latest --------------
 {
     // Ollama reports `nomic-embed-text:latest`, and the required name is
     // `nomic-embed-text`. An exact-match check here would re-download a
     // 274 MB model on every single launch, forever.
+    //
+    // This case USED to be asserted with `gemma3:4b-it-q4_K_M` standing in for
+    // `gemma3:4b`, which quietly asserted the opposite of what setup needs. A
+    // quantised variant is a SEPARATE tag: `ollama list` on this machine shows
+    // exactly `gemma3:4b`, and the app asks Ollama for that literal string
+    // (ragService: `s.localModel || 'gemma3:4b'`). Accepting a different tag as
+    // "already present" would skip the install and leave the user at the
+    // "is 'gemma3:4b' pulled?" error the app already has a handler for.
     const todo = ids(machine({
+        ollama: {
+            installed: true, apiUp: true, host: 'http://127.0.0.1:11434',
+            models: ['gemma3:4b', 'nomic-embed-text:latest'],
+        },
+        uv: { installed: true },
+    }));
+    check('an untagged requirement is satisfied by the :latest Ollama reports',
+        !todo.some((i) => i.startsWith('model:')));
+
+    // The other half, stated as its own claim rather than bundled in above.
+    const quantOnly = ids(machine({
         ollama: {
             installed: true, apiUp: true, host: 'http://127.0.0.1:11434',
             models: ['gemma3:4b-it-q4_K_M', 'nomic-embed-text:latest'],
         },
         uv: { installed: true },
     }));
-    check('a suffixed model tag counts as already present',
-        !todo.some((i) => i.startsWith('model:')));
+    check('a quantised variant does NOT stand in for the tag the app calls',
+        quantOnly.includes('model:gemma3:4b'));
 }
 
 // --- partial state resumes rather than restarting --------------------------
@@ -138,6 +158,102 @@ const ids = (d) => planSteps(d).steps.filter((s) => !s.skip).map((s) => s.id);
     }));
     check('old system Python is not treated as a problem when uv is present',
         !todo.includes('uv'));
+}
+
+// --- "is this model already here?" -----------------------------------------
+//
+// There were THREE copies of this question in the setup code, written
+// independently, and they disagreed. Both real failures are pinned here.
+{
+    // What Ollama actually reports on this machine.
+    const listed = ['gemma3:4b', 'nomic-embed-text:latest'];
+
+    // BUG 1, observed live during `jarvis repair`: the required name is
+    // `nomic-embed-text`, with no tag, and Ollama lists `:latest`. The puller
+    // compared split(':')[1] — undefined against 'latest' — so it never matched
+    // and re-issued a pull on EVERY run, then reported a download that had not
+    // happened.
+    check('a tagless request matches the :latest Ollama reports',
+        hasModel(listed, 'nomic-embed-text'));
+    check('an exact name:tag request matches', hasModel(listed, 'gemma3:4b'));
+
+    // BUG 2: the planner used startsWith, so a longer model whose name merely
+    // BEGINS with the wanted one counted as present — and the real dependency
+    // would be silently skipped.
+    check('a different model with a shared name prefix is NOT a match',
+        !hasModel(['nomic-embed-text-v2:latest'], 'nomic-embed-text'));
+    check('a longer tag with a shared prefix is not a match',
+        !modelMatches('gemma3:4b-it-q8', 'gemma3:4b'));
+
+    // A tag that was asked for must be honoured.
+    check('the wrong tag of the right model is not a match',
+        !hasModel(['gemma3:12b'], 'gemma3:4b'));
+    check('a quantised variant is a distinct tag, not the one requested',
+        !modelMatches('gemma3:4b-it-q4_K_M', 'gemma3:4b'));
+    check('any tag satisfies a tagless request',
+        modelMatches('gemma3:4b-it-q4_K_M', 'gemma3'));
+
+    // Ollama can report a digest instead of a tag; it identifies the blob, not
+    // the tag, so it must not defeat the name comparison.
+    check('a digest suffix still matches the name', modelMatches('gemma3:4b@sha256:abc', 'gemma3:4b'));
+
+    check('an empty list matches nothing', !hasModel([], 'gemma3:4b'));
+    check('a missing list does not throw', hasModel(undefined, 'gemma3:4b') === false);
+
+    // The list every part of setup reads.
+    check('the required models are declared once and shared',
+        Array.isArray(REQUIRED_MODELS) && REQUIRED_MODELS.length === 2
+        && chooseModels({ totalRamGB: 16 }).required.join() === REQUIRED_MODELS.join());
+}
+
+// --- a step must not claim work it did not do ------------------------------
+//
+// The most common real path: Ollama is installed but not running yet. Its API
+// is down at detection time, so the model list is empty for a reason that is
+// NOT "no models" — both model steps get planned, then find the model already
+// on disk. Observed on this machine during `jarvis repair`: it printed
+// "Downloading the AI model (gemma3:4b) ✓" having downloaded nothing.
+{
+    const down = machine({
+        ollama: { installed: true, apiUp: false, host: 'http://127.0.0.1:11434', models: [] },
+        uv: { installed: true },
+    });
+    const modelStep = planSteps(down).steps.find((s) => s.id === 'model:gemma3:4b');
+
+    check('with the API down a model step is described as a check, not a download',
+        /^Checking the AI model/.test(modelStep.label));
+    check('with the API down the model step still runs', modelStep.skip === false);
+
+    // And when it turns out the model was there all along, say that.
+    const asDone = describeOutcome(modelStep, { status: 'present', model: 'gemma3:4b' });
+    check('a model already on disk is reported as present, not downloaded',
+        asDone.status === 'skipped' && /already present/.test(asDone.label));
+    check('the report never says "Downloading" for work that did not happen',
+        !/Downloading/.test(asDone.label));
+
+    // The API being up is the case where the planner CAN see, so the label is
+    // allowed to promise a download.
+    const up = machine({
+        ollama: { installed: true, apiUp: true, host: 'http://127.0.0.1:11434', models: [] },
+        uv: { installed: true },
+    });
+    check('with the API up a genuinely missing model says Downloading',
+        /^Downloading the AI model/.test(
+            planSteps(up).steps.find((s) => s.id === 'model:gemma3:4b').label));
+}
+
+// --- outcome reporting, in general -----------------------------------------
+{
+    const step = { label: 'Starting the local model runtime', skipLabel: 'Local model runtime already running' };
+    check('a runtime already up is reported as already running',
+        describeOutcome(step, { status: 'running' }).status === 'skipped');
+    check('a runtime this run actually started is reported as done',
+        describeOutcome(step, { status: 'started' }).status === 'done');
+    // The honesty rule that predates this: an incomplete step is never done.
+    check('a manual step stays manual',
+        describeOutcome(step, { status: 'manual', detail: 'x' }).status === 'manual');
+    check('a step with no skipLabel falls back to its own label',
+        describeOutcome({ label: 'Only label' }, { status: 'present' }).label === 'Only label');
 }
 
 // --- disk ------------------------------------------------------------------

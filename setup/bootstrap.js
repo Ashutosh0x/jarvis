@@ -99,13 +99,18 @@ async function needsBootstrap({ version } = {}) {
     // is a missing piece of the install, not a preference.
     if (!current.command?.available) missing.push('terminal-command');
 
-    const models = current.ollama.models || [];
-    const hasChat = models.some((m) => /^gemma3:4b/.test(m));
-    const hasEmbed = models.some((m) => /^nomic-embed-text/.test(m));
     // Only claim a model is missing when Ollama could actually be asked. With
     // the API down the list is empty for a reason that is not "no models".
-    if (current.ollama.apiUp && !hasChat) missing.push('model:gemma3:4b');
-    if (current.ollama.apiUp && !hasEmbed) missing.push('model:nomic-embed-text');
+    //
+    // Same predicate as the planner and the puller — this was a third,
+    // independently written copy (an anchored regex), and three checks that can
+    // disagree about "is this installed" is three chances to loop forever or to
+    // skip something absent.
+    if (current.ollama.apiUp) {
+        for (const model of install.REQUIRED_MODELS) {
+            if (!install.hasModel(current.ollama.models, model)) missing.push(`model:${model}`);
+        }
+    }
 
     return {
         needed: missing.length > 0 || !state || (version && state.version !== version),
@@ -160,12 +165,22 @@ function planSteps(d) {
         skipLabel: 'Speech engine runtime already installed',
     });
 
-    const present = new Set(d.ollama.models || []);
+    /* With the API down the model list is empty for a reason that is not "no
+       models", so the step has to be planned — but it is a CHECK that may turn
+       into a download, not a download. Saying "Downloading the AI model" while
+       the machine already has it, on the most common path there is (Ollama
+       installed, simply not running yet), describes work that is not happening. */
+    const canSeeModels = Boolean(d.ollama.apiUp);
     for (const model of models.required) {
         steps.push({
             id: `model:${model}`,
-            label: `Downloading the AI model (${model})`,
-            skip: [...present].some((m) => m.startsWith(model)),
+            label: canSeeModels
+                ? `Downloading the AI model (${model})`
+                : `Checking the AI model (${model})`,
+            // install.hasModel, not a local startsWith: a prefix of a name is a
+            // different model, and skipping on one hides a genuinely absent
+            // dependency. See modelMatches for the two bugs this replaced.
+            skip: canSeeModels && install.hasModel(d.ollama.models, model),
             skipLabel: `AI model already present (${model})`,
             model,
         });
@@ -266,7 +281,7 @@ async function bootstrap({ onEvent = () => {}, dryRun = false, version, packaged
                 onLine: (text) => emit('note', { level: 'debug', text }),
             });
             results[step.id] = outcome;
-            emit('step', { ...base, status: outcome.status === 'manual' ? 'manual' : 'done', detail: outcome.detail });
+            emit('step', { ...base, ...describeOutcome(step, outcome) });
             // Something the user has to do themselves for the step to take
             // effect — said at the moment it becomes true, not buried in a
             // summary line at the end.
@@ -304,6 +319,35 @@ async function bootstrap({ onEvent = () => {}, dryRun = false, version, packaged
 
     emit('done', { ok: summary.ok, summary });
     return summary;
+}
+
+/**
+ * How a finished step should be shown.
+ *
+ * PURE, and separate from the loop because it encodes a rule worth testing: a
+ * step can only be PLANNED from what was measurable before it ran. With
+ * Ollama's API down at detection time the model list is empty for a reason
+ * that is not "no models", so both model steps get planned — and then find the
+ * model already on disk.
+ *
+ * Reporting that as "Downloading the AI model ✓" claims a download that never
+ * happened, which is the same class of untruth as trusting an installer's exit
+ * code. A step that found its work already done says so, borrowing the label
+ * the planner would have used had it been able to see.
+ *
+ * @param {{label:string, skipLabel?:string}} step
+ * @param {{status:string, detail?:string}} outcome
+ */
+function describeOutcome(step, outcome) {
+    // 'present' — nothing to do. 'running' — startOllama found it already up.
+    const alreadyDone = outcome.status === 'present' || outcome.status === 'running';
+    return {
+        label: alreadyDone ? (step.skipLabel || step.label) : step.label,
+        status: outcome.status === 'manual' ? 'manual'
+            : alreadyDone ? 'skipped'
+            : 'done',
+        detail: outcome.detail,
+    };
 }
 
 async function runStep(step, { detected, onProgress, onLine, packagedExe = null }) {
@@ -379,6 +423,6 @@ async function runStep(step, { detected, onProgress, onLine, packagedExe = null 
 }
 
 module.exports = {
-    needsBootstrap, bootstrap, planSteps, measure,
+    needsBootstrap, bootstrap, planSteps, measure, describeOutcome,
     stateDir, readState, writeState, STATE_FILE, INSTALL_ROOT,
 };

@@ -29,6 +29,14 @@ const { Readable } = require('node:stream');
 
 const detect = require('./detect.js');
 
+/**
+ * The two models Jarvis actually requires: one to answer, one to embed for
+ * memory search. Declared once — the planner, the puller and the "do we still
+ * need to bootstrap" check all read this list, and a second copy is a second
+ * thing to forget when it changes.
+ */
+const REQUIRED_MODELS = ['gemma3:4b', 'nomic-embed-text'];
+
 /** Hosts an installer may be fetched from. Anything else is refused. */
 const ALLOWED_HOSTS = new Set([
     'ollama.com',
@@ -224,6 +232,49 @@ async function startOllama({ onLine, timeoutMs = 30000 } = {}) {
 }
 
 /**
+ * Is `listed` (a name Ollama reported) the model `wanted` asks for?
+ *
+ * ONE predicate, used by both the planner and the puller. They used to carry
+ * their own, and the two disagreed — which is the only reason this is a named,
+ * tested function rather than an inline expression:
+ *
+ *   planner: `listed.startsWith(wanted)`
+ *     says nomic-embed-text-v2:latest IS nomic-embed-text. A prefix of a name
+ *     is a different model, so this skips installing something that is absent.
+ *
+ *   puller: `listed.split(':')[1] === wanted.split(':')[1]`
+ *     `nomic-embed-text` has no tag, so the right side is undefined while
+ *     Ollama reports `:latest`. Never matched, so a tagless model was pulled
+ *     again on EVERY run — a network round-trip per launch, reported as a
+ *     download that did not happen.
+ *
+ * The rule: names must be equal, and an unspecified tag means "any tag".
+ */
+function modelMatches(listed, wanted) {
+    if (listed === wanted) return true;
+
+    // `name:tag`, `name@sha256:...`, or bare `name`. The digest is an identity
+    // for the exact blob, not a tag, so it is stripped before comparing.
+    const parts = (s) => {
+        const noDigest = String(s).split('@')[0];
+        const colon = noDigest.indexOf(':');
+        return colon === -1
+            ? { name: noDigest, tag: null }
+            : { name: noDigest.slice(0, colon), tag: noDigest.slice(colon + 1) };
+    };
+
+    const l = parts(listed);
+    const w = parts(wanted);
+    if (l.name !== w.name) return false;
+    return w.tag == null || l.tag === w.tag;
+}
+
+/** Does anything in `listed` satisfy `wanted`? */
+function hasModel(listed, wanted) {
+    return (listed || []).some((m) => modelMatches(m, wanted));
+}
+
+/**
  * Pull a model, reporting progress.
  *
  * Uses the HTTP API rather than the CLI so progress is structured rather than
@@ -235,11 +286,9 @@ async function pullModel(model, { host, onProgress, onLine } = {}) {
     const existing = await detect.ollama(base);
     if (!existing.apiUp) return { status: 'failed', detail: 'Ollama is not running.' };
 
-    // Never re-download. Tags are matched loosely because `gemma3:4b` is listed
-    // as `gemma3:4b` but sometimes carries a digest suffix.
-    const has = existing.models.some((m) => m === model || m.startsWith(`${model}@`)
-        || m.split(':')[0] === model.split(':')[0] && m.split(':')[1] === model.split(':')[1]);
-    if (has) return { status: 'present', model };
+    // Never re-download. Same predicate the planner uses, so the two cannot
+    // disagree about whether this model is already here.
+    if (hasModel(existing.models, model)) return { status: 'present', model };
 
     onLine?.(`Downloading ${model}`);
     const res = await fetch(`${base}/api/pull`, {
@@ -281,8 +330,11 @@ async function pullModel(model, { host, onProgress, onLine } = {}) {
         }
     }
 
+    /* Confirm by re-listing, and confirm the model that was ASKED for. The old
+       check matched on the name before the colon, so a failed `gemma3:4b` pull
+       on a machine that happened to hold `gemma3:12b` reported success. */
     const after = await detect.ollama(base);
-    return after.models.some((m) => m.startsWith(model.split(':')[0]))
+    return hasModel(after.models, model)
         ? { status: 'pulled', model }
         : { status: 'failed', detail: `${model} did not appear after pulling.` };
 }
@@ -343,7 +395,7 @@ async function installUv({ onLine, cacheDir } = {}) {
  * replaced and feels broken rather than clever.
  */
 function chooseModels({ totalRamGB, vramGB, freeDiskGB } = {}) {
-    const required = ['gemma3:4b', 'nomic-embed-text'];
+    const required = [...REQUIRED_MODELS];
     const ram = Number(totalRamGB) || 0;
     const vram = Number(vramGB) || 0;
     /* `Number(null)` is 0, not NaN — and detect.js returns null for free disk
@@ -391,4 +443,5 @@ module.exports = {
     download, sha256, runStreaming,
     ollamaSource, installOllama, startOllama, pullModel,
     installUv, chooseModels, ALLOWED_HOSTS,
+    modelMatches, hasModel, REQUIRED_MODELS,
 };
