@@ -30,6 +30,11 @@ import * as inputControl from './services/inputControl.js';
 import { parseFileCommand, inferCodeFilename } from './services/fileCommands.js';
 import { parseAlarmCommand, parseAlarmCancel, parseAlarmList, formatDuration, formatClock } from './services/alarmParser.js';
 import { AlarmService } from './services/alarmService.js';
+
+/* How long after launch a missing TTS server is treated as "still starting"
+   rather than "broken". The Python server plus edge-tts import lands well
+   inside this on a cold boot. */
+const TTS_STARTUP_GRACE_MS = 20000;
 import { MeetingScheduler } from './services/meetingScheduler.js';
 import { MeetingMonitor, describeAlert } from './services/meetingMonitor.js';
 import { LocalVoiceService } from './services/voiceService.js';
@@ -129,9 +134,16 @@ class Jarvis {
             onSpeakEnd: () => { this.ttsActive = false; },
             onStatus: (s) => console.log('NeuralTTS:', s),
         });
+        this._startedAt = Date.now();
         this.neuralTTS.connect().then(ok => {
-            if (ok) console.log('NeuralTTS: edge-tts connected — natural voice active (NOT local)');
-            else console.log('NeuralTTS: server unavailable — using SAPI fallback');
+            if (ok) {
+                // Recovered — clear the latch so a LATER outage warns again
+                // instead of being suppressed by a startup-time warning.
+                this._warnedNoVoice = false;
+                console.log('NeuralTTS: edge-tts connected — natural voice active (NOT local)');
+            } else {
+                console.log('NeuralTTS: server not up yet — retrying with backoff');
+            }
         }).catch(() => {});
 
         /* Learned timeout budgets survive a restart. Without this every launch
@@ -978,7 +990,14 @@ class Jarvis {
      */
     _systemVoiceAllowed() {
         if (!this.settings.get('systemVoiceFallback')) {
-            if (!this._warnedNoVoice) {
+            /* Silent during startup. The TTS server is a Python process that
+               takes a few seconds to spawn, so the first speech attempt of
+               every launch legitimately finds it missing. Warning there told
+               the user the voice was broken when it was merely not up yet —
+               and because the flag latched, the message stayed on screen long
+               after the voice had recovered. */
+            const uptimeMs = Date.now() - (this._startedAt || Date.now());
+            if (uptimeMs > TTS_STARTUP_GRACE_MS && !this._warnedNoVoice) {
                 this._warnedNoVoice = true;
                 console.warn('Neural TTS is unavailable and the system-voice fallback is off, '
                     + 'so replies are text-only. Enable systemVoiceFallback to use a system voice.');

@@ -56,6 +56,7 @@ export class NeuralTTSService {
         this._drainTimer = null;
         this._lastUnderruns = 0;
         this._lastDrainConsumed = 0;
+        this._retryMs = 0;
     }
 
     /* -------------------- WebSocket Connection -------------------- */
@@ -72,6 +73,7 @@ export class NeuralTTSService {
                 this.ws.onopen = () => {
                     this.wsReady = true;
                     this.available = true;
+                    this._retryMs = 0;          // recovered — reset the backoff
                     this.onStatus('tts-connected');
                     console.log('NeuralTTS: server connected');
                     resolve(true);
@@ -89,13 +91,21 @@ export class NeuralTTSService {
                     // loop wedging on an unresolved promise.
                     this._settle(false);
                     if (!this._stopped) {
-                        setTimeout(() => this.connect().catch(() => {}), 10000);
+                        /* Exponential backoff from 400ms, not a flat 10s.
+                           The Python TTS server takes a few seconds to spawn,
+                           so the renderer's first connect always loses the
+                           race — and a flat 10s retry left Jarvis voiceless
+                           for the first ten seconds of every single launch,
+                           which is exactly when someone speaks to it. */
+                        this._retryMs = Math.min((this._retryMs || 400) * 2, 10000);
+                        setTimeout(() => this.connect().catch(() => {}), this._retryMs);
                     }
                 };
 
                 this.ws.onerror = () => {
                     this.wsReady = false;
                     this.available = false;
+                    // onclose fires after onerror and owns the retry schedule.
                     resolve(false);
                 };
 

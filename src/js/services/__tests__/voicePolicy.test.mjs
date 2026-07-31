@@ -71,8 +71,30 @@ check('the migration resets a stored system voice',
         gated);
 }
 
-check('the gate returns false when the setting is off',
-    /_systemVoiceAllowed\(\)\s*\{\s*if\s*\(!this\.settings\.get\('systemVoiceFallback'\)\)[\s\S]{0,600}?return false;/.test(jarvis));
+{
+    /* Comments are stripped before matching.
+
+       The previous version allowed 600 characters between the `if` and the
+       `return false`, which quietly made this an assertion about how long the
+       comment inside the function was. Adding an explanatory comment to
+       correct code turned the suite red. What matters is the control flow, so
+       that is what gets matched. */
+    const code = jarvis
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .replace(/^\s*\/\/.*$/gm, '');
+
+    const body = code.match(/_systemVoiceAllowed\(\)\s*\{([\s\S]*?)\n {4}\}/);
+    check('the gate can be located', Boolean(body));
+
+    if (body) {
+        const guard = body[1].match(
+            /if\s*\(!this\.settings\.get\('systemVoiceFallback'\)\)\s*\{([\s\S]*?)\n {8}\}/);
+        check('the gate opens by consulting systemVoiceFallback', Boolean(guard));
+        check('the disabled branch returns false and returns nothing else',
+            Boolean(guard) && /return false;/.test(guard[1])
+            && (guard[1].match(/return\s+/g) || []).length === 1);
+    }
+}
 
 // --- David can never be selected -------------------------------------------
 {
