@@ -796,10 +796,63 @@ detectConsistentChains(...)   // structurally coherent paths`}</Code>
 
           <Section id="install" eyebrow="20" title="Install & run">
             <p>
-              Clone the repository, install dependencies, and pull two local models. The
-              whole assistant boots from one command.
+              The fastest path is npm. This installs the app and its Electron runtime,
+              and puts a <Term>jarvis</Term> command on your PATH.
             </p>
-            <Code>{`git clone jarvis && cd jarvis
+            <Code>{`npm install -g @ashutosh0x/jarvis
+jarvis`}</Code>
+            <p>
+              Or run it once without installing anything permanently:
+            </p>
+            <Code>{`npx @ashutosh0x/jarvis`}</Code>
+            <p>
+              <strong>No API key is required to start.</strong> Web search works out of
+              the box. Everything else is optional, and the app degrades honestly rather
+              than erroring — <Term>jarvis doctor</Term> reports exactly what is and is
+              not available on your machine, so a quiet feature is never a mystery.
+            </p>
+            <Code>{`$ jarvis doctor
+
+  Runtime
+    ✓ Node                   v22.14.0
+    ✓ Electron               installed
+    ✓ Interface built
+
+  Optional services
+    · GEMINI_API_KEY         unset — conversational answers disabled
+    ✓ Ollama                 http://127.0.0.1:11434
+    · SearXNG                unset — using public search providers`}</Code>
+            <p>
+              Everything marked <Term>·</Term> is optional. The package bundles Electron,
+              so the first install pulls a platform binary of roughly 100 MB — that is the
+              cost of <Term>npm i -g</Term> producing a working program rather than a list
+              of instructions. Signed native installers for Windows, macOS and Linux are on
+              the releases page if you would rather skip npm entirely.
+            </p>
+
+            <h3 className="text-lg font-medium mt-10 mb-3">Use the search engine as a library</h3>
+            <p>
+              The federated search engine has no Electron dependency and no DOM. If that
+              is all you want, take just that:
+            </p>
+            <Code>{`import { search } from '@ashutosh0x/jarvis'
+
+const { results, answer, providers } = await search('rust async runtime comparison')
+// answer    — extracted answer, or null
+// providers — ['crates', 'github', 'hn', …]`}</Code>
+            <p>
+              The individual pieces are exported too: <Term>rrfFuse</Term> (Reciprocal
+              Rank Fusion, k=60), <Term>bm25Search</Term>, <Term>editDistance</Term>{" "}
+              (Damerau-Levenshtein), <Term>gatherAll</Term>, and the percentile metric
+              store under <Term>@ashutosh0x/jarvis/metrics</Term>.
+            </p>
+
+            <h3 className="text-lg font-medium mt-10 mb-3">From source</h3>
+            <p>
+              For development, or to run the full local-model stack, clone and pull the
+              two models.
+            </p>
+            <Code>{`git clone https://github.com/Ashutosh0x/jarvis && cd jarvis
 npm install
 
 # pull the local models
