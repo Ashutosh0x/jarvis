@@ -31,18 +31,44 @@ function getLocalConfig() {
     }
 }
 
-// Quick health probe so the UI can show whether Local Mode is available
+/* Seed for the probe deadline. Deliberately well above the 2000ms this used to
+   be pinned at: /api/tags does not answer while Ollama is loading a model or
+   retrying GPU discovery, and on 31 Jul four turns were refused at 2002-2007ms
+   by the same server that then streamed generations with a 3.7-5.6s first
+   token. A server that is genuinely absent fails on connect and never reaches
+   this deadline, so a longer one costs nothing in the down case. */
+export const PROBE_TIMEOUT_MS = 6000;
+export const PROBE_CEILING_MS = 20000;
+
+// Quick health probe so the UI can show whether Local Mode is available.
+//
+// The deadline is learned rather than fixed, for the reason set out in
+// selfHeal.js: a timeout chosen on a fast day becomes a permanent false
+// negative on a slow one. Only genuine deadline hits widen it — a refused
+// connection says nothing about how long the service needs.
 export async function checkOllama() {
     const { url } = getLocalConfig();
+    const budget = health.budget('ollama.probe', {
+        min: 2000, max: PROBE_CEILING_MS, initial: PROBE_TIMEOUT_MS, factor: 2,
+    });
+    const deadline = budget.value;
+    const startedAt = Date.now();
+
     try {
-        const res = await fetch(`${url}/api/tags`, { signal: AbortSignal.timeout(2000) });
+        const res = await fetch(`${url}/api/tags`, { signal: AbortSignal.timeout(deadline) });
+        // Record before inspecting status: a 500 that arrived in 80ms is still
+        // evidence about latency, which is all this budget models.
+        budget.record(Date.now() - startedAt);
         if (!res.ok) return { available: false };
         const data = await res.json();
         return {
             available: true,
             models: (data.models || []).map(m => m.name),
         };
-    } catch {
+    } catch (e) {
+        if (e?.name === 'TimeoutError' || e?.name === 'AbortError') {
+            budget.recordTimeout(deadline);
+        }
         return { available: false };
     }
 }
