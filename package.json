@@ -1,6 +1,6 @@
 {
   "name": "@ashutosh0x/jarvis",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A local-first desktop AI assistant: federated live web search with no API key, on-device vision and OCR, neural TTS, and a self-healing supervisor. Ships as an Electron app and an importable search library.",
   "main": "electron.js",
   "scripts": {
