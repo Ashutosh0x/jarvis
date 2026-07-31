@@ -13,6 +13,12 @@
 
 appId: com.jarvis.ai
 productName: Jarvis
+
+# Pinned, NOT derived. electron-builder defaults the Linux executable name to
+# package.json's `name`, which is now the scoped `@ashutosh0x/jarvis` — that
+# produced a binary literally called `@ashutosh0xjarvis`. The npm package name
+# and the command a user types are different things and should not be coupled.
+executableName: jarvis
 copyright: Copyright © 2026 JARVIS
 
 directories:
