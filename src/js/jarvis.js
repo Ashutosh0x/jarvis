@@ -30,6 +30,8 @@ import * as inputControl from './services/inputControl.js';
 import { parseFileCommand, inferCodeFilename } from './services/fileCommands.js';
 import { parseAlarmCommand, parseAlarmCancel, parseAlarmList, formatDuration, formatClock } from './services/alarmParser.js';
 import { AlarmService } from './services/alarmService.js';
+import { MeetingScheduler } from './services/meetingScheduler.js';
+import { MeetingMonitor, describeAlert } from './services/meetingMonitor.js';
 import { LocalVoiceService } from './services/voiceService.js';
 import { NeuralTTSService } from './services/ttsService.js';
 import { guardOutput } from './services/groundingGuard.js';
@@ -1215,6 +1217,22 @@ class Jarvis {
         const alarmCancel = parseAlarmCancel(cmd);
         if (alarmCancel) return { intent: 'ALARM_CANCEL', all: alarmCancel.all };
         if (parseAlarmList(cmd)) return { intent: 'ALARM_LIST' };
+        /* A scheduling conversation owns every turn until it finishes. Without
+           this, "project review" mid-flow would be classified as a web search. */
+        if (this.scheduler?.isActive) return { intent: 'SCHEDULING_TURN', text: command };
+
+        if (/(?:connect|link|set ?up).*calendar/.test(cmd)) return { intent: 'CALENDAR', action: 'connect' };
+        if (/schedule.*(?:meeting|call|meet)|set ?up a (?:meeting|call)|book a (?:meeting|call)/.test(cmd))
+            return { intent: 'CALENDAR', action: 'schedule' };
+        if (/(?:create|open|start|make).*meet (?:room|space|link)|instant meet/.test(cmd))
+            return { intent: 'CALENDAR', action: 'meet-room' };
+        if (/next meeting|when is my (?:next )?(?:meeting|call)/.test(cmd))
+            return { intent: 'CALENDAR', action: 'next' };
+        if (/(?:my|any|what).*(?:meetings|schedule|calendar)|what'?s on today/.test(cmd))
+            return { intent: 'CALENDAR', action: 'list' };
+        if (/i know about.*meeting|ack(?:nowledge)? (?:the )?meeting/.test(cmd))
+            return { intent: 'CALENDAR', action: 'acknowledge' };
+
         const alarmCmd = parseAlarmCommand(cmd);
         if (alarmCmd) return { intent: 'SET_ALARM', alarm: alarmCmd };
 
@@ -1962,6 +1980,12 @@ class Jarvis {
                     break;
                 case 'CAMERA_OFF':
                     await this.toggleCamera(false);
+                    break;
+                case 'SCHEDULING_TURN':
+                    await this.continueScheduling(intent.text);
+                    break;
+                case 'CALENDAR':
+                    await this.handleCalendarCommand(intent.action);
                     break;
                 case 'SET_ALARM':
                     await this.handleSetAlarm(intent.alarm);
@@ -6016,6 +6040,175 @@ class Jarvis {
      * null and we say so — an assistant that answers "alarm set" without
      * having set one is the failure mode this whole path exists to avoid.
      */
+    /**
+     * Google Calendar. Connect, list, schedule, and stay aware of meetings.
+     *
+     * The scheduler is a state machine — once it is active, every utterance
+     * goes to it until the meeting is created or cancelled. See
+     * meetingScheduler.js for why the model does not decide any field that
+     * lands in the calendar.
+     */
+    async handleCalendarCommand(action, payload) {
+        const api = window.electronAPI;
+        if (!api?.gcalStatus) {
+            this.speak('Calendar access is not available in this environment.');
+            return;
+        }
+
+        const status = await api.gcalStatus();
+
+        if (action === 'connect') {
+            if (!status.configured) {
+                this.speak('Google credentials are not set up yet, Sir. See the calendar section of the readme.');
+                return;
+            }
+            if (status.connected) {
+                this.speak('Your calendar is already connected, Sir.');
+                return;
+            }
+            this.displayText('Opening Google sign-in in your browser...', null);
+            const res = await api.gcalConnect();
+            this.speak(res.connected
+                ? 'Connected to your calendar, Sir.'
+                : `I could not connect, Sir. ${res.error || ''}`);
+            if (res.connected) this.startMeetingMonitor();
+            return;
+        }
+
+        if (!status.connected) {
+            this.speak('Your calendar is not connected, Sir. Say "connect my calendar" to set it up.');
+            return;
+        }
+
+        if (action === 'list') return this._listMeetings();
+        if (action === 'schedule') return this._beginScheduling();
+        if (action === 'next') return this._nextMeeting();
+        if (action === 'acknowledge') return this._acknowledgeMeeting();
+        if (action === 'meet-room') return this._createMeetRoom();
+    }
+
+    async _listMeetings() {
+        const res = await window.electronAPI.gcalList({ hoursAhead: 24 });
+        if (!res.success) {
+            // Never invent a schedule. If the fetch failed, say so.
+            this.speak(`I could not read your calendar, Sir. ${res.error || ''}`);
+            return;
+        }
+        const events = res.events.filter((e) => !e.allDay);
+        if (!events.length) {
+            this.speak('Nothing on your calendar for the next day, Sir.');
+            return;
+        }
+
+        const lines = events.map((e) => {
+            const when = new Date(e.start).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+            return `${when}  ${e.summary}${e.meetLink ? '  (Meet)' : ''}`;
+        });
+        this.displayText(lines.join('\n'), null);
+
+        const first = events[0];
+        const when = new Date(first.start).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+        this.speak(events.length === 1
+            ? `One meeting, Sir: ${first.summary} at ${when}.`
+            : `${events.length} meetings, Sir. The next is ${first.summary} at ${when}.`);
+    }
+
+    async _nextMeeting() {
+        const next = this.meetingMonitor?.nextMeeting();
+        if (!next) {
+            // Fall back to a live read rather than claiming nothing is on when
+            // the monitor simply has not polled yet.
+            return this._listMeetings();
+        }
+        const mins = Math.round((next.startMs - Date.now()) / 60000);
+        this.speak(`${next.summary}, in ${mins} minute${mins === 1 ? '' : 's'}, Sir.`);
+        if (next.meetLink) this.displayText(next.meetLink, null);
+    }
+
+    _beginScheduling() {
+        this.scheduler = this.scheduler || new MeetingScheduler({
+            // The ONLY thing the model does here: propose a better title when
+            // the user gave a generic one. Everything else is rule-parsed.
+            suggestTitle: async (purpose) => {
+                const out = await generateContentLocal(
+                    [{ role: 'user', parts: [{ text:
+                        `Give a 2-4 word meeting title for this purpose. Title only, no quotes, no explanation.\n\n${purpose}` }] }],
+                    null, { temperature: 0.3 }
+                );
+                return String(out || '').split('\n')[0].replace(/["'.]/g, '').trim().slice(0, 60);
+            },
+        });
+        const opening = this.scheduler.start();
+        this.speak(opening.say);
+    }
+
+    /** Routed here while a scheduling conversation is open. */
+    async continueScheduling(transcript) {
+        const res = await this.scheduler.handle(transcript);
+        if (res.say) this.speak(res.say);
+
+        if (res.create) {
+            const out = await window.electronAPI.gcalCreate(res.create);
+            if (!out.success) {
+                this.speak(`I could not create it, Sir. ${out.error || ''}`);
+                return;
+            }
+            const ev = out.event;
+            this.displayText(
+                `${ev.summary}\n${new Date(ev.start).toLocaleString()}\n${ev.meetLink || ''}`.trim(),
+                null
+            );
+
+            if (ev.meetLink) {
+                this.speak('Done, Sir. The Meet link is on screen.');
+            } else if (ev.meetUnavailable) {
+                // Stated plainly. A personal Gmail cannot create a Meet link
+                // through the API, and implying otherwise would send someone
+                // to a meeting with no way in.
+                this.speak('Created, Sir — but without a Meet link. That needs a Google Workspace account.');
+            } else {
+                this.speak('Created, Sir.');
+            }
+            await this.meetingMonitor?._refresh();
+        }
+    }
+
+    async _createMeetRoom() {
+        const res = await window.electronAPI.gcalMeetSpace();
+        if (!res.success) {
+            this.speak(`I could not open a Meet room, Sir. ${res.error || ''}`);
+            return;
+        }
+        this.displayText(res.uri, null);
+        this.speak('Your Meet room is ready, Sir. The link is on screen.');
+    }
+
+    _acknowledgeMeeting() {
+        const ack = this.meetingMonitor?.acknowledgeCurrent();
+        this.speak(ack
+            ? `Understood, Sir. I will not mention ${ack.summary} again.`
+            : 'There is nothing to acknowledge, Sir.');
+    }
+
+    /** Start background meeting awareness. Safe to call twice. */
+    startMeetingMonitor() {
+        if (this.meetingMonitor?.running) return;
+
+        this.meetingMonitor = this.meetingMonitor || new MeetingMonitor({
+            fetchEvents: async () => {
+                const res = await window.electronAPI.gcalList({ hoursAhead: 12 });
+                if (!res.success) throw new Error(res.error || 'calendar unavailable');
+                return res.events;
+            },
+            onAlert: (alert) => {
+                this.displayText(`📅 ${alert.event.summary} — ${alert.minutesUntil} min`, null);
+                this.speak(describeAlert(alert));
+                if (alert.event.meetLink) this.displayText(alert.event.meetLink, null);
+            },
+        });
+        this.meetingMonitor.start();
+    }
+
     async handleSetAlarm(alarm) {
         if (!alarm?.at) {
             this.speak('I did not catch when. Try "set a timer for twenty minutes", or "set an alarm for seven thirty".');

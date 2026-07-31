@@ -830,6 +830,61 @@ ipcMain.handle('reveal-in-folder', async (event, requestedPath) => {
     }
 });
 
+/* =========================
+   GOOGLE CALENDAR & MEET
+   OAuth2 installed-app flow over the loopback interface, and Calendar v3 via
+   fetch. See googleCalendar.js for why there is no `googleapis` dependency.
+   Credentials come from .env and are NEVER handed to the renderer.
+========================= */
+const { GoogleCalendar } = require('./googleCalendar.js');
+
+const googleCal = new GoogleCalendar({
+    clientId: process.env.GOOGLE_CLIENT_ID || '',
+    clientSecret: process.env.GOOGLE_CLIENT_SECRET || '',
+    tokenPath: path.join(app.getPath('userData'), 'google-token.json'),
+});
+googleCal.loadTokens().catch(() => {});
+
+ipcMain.handle('gcal-status', async () => ({
+    configured: googleCal.isConfigured,
+    connected: googleCal.isConnected,
+}));
+
+ipcMain.handle('gcal-connect', async () => {
+    try {
+        // The system browser, not a WebView: the user must be able to see the
+        // real Google origin and padlock when handing over calendar access.
+        return await googleCal.connect((url) => shell.openExternal(url));
+    } catch (e) {
+        return { connected: false, error: e.message };
+    }
+});
+
+ipcMain.handle('gcal-disconnect', async () => {
+    try { return await googleCal.disconnect(); }
+    catch (e) { return { disconnected: false, error: e.message }; }
+});
+
+ipcMain.handle('gcal-list', async (event, opts) => {
+    try { return { success: true, events: await googleCal.listEvents(opts || {}) }; }
+    catch (e) { return { success: false, error: e.message }; }
+});
+
+ipcMain.handle('gcal-create', async (event, draft) => {
+    try { return { success: true, event: await googleCal.createEvent(draft) }; }
+    catch (e) { return { success: false, error: e.message }; }
+});
+
+ipcMain.handle('gcal-delete', async (event, eventId) => {
+    try { return { success: true, ...(await googleCal.deleteEvent(eventId)) }; }
+    catch (e) { return { success: false, error: e.message }; }
+});
+
+ipcMain.handle('gcal-meet-space', async () => {
+    try { return { success: true, ...(await googleCal.createMeetSpace()) }; }
+    catch (e) { return { success: false, error: e.message }; }
+});
+
 // Website Opening Handler - SECURITY: validateUrl() enforces http/https only.
 // Opens in Chrome specifically (the user's default browser preference); the URL
 // is passed as an execFile ARGUMENT ARRAY, never a shell string, so a crafted

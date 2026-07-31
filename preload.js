@@ -193,6 +193,15 @@ contextBridge.exposeInMainWorld('electronAPI', {
     // manager. Both validate the path in the main process; the renderer cannot
     // reach outside the allowed user folders through either.
     openEditor: (filePath, editor) => ipcRenderer.invoke('open-editor', filePath, editor),
+    // Google Calendar. Credentials live in the main process only — the
+    // renderer can ask for events and create them, never see a token.
+    gcalStatus: () => ipcRenderer.invoke('gcal-status'),
+    gcalConnect: () => ipcRenderer.invoke('gcal-connect'),
+    gcalDisconnect: () => ipcRenderer.invoke('gcal-disconnect'),
+    gcalList: (opts) => ipcRenderer.invoke('gcal-list', opts),
+    gcalCreate: (draft) => ipcRenderer.invoke('gcal-create', draft),
+    gcalDelete: (eventId) => ipcRenderer.invoke('gcal-delete', eventId),
+    gcalMeetSpace: () => ipcRenderer.invoke('gcal-meet-space'),
     revealInFolder: (filePath) => ipcRenderer.invoke('reveal-in-folder', filePath),
     openWebsite: (url) => ipcRenderer.send('open-website', url),
     readClipboard: () => ipcRenderer.invoke('read-clipboard'),
