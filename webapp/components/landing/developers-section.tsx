@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useRef } from "react";
 import { Copy, Check } from "lucide-react";
+import { REPO_URL, NPM_URL } from "@/lib/links";
 
 const codeExamples = [
   {
@@ -54,7 +55,7 @@ const features = [
   },
   {
     title: "Open source",
-    description: "ISC licensed. Read it, fork it, run it."
+    description: "MIT licensed. Read it, fork it, run it."
   },
 ];
 
@@ -229,8 +230,22 @@ export function DevelopersSection() {
                 Read the docs
               </a>
               <span className="text-foreground/20">|</span>
-              <a href="#" className="text-muted-foreground hover:text-foreground">
+              <a
+                href={REPO_URL}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-muted-foreground hover:text-foreground"
+              >
                 View on GitHub
+              </a>
+              <span className="text-foreground/20">|</span>
+              <a
+                href={NPM_URL}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-muted-foreground hover:text-foreground"
+              >
+                View on npm
               </a>
             </div>
           </div>

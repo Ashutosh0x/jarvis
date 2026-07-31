@@ -3,6 +3,12 @@ dist
 release
 # `npm pack` output. A build artifact, not a source file.
 *.tgz
+
+# Screen recordings. GitHub hard-rejects any file over 100 MB, and the demo
+# capture sitting in this directory is 400 MB — `git add -A` would fail the
+# push, or worse, land it in the history where it cannot be removed cheaply.
+*.mp4
+*.mov
 src/config.js
 # Secrets: real keys live here, .env.example is the committed template.
 .env

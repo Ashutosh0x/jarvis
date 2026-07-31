@@ -2,6 +2,14 @@
 
 import { ArrowUpRight } from "lucide-react";
 import { AnimatedWave } from "./animated-wave";
+import {
+  REPO_URL,
+  NPM_URL,
+  README_URL,
+  LICENSE_URL,
+  ISSUES_URL,
+  RELEASES_URL,
+} from "@/lib/links";
 
 const footerLinks = {
   Product: [
@@ -16,11 +24,15 @@ const footerLinks = {
     { name: "On-chain reads", href: "#how-it-works" },
     { name: "Android companion", href: "#features" },
   ],
+  // These four pointed at "#" — every one of them a link to nowhere on the
+  // section of the page that exists to send people to the source.
   Project: [
-    { name: "Under the hood", href: "#developers" },
-    { name: "Source on GitHub", href: "#" },
-    { name: "README", href: "#" },
-    { name: "License (ISC)", href: "#" },
+    { name: "Source on GitHub", href: REPO_URL },
+    { name: "npm package", href: NPM_URL },
+    { name: "All releases", href: RELEASES_URL },
+    { name: "README", href: README_URL },
+    { name: "Report an issue", href: ISSUES_URL },
+    { name: "License (MIT)", href: LICENSE_URL },
   ],
   Trust: [
     { name: "Privacy by design", href: "#security" },
@@ -30,8 +42,8 @@ const footerLinks = {
 };
 
 const socialLinks = [
-  { name: "GitHub", href: "#" },
-  { name: "README", href: "#" },
+  { name: "GitHub", href: REPO_URL },
+  { name: "npm", href: NPM_URL },
 ];
 
 export function FooterSection() {
@@ -96,7 +108,7 @@ export function FooterSection() {
         {/* Bottom Bar */}
         <div className="py-8 border-t border-foreground/10 flex flex-col md:flex-row items-center justify-between gap-4">
           <p className="text-sm text-muted-foreground">
-            JARVIS — local-first assistant. ISC licensed.
+            JARVIS — local-first assistant. MIT licensed.
           </p>
 
           <div className="flex items-center gap-4 text-sm text-muted-foreground">

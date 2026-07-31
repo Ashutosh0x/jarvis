@@ -41,6 +41,10 @@ const suites = [
     path.join(root, 'sectorMove.test.mjs'),
     path.join(root, 'webSearch.test.mjs'),
     path.join(root, 'packaging.test.mjs'),
+    /* The marketing site advertises download URLs that embed the version, so
+       they 404 the moment the app is released again. Nothing else notices:
+       the site builds, the links are well-formed, and only a click reveals it. */
+    path.join(root, 'webapp-links.test.mjs'),
 ];
 
 /* The answer benchmark's grader is the part of it that can silently lie, so its

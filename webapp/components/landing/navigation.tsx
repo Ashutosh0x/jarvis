@@ -3,6 +3,7 @@
 import { useState, useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { Menu, X } from "lucide-react";
+import { REPO_URL } from "@/lib/links";
 
 const navLinks = [
   { name: "Features", href: "#features" },
@@ -65,14 +66,22 @@ export function Navigation() {
 
           {/* Desktop CTA */}
           <div className="hidden md:flex items-center gap-4">
-            <a href="#" className={`text-foreground/70 hover:text-foreground transition-all duration-500 ${isScrolled ? "text-xs" : "text-sm"}`}>
+            <a
+              href={REPO_URL}
+              target="_blank"
+              rel="noopener noreferrer"
+              className={`text-foreground/70 hover:text-foreground transition-all duration-500 ${isScrolled ? "text-xs" : "text-sm"}`}
+            >
               GitHub
             </a>
             <Button
+              asChild
               size="sm"
               className={`bg-foreground hover:bg-foreground/90 text-background rounded-full transition-all duration-500 ${isScrolled ? "px-4 h-8 text-xs" : "px-6"}`}
             >
-              Download
+              {/* asChild so this is a real anchor: it was a <button> that did
+                  nothing, on the site's most prominent call to action. */}
+              <a href="#pricing">Download</a>
             </Button>
           </div>
 
@@ -129,18 +138,24 @@ export function Navigation() {
           }`}
           style={{ transitionDelay: isMobileMenuOpen ? "300ms" : "0ms" }}
           >
-            <Button 
-              variant="outline" 
+            {/* Both were buttons that only closed the menu — the mobile CTA
+                dismissed itself and went nowhere. */}
+            <Button
+              asChild
+              variant="outline"
               className="flex-1 rounded-full h-14 text-base"
               onClick={() => setIsMobileMenuOpen(false)}
             >
-              GitHub
+              <a href={REPO_URL} target="_blank" rel="noopener noreferrer">
+                GitHub
+              </a>
             </Button>
-            <Button 
+            <Button
+              asChild
               className="flex-1 bg-foreground text-background rounded-full h-14 text-base"
               onClick={() => setIsMobileMenuOpen(false)}
             >
-              Download
+              <a href="#pricing">Download</a>
             </Button>
           </div>
         </div>
