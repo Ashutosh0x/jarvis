@@ -93,6 +93,57 @@ export function parseDuration(text) {
 }
 
 /**
+ * Clock times said as words: "seven thirty", "half past six", "quarter to
+ * eight", "at seven".
+ *
+ * parseClockTime matched digits only, so every word form resolved to nothing —
+ * including "set an alarm for seven thirty", which is the example the failure
+ * message itself offers the user. Advertising a syntax the parser cannot read
+ * is worse than not supporting it, because the user has no way to discover
+ * what would have worked.
+ *
+ * Returns {hour, minute} on a 12-hour clock, or null. Never guesses: an
+ * unrecognised word yields null so the caller can say it did not understand.
+ */
+function parseSpokenClock(t) {
+    // "half past six" -> 6:30, "quarter past six" -> 6:15, "quarter to seven" -> 6:45
+    const rel = t.match(/\b(half|quarter)\s+(past|to)\s+([a-z]+)\b/);
+    if (rel) {
+        const h = wordToNumber(rel[3]);
+        if (h === null || h < 1 || h > 12) return null;
+        const mins = rel[1] === 'half' ? 30 : 15;
+        if (rel[2] === 'past') return { hour: h, minute: mins };
+        return { hour: h === 1 ? 12 : h - 1, minute: 60 - mins };
+    }
+
+    // "at seven", "for seven thirty", "for seven forty five".
+    //
+    // The preposition is required, mirroring the digit form: a bare number is
+    // only a clock time when "at" or a colon or a meridiem marks it as one.
+    const m = t.match(/\b(?:at|for)\s+([a-z]+)(?:\s+([a-z]+))?(?:\s+([a-z]+))?/);
+    if (!m) return null;
+
+    const hour = wordToNumber(m[1]);
+    if (hour === null || hour < 1 || hour > 12) return null;
+
+    // "for seven minutes" is a duration. Durations are resolved before this is
+    // reached from parseAlarmCommand, but parseClockTime is exported and must
+    // not misread one when called directly.
+    if (m[2] && UNIT_MS[m[2]]) return null;
+
+    let minute = 0;
+    if (m[2] && !/^o'?clock$/.test(m[2])) {
+        const tens = wordToNumber(m[2]);
+        if (tens === null) return null;
+        const units = m[3] ? wordToNumber(m[3]) : null;
+        // "forty five" -> 45, but "thirty" -> 30 and "seven ten" -> 7:10.
+        minute = (units !== null && tens % 10 === 0 && units < 10) ? tens + units : tens;
+        if (minute > 59) return null;
+    }
+    return { hour, minute };
+}
+
+/**
  * Absolute clock time, or null.
  *
  * Returns a Date. When the spoken time has already passed today it rolls to
@@ -104,12 +155,30 @@ export function parseClockTime(text, now = new Date()) {
 
     // 24-hour "at 18:00", 12-hour "at 2:30 pm", bare "at 6"
     const m = t.match(/\bat\s+(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)?/)
-        || t.match(/\b(\d{1,2}):(\d{2})\s*(a\.?m\.?|p\.?m\.?)?/);
-    if (!m) return null;
+        || t.match(/\b(\d{1,2}):(\d{2})\s*(a\.?m\.?|p\.?m\.?)?/)
+        // "for 8pm", "the 8 pm", "wake me 7am" — no "at" and no colon. Both
+        // patterns above need one or the other, so "set an alarm for 8pm" used
+        // to resolve to nothing and be answered with "I did not catch when".
+        //
+        // The meridiem is mandatory in this form. Without it a bare number is
+        // far more likely to be a duration than a clock time, and durations are
+        // already resolved before parseClockTime is reached.
+        || t.match(/\b(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)\b/);
 
-    let hour = parseInt(m[1], 10);
-    const minute = m[2] ? parseInt(m[2], 10) : 0;
-    const meridiem = m[3] ? m[3].replace(/\./g, '') : null;
+    let hour, minute, meridiem;
+    if (m) {
+        hour = parseInt(m[1], 10);
+        minute = m[2] ? parseInt(m[2], 10) : 0;
+        meridiem = m[3] ? m[3].replace(/\./g, '') : null;
+    } else {
+        // No digits anywhere — try the spoken form before giving up.
+        const spoken = parseSpokenClock(t);
+        if (!spoken) return null;
+        hour = spoken.hour;
+        minute = spoken.minute;
+        const mer = t.match(/\b(a\.?m\.?|p\.?m\.?)\b/);
+        meridiem = mer ? mer[1].replace(/\./g, '') : null;
+    }
 
     if (hour > 23 || minute > 59) return null;
 

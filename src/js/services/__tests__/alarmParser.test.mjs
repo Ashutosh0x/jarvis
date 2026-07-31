@@ -109,6 +109,35 @@ check('list: "show my alarms"', parseAlarmList('show my alarms') === true);
 check('list: "how long left on my timer"', parseAlarmList('how long left on my timer') === true);
 check('list: setting one is not listing', parseAlarmList('the weather today') === false);
 
+// --- clock times without "at" or a colon ------------------------------------
+// parseClockTime matched only "at <n>" or "<h>:<mm>", so a meridiem on its own
+// resolved to nothing and "set an alarm for 8pm" was answered with "I did not
+// catch when". The meridiem is what makes these unambiguous.
+check('clock: bare "8pm"', hhmm(at('set an alarm for 8pm')) === '20:00');
+check('clock: bare "8 pm" spaced', hhmm(at('set an alarm for 8 pm')) === '20:00');
+check('clock: bare "7am" rolls to tomorrow', hhmm(at('set alarm 7am')) === '07:00');
+check('clock: trailing punctuation', hhmm(at('set an alarm to the 8pm.')) === '20:00');
+
+// --- spoken clock times -----------------------------------------------------
+// The failure message tells the user to say "set an alarm for seven thirty",
+// which the digit-only parser could never read. Advertising a syntax that does
+// not work leaves the user with no way to discover one that does.
+check('spoken: "seven thirty"', hhmm(at('set an alarm for seven thirty')) === '19:30');
+check('spoken: "six thirty" with at', hhmm(at('set an alarm at six thirty')) === '18:30');
+check('spoken: "seven forty five"', hhmm(at('set an alarm for seven forty five')) === '19:45');
+check('spoken: bare hour', hhmm(at('wake me at seven')) === '19:00');
+check('spoken: "half past six"', hhmm(at('set an alarm for half past six')) === '18:30');
+check('spoken: "quarter past six"', hhmm(at('set an alarm for quarter past six')) === '18:15');
+check('spoken: "quarter to eight"', hhmm(at('set an alarm for quarter to eight')) === '19:45');
+check('spoken: "quarter to one" wraps to 12', hhmm(at('set an alarm for quarter to one')) === '12:45');
+
+// A duration must still read as a duration, not as an hour.
+check('spoken: "seven minutes" stays a duration',
+    parseAlarmCommand('set a timer for seven minutes', NOW)?.durationMs === 7 * MIN);
+check('spoken: refuses a non-time word', parseClockTime('for the meeting', NOW) === null);
+check('spoken: unresolvable still refuses',
+    parseAlarmCommand('set an alarm for the meeting', NOW)?.at === null);
+
 // --- formatting -------------------------------------------------------------
 check('format: 40 minutes', formatDuration(40 * MIN) === '40 minutes');
 check('format: singular minute', formatDuration(MIN) === '1 minute');
