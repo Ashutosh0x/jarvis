@@ -7343,9 +7343,32 @@ class Jarvis {
         // caught get classified by Gemma into an executable action before we
         // fall back to conversation. "Play some music on YouTube" -> opens
         // youtube.com instead of an apologetic paragraph.
-        if (/^(open|play|launch|start|go to|visit|show me|put on|bring up)\b/i.test(query)) {
+        // Scheduling verbs are included because the model was reliably
+        // RECOGNISING these and then only describing them — the 31 Jul log has
+        // it answering "I would request the command layer to set an alarm for
+        // seven thirty" instead of setting one. Recognition without a route to
+        // execution is just a more fluent failure.
+        //
+        // A leading filler ("okay, ...") is skipped so the verb is still found.
+        // This does not rescue an anaphoric command like "do it for 7 30" —
+        // that needs the previous turn, not a wider regex.
+        if (/^(?:(?:ok|okay|alright|yeah|yes|hey|now|please|jarvis)\b[,\s]+)*(?:open|play|launch|start|go to|visit|show me|put on|bring up|set|create|make|wake me|remind me)\b/i.test(query)) {
             const route = await routeLocalAction(query);
             switch (route.action) {
+                case 'set_timer':
+                case 'set_alarm': {
+                    // Re-parse the model's argument with the rule-based parser
+                    // rather than trusting it. An alarm the user cannot rely on
+                    // is worse than no alarm, so the time still has to resolve
+                    // unambiguously or this falls through to conversation.
+                    const kind = route.action === 'set_timer' ? 'timer' : 'alarm';
+                    const parsed = parseAlarmCommand(`set a ${kind} for ${route.arg}`);
+                    if (parsed?.at) {
+                        await this.handleSetAlarm(parsed);
+                        return;
+                    }
+                    break;
+                }
                 case 'open_app':
                     await this.handleOpenApp(route.arg);
                     return;

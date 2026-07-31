@@ -287,7 +287,7 @@ export async function routeLocalAction(query) {
                 messages: [
                     {
                         role: 'system',
-                        content: 'You route a voice command to an action. Reply ONLY with JSON: {"action": string, "arg": string}. Actions: "open_app" (arg: chrome|notepad|explorer|vscode|calculator|paint|downloads), "open_website" (arg: domain like youtube.com), "web_search" (arg: search query), "remember" (arg: the fact to store), "recall" (arg: what to look up in memory), "none" (anything else - questions, chat, requests you cannot map). When unsure, use "none".'
+                        content: 'You route a voice command to an action. Reply ONLY with JSON: {"action": string, "arg": string}. Actions: "open_app" (arg: chrome|notepad|explorer|vscode|calculator|paint|downloads), "open_website" (arg: domain like youtube.com), "web_search" (arg: search query), "remember" (arg: the fact to store), "recall" (arg: what to look up in memory), "set_timer" (arg: the duration only, e.g. "20 minutes"), "set_alarm" (arg: the clock time only, e.g. "7:30 pm"), "none" (anything else - questions, chat, requests you cannot map). When unsure, use "none".'
                     },
                     { role: 'user', content: query }
                 ]
@@ -297,7 +297,8 @@ export async function routeLocalAction(query) {
         if (!res.ok) return { action: 'none' };
         const data = await res.json();
         const parsed = JSON.parse(data.message?.content || '{}');
-        const action = ['open_app', 'open_website', 'web_search', 'remember', 'recall'].includes(parsed.action)
+        const action = ['open_app', 'open_website', 'web_search', 'remember', 'recall',
+                        'set_timer', 'set_alarm'].includes(parsed.action)
             ? parsed.action : 'none';
         return { action, arg: String(parsed.arg || '').slice(0, 300) };
     } catch (e) {
