@@ -21,7 +21,7 @@
 //
 // which points at telemetry and has nothing to do with the actual fault.
 
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -112,6 +112,36 @@ check('preload.js is packaged', listed.has('preload.js'));
 check('the built renderer is packaged',
     [...listed].some((f) => f.startsWith('dist')));
 
+// The main process also reaches into DIRECTORIES — `require('./setup/path.js')`
+// for the terminal-command installer. `localRequires` cannot see those: its
+// character class excludes '/', so a module in a subdirectory silently escapes
+// every check above. That is the googleCalendar.js bug again, one directory
+// over, and it would crash the packaged app on launch in exactly the same way.
+{
+    const src = readFileSync(path.join(root, 'electron.js'), 'utf-8');
+    const dirs = new Set();
+    for (const m of src.matchAll(/require\(\s*['"]\.\/([A-Za-z0-9_.-]+)\/[^'"]+['"]\s*\)/g)) {
+        dirs.add(`${m[1]}/`);
+    }
+
+    const pkg = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf-8'));
+    const npmFiles = new Set(pkg.files || []);
+
+    const notPackaged = [...dirs].filter((d) => !listed.has(d) && !listed.has(d.replace(/\/$/, '')));
+    check(`every directory electron.js requires is in electron-builder files${notPackaged.length ? ` — MISSING: ${notPackaged.join(', ')}` : ''}`,
+        notPackaged.length === 0);
+
+    const notNpm = [...dirs].filter((d) => !npmFiles.has(d));
+    check(`every directory electron.js requires is in package.json files${notNpm.length ? ` — MISSING: ${notNpm.join(', ')}` : ''}`,
+        notNpm.length === 0);
+
+    const missing = [...src.matchAll(/require\(\s*['"](\.\/[A-Za-z0-9_.-]+\/[^'"]+)['"]\s*\)/g)]
+        .map((m) => m[1])
+        .filter((rel) => !existsSync(path.join(root, rel)));
+    check(`every directory module electron.js requires exists${missing.length ? ` — MISSING: ${missing.join(', ')}` : ''}`,
+        missing.length === 0);
+}
+
 // npm's own allowlist has the same failure mode: a root module added to
 // exports/bin but left out of `files` ships a package that cannot start.
 {
@@ -120,6 +150,57 @@ check('the built renderer is packaged',
     const npmMissing = [...required].filter((dep) => !npmFiles.has(dep));
     check(`every required module is in package.json files${npmMissing.length ? ` — MISSING: ${npmMissing.join(', ')}` : ''}`,
         npmMissing.length === 0);
+}
+
+// ── the CLI, which has its own dependency tree ──────────────────────────────
+//
+// The checks above only walk flat `require('./x')` from electron.js. The
+// launcher reaches into a DIRECTORY (`../setup/`), which that regex cannot see
+// and neither allowlist covered — the same allowlist bug as googleCalendar.js,
+// one directory over. `jarvis doctor` on a freshly installed package would
+// have thrown `Cannot find module '../setup/bootstrap.js'`.
+{
+    const pkg = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf-8'));
+    const npmFiles = new Set(pkg.files || []);
+
+    const binEntry = (pkg.bin && pkg.bin.jarvis) || 'bin/jarvis.mjs';
+    check('the CLI entry point exists', existsSync(path.join(root, binEntry)));
+    check('the CLI entry point is packaged for npm',
+        [...npmFiles].some((f) => binEntry.startsWith(f.replace(/\/$/, ''))));
+
+    const cliSrc = readFileSync(path.join(root, binEntry), 'utf-8');
+
+    // Both forms — `require_('../setup/x.js')` and a static import.
+    const dirDeps = new Set();
+    for (const m of cliSrc.matchAll(/(?:require_?\(|from\s+)\s*['"]\.\.\/([A-Za-z0-9_.-]+)\//g)) {
+        dirDeps.add(`${m[1]}/`);
+    }
+
+    check(`the CLI's directory dependencies were found (${[...dirDeps].join(', ') || 'none'})`,
+        dirDeps.size > 0);
+
+    const notNpm = [...dirDeps].filter((d) => !npmFiles.has(d));
+    check(`every CLI directory dependency is in package.json files${notNpm.length ? ` — MISSING: ${notNpm.join(', ')}` : ''}`,
+        notNpm.length === 0);
+
+    const notBuilder = [...dirDeps].filter((d) => !listed.has(d) && !listed.has(d.replace(/\/$/, '')));
+    check(`every CLI directory dependency is in electron-builder files${notBuilder.length ? ` — MISSING: ${notBuilder.join(', ')}` : ''}`,
+        notBuilder.length === 0);
+
+    // And the modules inside those directories must resolve each other.
+    const unresolved = [];
+    for (const dir of dirDeps) {
+        const dirPath = path.join(root, dir);
+        if (!existsSync(dirPath)) { unresolved.push(`${dir} (directory missing)`); continue; }
+        for (const file of readdirSync(dirPath).filter((f) => f.endsWith('.js'))) {
+            const src = readFileSync(path.join(dirPath, file), 'utf-8');
+            for (const m of src.matchAll(/require\(\s*['"](\.\/[A-Za-z0-9_.-]+)['"]\s*\)/g)) {
+                if (!existsSync(path.join(dirPath, m[1]))) unresolved.push(`${dir}${file} -> ${m[1]}`);
+            }
+        }
+    }
+    check(`modules inside those directories resolve${unresolved.length ? ` — BROKEN: ${unresolved.join(', ')}` : ''}`,
+        unresolved.length === 0);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

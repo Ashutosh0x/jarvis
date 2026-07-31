@@ -16,10 +16,25 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const testDir = path.join(root, 'src', 'js', 'services', '__tests__');
+
+/* Every `__tests__` directory, not just the services one. A suite that exists
+   but is never discovered is worse than no suite: it passes locally when you
+   run it by hand and never runs in CI, so it protects nothing. */
+const testDirs = [
+    path.join(root, 'src', 'js', 'services', '__tests__'),
+    path.join(root, 'setup', '__tests__'),
+];
+
+const discovered = testDirs.flatMap((dir) => {
+    try {
+        return readdirSync(dir).filter((f) => f.endsWith('.mjs')).map((f) => path.join(dir, f));
+    } catch {
+        return [];   // a directory that has not been created yet is not a failure
+    }
+});
 
 const suites = [
-    ...readdirSync(testDir).filter(f => f.endsWith('.mjs')).map(f => path.join(testDir, f)),
+    ...discovered,
     path.join(root, 'metricStore.test.mjs'),
     path.join(root, 'edgarGuard.test.mjs'),
     path.join(root, 'visionRouter.test.mjs'),

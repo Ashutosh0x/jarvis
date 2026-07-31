@@ -1,6 +1,8 @@
 node_modules
 dist
 release
+# `npm pack` output. A build artifact, not a source file.
+*.tgz
 src/config.js
 # Secrets: real keys live here, .env.example is the committed template.
 .env

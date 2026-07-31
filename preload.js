@@ -198,6 +198,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
     // Autostart and background running
     autostartStatus: () => ipcRenderer.invoke('autostart-status'),
     autostartSet: (enabled) => ipcRenderer.invoke('autostart-set', enabled),
+    // The `jarvis` terminal command: whether it works, and linking it.
+    terminalCommandStatus: () => ipcRenderer.invoke('terminal-command-status'),
+    terminalCommandLink: (enabled) => ipcRenderer.invoke('terminal-command-link', enabled),
     hideWindow: () => ipcRenderer.invoke('window-hide'),
     gcalStatus: () => ipcRenderer.invoke('gcal-status'),
     gcalConnect: () => ipcRenderer.invoke('gcal-connect'),

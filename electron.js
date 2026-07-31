@@ -287,6 +287,43 @@ function createWindow() {
     });
 }
 
+/**
+ * Make `jarvis` work in a terminal, from an installed build.
+ *
+ * Installing an app registers a Start-menu entry, not a command. This writes a
+ * launcher into a per-user directory and puts that directory on the user's
+ * PATH — HKCU only, never `setx`, and read back after writing. See setup/path.js.
+ *
+ * Only from a PACKAGED build: in development `process.execPath` is electron.exe,
+ * and a shim pointing at that opens a bare Electron runtime with no app — a
+ * command that exists and does nothing. Same reasoning as autostart.canRegister().
+ *
+ * Deferred and never awaited. It costs a PowerShell spawn on the run that
+ * actually changes something, and nothing about starting Jarvis should wait for
+ * a convenience.
+ */
+function ensureTerminalCommand() {
+    if (!app.isPackaged) return;
+    setTimeout(() => {
+        try {
+            require('./setup/path.js')
+                .ensureCommand({ root: __dirname, packagedExe: process.execPath })
+                .then((res) => {
+                    if (res.status === 'installed') {
+                        console.log(`[path] jarvis command installed at ${res.command}`);
+                    } else if (res.status === 'manual' || res.status === 'failed') {
+                        // Reported, not retried in a loop. A PATH write that
+                        // fails twice will fail a hundred times.
+                        console.warn(`[path] ${res.detail}`);
+                    }
+                })
+                .catch((e) => console.warn('[path]', e.message));
+        } catch (e) {
+            console.warn('[path]', e.message);
+        }
+    }, 4000);
+}
+
 app.whenReady().then(async () => {
     createWindow();
 
@@ -295,6 +332,7 @@ app.whenReady().then(async () => {
        of Task Manager. */
     autostart.installTray(() => mainWindow);
     autostart.keepAliveInTray(mainWindow);
+    ensureTerminalCommand();
     startTelemetry();
     phoneBridgeToken = await loadPhoneBridgeToken();
     startPhoneBridge();
@@ -922,6 +960,29 @@ ipcMain.handle('autostart-status', async () => ({
 }));
 
 ipcMain.handle('autostart-set', async (event, enabled) => autostart.setEnabled(enabled));
+
+/* The `jarvis` terminal command. Status is a read; `terminal-command-link` is
+   the only state-changing one, and it edits nothing outside HKCU\Environment
+   and a per-user directory. */
+ipcMain.handle('terminal-command-status', async () => {
+    try {
+        const p = require('./setup/path.js');
+        return { ...(await p.commandAvailable()), dir: p.commandDir(), supported: app.isPackaged };
+    } catch (e) {
+        return { available: false, error: e.message };
+    }
+});
+
+ipcMain.handle('terminal-command-link', async (event, enabled = true) => {
+    try {
+        const p = require('./setup/path.js');
+        return enabled
+            ? await p.ensureCommand({ root: __dirname, packagedExe: app.isPackaged ? process.execPath : null })
+            : await p.removeCommand();
+    } catch (e) {
+        return { status: 'failed', detail: e.message };
+    }
+});
 
 ipcMain.handle('window-hide', async () => {
     if (mainWindow) mainWindow.hide();

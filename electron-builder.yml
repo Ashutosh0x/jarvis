@@ -34,6 +34,7 @@ files:
   # Root CommonJS modules. The main process cannot import the renderer's ES
   # modules, so its pure logic lives at the root; all of it must ship.
   - adbService.js
+  - setup/
   - autostart.js
   - chainProviders.js
   - chainWatch.js
@@ -121,6 +122,9 @@ nsis:
   artifactName: ${productName}-Setup-${version}-${arch}.${ext}
   # A voice assistant that survives reboots is expected to come back on its own.
   runAfterFinish: true
+  # Removes the `jarvis` launcher on uninstall. It explains there why the PATH
+  # entry itself is left alone rather than edited from NSIS.
+  include: build/installer.nsh
 
 portable:
   artifactName: ${productName}-Portable-${version}-${arch}.${ext}

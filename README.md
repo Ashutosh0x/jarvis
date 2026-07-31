@@ -71,6 +71,7 @@ your machine:
     ✓ Platform               win32 x64
     ✓ Electron               installed
     ✓ Interface built
+    ✓ jarvis command         %LOCALAPPDATA%\Jarvis\bin\jarvis.cmd
 
   Optional services
     · GEMINI_API_KEY         unset — conversational answers disabled
@@ -79,6 +80,41 @@ your machine:
 ```
 
 Everything marked `·` is optional.
+
+### The `jarvis` command
+
+Whichever way you install it, `jarvis` becomes a command you can type in any
+terminal. Installing an app normally gives you a Start-menu entry, not a
+command, so setup closes that gap itself: it writes a small launcher to a
+per-user directory and puts that directory on your PATH.
+
+| | |
+|---|---|
+| Windows | `%LOCALAPPDATA%\Jarvis\bin\jarvis.cmd`, registered in `HKCU\Environment` |
+| macOS / Linux | `~/.local/bin/jarvis`, with a guarded block in your shell rc if that directory is not already on PATH |
+
+```bash
+jarvis link      # do it now, if setup could not
+jarvis unlink    # undo it completely
+jarvis doctor    # shows where the command resolves from
+```
+
+What it will not do:
+
+- **No `setx`.** It truncates PATH at 1024 characters and rewrites
+  `REG_EXPAND_SZ` as `REG_SZ`, so `%VAR%` entries stop expanding. The registry
+  is written directly, preserving the original value kind. (The PATH on the
+  machine this was built on is 2,152 characters — `setx` would have destroyed it.)
+- **No elevation, no machine-wide change.** `HKCU` only.
+- **No second `jarvis`.** If one is already on PATH — `npm i -g` puts one there —
+  it is left alone and reported rather than shadowed.
+- **No claimed success.** The previous PATH is saved to disk first, the new value
+  is read back after writing, and the change is verified against the *stored*
+  PATH rather than this process's environment.
+
+A shell inherits its environment when it starts, so **the terminal you ran it
+from cannot see the change** — open a new one. Every message says so rather than
+implying otherwise.
 
 > The package bundles Electron, so the first install downloads a platform
 > binary (~100 MB). That is the price of `npm i -g` producing a working app
