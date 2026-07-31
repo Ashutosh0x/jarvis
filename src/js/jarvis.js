@@ -28,6 +28,8 @@ import * as netDiscovery from './services/netDiscovery.js';
 import * as sysInspect from './services/sysInspect.js';
 import * as inputControl from './services/inputControl.js';
 import { parseFileCommand, inferCodeFilename } from './services/fileCommands.js';
+import { parseAlarmCommand, parseAlarmCancel, parseAlarmList, formatDuration, formatClock } from './services/alarmParser.js';
+import { AlarmService } from './services/alarmService.js';
 import { LocalVoiceService } from './services/voiceService.js';
 import { NeuralTTSService } from './services/ttsService.js';
 import { guardOutput } from './services/groundingGuard.js';
@@ -57,6 +59,13 @@ class Jarvis {
 
         // Calendar System
         this.calendar = new CalendarSystem();
+
+        // Alarms and timers. speak/display are bound so the service can
+        // announce a missed alarm on startup without reaching into the app.
+        this.alarms = new AlarmService({
+            speak: (t) => this.speak(t),
+            display: (t) => this.displayText(t, null),
+        });
         this.calendar.requestNotificationPermission();
 
         // Settings Manager
@@ -1196,6 +1205,19 @@ class Jarvis {
         if (cmd.includes('export conversation')) return { intent: 'EXPORT_MEMORY' };
 
         // Calendar Commands
+        /* Alarms and timers. Placed BEFORE the calendar reminder branch:
+           "remind me in 40 minutes" matched there and resolved to 12:00,
+           because parseDateTime applied the offset to the date but returned
+           the default time string. Rule-based, and an unresolved time asks
+           rather than guessing. */
+        if (this.alarms?.isRinging && /(stop|dismiss|off|quiet|enough|okay|ok)/.test(cmd))
+            return { intent: 'ALARM_DISMISS' };
+        const alarmCancel = parseAlarmCancel(cmd);
+        if (alarmCancel) return { intent: 'ALARM_CANCEL', all: alarmCancel.all };
+        if (parseAlarmList(cmd)) return { intent: 'ALARM_LIST' };
+        const alarmCmd = parseAlarmCommand(cmd);
+        if (alarmCmd) return { intent: 'SET_ALARM', alarm: alarmCmd };
+
         if (cmd.includes('set reminder') || cmd.includes('remind me')) {
             const reminderText = cmd.replace(/(?:set reminder|remind me)/i, '').trim();
             return { intent: 'SET_REMINDER', text: reminderText };
@@ -1940,6 +1962,19 @@ class Jarvis {
                     break;
                 case 'CAMERA_OFF':
                     await this.toggleCamera(false);
+                    break;
+                case 'SET_ALARM':
+                    await this.handleSetAlarm(intent.alarm);
+                    break;
+                case 'ALARM_CANCEL':
+                    await this.handleAlarmCancel(intent.all);
+                    break;
+                case 'ALARM_LIST':
+                    await this.handleAlarmList();
+                    break;
+                case 'ALARM_DISMISS':
+                    this.alarms.dismiss();
+                    this.speak('Alarm off, Sir.');
                     break;
                 case 'SET_REMINDER':
                     await this.handleSetReminder(intent.text);
@@ -5974,6 +6009,98 @@ class Jarvis {
     }
 
     // Calendar Handlers
+    /**
+     * Set an alarm or a timer.
+     *
+     * The parser has already resolved the instant. If it could not, `at` is
+     * null and we say so — an assistant that answers "alarm set" without
+     * having set one is the failure mode this whole path exists to avoid.
+     */
+    async handleSetAlarm(alarm) {
+        if (!alarm?.at) {
+            this.speak('I did not catch when. Try "set a timer for twenty minutes", or "set an alarm for seven thirty".');
+            return;
+        }
+
+        // A time in the past means the parse was wrong, not that the user
+        // wants an instant alarm.
+        if (alarm.at.getTime() <= Date.now()) {
+            this.speak('That time has already passed, Sir.');
+            return;
+        }
+
+        const { at } = this.alarms.schedule({
+            kind: alarm.kind,
+            at: alarm.at,
+            label: alarm.label,
+        });
+
+        const noun = alarm.kind === 'timer' ? 'Timer' : 'Alarm';
+        const subject = alarm.label ? ` for ${alarm.label}` : '';
+        const when = alarm.kind === 'timer'
+            ? formatDuration(at.getTime() - Date.now())
+            : formatClock(at);
+
+        this.displayText(`${noun}${subject} — ${when} (${at.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })})`, null);
+        this.speak(alarm.kind === 'timer'
+            ? `${noun} set${subject} for ${when}.`
+            : `${noun} set${subject} for ${when}.`);
+
+        // Said once per session, not on every alarm. This is a renderer-side
+        // scheduler: if Jarvis is closed the alarm does not fire, and letting
+        // someone believe otherwise is worse than the limitation itself.
+        if (!this._warnedAlarmScope) {
+            this._warnedAlarmScope = true;
+            this.displayText('Note: alarms only fire while Jarvis is running.', null);
+        }
+    }
+
+    async handleAlarmCancel(all) {
+        if (all) {
+            const n = this.alarms.cancelAll();
+            this.speak(n ? `Cancelled ${n} alarm${n === 1 ? '' : 's'}, Sir.` : 'There was nothing to cancel.');
+            return;
+        }
+
+        const pending = this.alarms.list();
+        if (!pending.length) {
+            this.speak('You have no alarms set, Sir.');
+            return;
+        }
+
+        // Cancel the SOONEST rather than asking which. With one pending — the
+        // common case — a disambiguation prompt is friction for no gain.
+        const next = pending[0];
+        this.alarms.cancel(next.id);
+        const subject = next.label ? ` for ${next.label}` : '';
+        this.speak(`Cancelled your ${next.kind}${subject}, Sir.`);
+
+        if (pending.length > 1) {
+            this.displayText(`${pending.length - 1} other alarm${pending.length === 2 ? '' : 's'} still set.`, null);
+        }
+    }
+
+    async handleAlarmList() {
+        const pending = this.alarms.list();
+        if (!pending.length) {
+            this.speak('You have no alarms or timers set, Sir.');
+            return;
+        }
+
+        const lines = pending.map((a) => {
+            const subject = a.label ? ` — ${a.label}` : '';
+            const at = a.at.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+            return `${a.kind === 'timer' ? 'Timer' : 'Alarm'} ${at} (in ${formatDuration(a.remainingMs)})${subject}`;
+        });
+        this.displayText(lines.join('\n'), null);
+
+        const next = pending[0];
+        const subject = next.label ? ` for ${next.label}` : '';
+        this.speak(pending.length === 1
+            ? `One ${next.kind}${subject}, in ${formatDuration(next.remainingMs)}.`
+            : `${pending.length} set. The next${subject} is in ${formatDuration(next.remainingMs)}.`);
+    }
+
     async handleSetReminder(text) {
         try {
             const { date, time } = this.calendar.parseDateTime(text);

@@ -97,6 +97,7 @@ class CalendarSystem {
         const now = new Date();
         let date = new Date(now);
         let time = '12:00';
+        let relative = false;
 
         // Parse time (e.g., "at 3 PM", "at 15:30")
         const timeMatch = text.match(/at\s+(\d{1,2}(?::\d{2})?\s*(?:AM|PM)?)/i);
@@ -113,12 +114,22 @@ class CalendarSystem {
             const hourMatch = text.match(/in\s+(\d+)\s+hour/i);
             if (hourMatch) {
                 date.setHours(date.getHours() + parseInt(hourMatch[1]));
+                relative = true;
             }
         } else if (text.includes('in') && text.match(/in\s+(\d+)\s+minute/i)) {
             const minuteMatch = text.match(/in\s+(\d+)\s+minute/i);
             if (minuteMatch) {
                 date.setMinutes(date.getMinutes() + parseInt(minuteMatch[1]));
+                relative = true;
             }
+        }
+
+        // A relative offset ("in 40 minutes") moves `date`, but `time` was
+        // still the 12:00 default because the "at ..." match never ran — so
+        // "remind me in 40 minutes" at 09:00 scheduled for 12:00. Derive the
+        // time from the date whenever an offset was applied.
+        if (relative) {
+            time = `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
         }
 
         return {
