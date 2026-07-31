@@ -324,7 +324,76 @@ function ensureTerminalCommand() {
     }, 4000);
 }
 
+/* =========================
+   LEGACY userData MIGRATION
+
+   Electron derives userData from the package name. Scoping the package to
+   "@ashutosh0x/jarvis" therefore moved it from Roaming/jarvis to
+   Roaming/@ashutosh0x/jarvis, and every file written under the old name was
+   left behind — silently, because an absent store reads as an empty one. The
+   observable symptom is Jarvis starting up with no remembered facts and no
+   chain alert history, which looks like data loss rather than a moved path.
+
+   Copies, never moves: the old directory is left intact so a downgrade still
+   finds its data. Never overwrites: anything already present under the new
+   path is authoritative. Marked done once, so a file the user deliberately
+   cleared is not resurrected on the next launch.
+========================= */
+const LEGACY_USERDATA_DIRS = ['jarvis', 'jarvis-assistant'];
+const MIGRATED_FILES = [
+    'fact-store.json', 'chain-alerts.jsonl', 'chain-watchlist.json',
+    'entity-labels.json', 'events.jsonl', 'feed-events.jsonl', 'feed-seen.json',
+    'interactions.jsonl', 'memory-audit.jsonl', 'metrics.jsonl',
+    'metrics-rollups.jsonl', 'prediction-watchlist.json', 'rag-store.json',
+    'reflections.jsonl', 'trajectories.jsonl', 'watchlist.json',
+];
+
+async function migrateLegacyUserData() {
+    const current = app.getPath('userData');
+    const marker = path.join(current, '.userdata-migrated');
+    try {
+        await fs.access(marker);
+        return; // already run
+    } catch { /* not yet migrated */ }
+
+    // appData IS the Roaming root, so the legacy directories can be addressed
+    // directly rather than by walking up from a path whose depth depends on
+    // whether the current package name is scoped.
+    const roaming = app.getPath('appData');
+
+    const copied = [];
+    for (const legacyName of LEGACY_USERDATA_DIRS) {
+        const legacyDir = path.join(roaming, legacyName);
+        if (legacyDir === current) continue;
+        for (const file of MIGRATED_FILES) {
+            const src = path.join(legacyDir, file);
+            const dst = path.join(current, file);
+            try {
+                await fs.access(dst);
+                continue; // present already — the new copy wins
+            } catch { /* absent, so a legacy copy is worth having */ }
+            try {
+                await fs.copyFile(src, dst);
+                copied.push(`${legacyName}/${file}`);
+            } catch { /* no legacy copy either */ }
+        }
+    }
+
+    try {
+        await fs.writeFile(marker, new Date().toISOString(), 'utf8');
+    } catch { /* a re-run is harmless: nothing is overwritten */ }
+
+    if (copied.length) {
+        console.log(`userData migration: recovered ${copied.length} file(s) from a previous app name: ${copied.join(', ')}`);
+    }
+}
+
 app.whenReady().then(async () => {
+    // Before the window exists: the renderer reads these stores on load, and a
+    // store that is migrated after the first read is a store that was empty
+    // when it mattered.
+    await migrateLegacyUserData();
+
     createWindow();
 
     /* Tray first, THEN close-to-tray. Hiding a window with no tray icon would
