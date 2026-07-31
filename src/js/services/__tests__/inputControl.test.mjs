@@ -64,11 +64,21 @@ check('parse: write is a synonym', parseInputCommand('write an email')?.intent =
 check('parse: press enter', parseInputCommand('press enter')?.chord === '{ENTER}');
 check('parse: hit ctrl s', parseInputCommand('hit ctrl s')?.chord === '^s');
 check('parse: press unknown key is not an intent', parseInputCommand('press banana') === null);
-check('parse: search sets thenEnter',
-    parseInputCommand('search for weather in delhi')?.thenEnter === true);
-check('parse: search text captured',
-    parseInputCommand('search for weather in delhi')?.text === 'weather in delhi');
-check('parse: google as a verb', parseInputCommand('google typescript generics')?.isSearch === true);
+/* "search X" is a question for Jarvis, not a keystroke macro.
+   These three previously asserted the opposite — that "search for weather in
+   delhi" should be typed into whatever window happened to be focused. Because
+   this matcher runs first, that made the web-search router unreachable: the
+   interaction log shows "search about jamie diamond" and "search bitcoin price
+   today" classified TYPE_TEXT while the user was asking Jarvis a question. */
+check('parse: search is not claimed as dictation',
+    parseInputCommand('search for weather in delhi') === null);
+check('parse: google as a verb is not claimed as dictation',
+    parseInputCommand('google typescript generics') === null);
+check('parse: look up is not claimed as dictation',
+    parseInputCommand('look up rust lifetimes') === null);
+// Explicit dictation still reaches the focused window.
+check('parse: "type search foo" still dictates',
+    parseInputCommand('type search foo')?.text === 'search foo');
 check('parse: close app', parseInputCommand('close notepad')?.name === 'notepad');
 check('parse: quit is a synonym', parseInputCommand('quit chrome')?.name === 'chrome');
 check('parse: switch to app', parseInputCommand('switch to chrome')?.intent === 'FOCUS_WINDOW');

@@ -6,21 +6,20 @@ import { Copy, Check } from "lucide-react";
 const codeExamples = [
   {
     label: "Install",
-    code: `git clone jarvis && cd jarvis
-npm install
+    code: `npm install -g @ashutosh0x/jarvis
+jarvis
 
-# pull the local models
-ollama pull gemma3:4b
-ollama pull nomic-embed-text`,
+# or run it once:
+npx @ashutosh0x/jarvis`,
   },
   {
-    label: "Run",
-    code: `npm run build
-npm run electron
+    label: "Check",
+    code: `jarvis doctor
 
-# faster-whisper + Ollama
-# start automatically,
-# bound to loopback only`,
+# reports what is available.
+# No API key is needed to
+# start — search works
+# out of the box.`,
   },
   {
     label: "Ask",
@@ -29,6 +28,14 @@ npm run electron
 "who is vitalik.eth"
 "what's on my screen"
 "reflect"`,
+  },
+  {
+    label: "Import",
+    code: `import { search } from
+  '@ashutosh0x/jarvis'
+
+const { answer, results } =
+  await search('rust async')`,
   },
 ];
 

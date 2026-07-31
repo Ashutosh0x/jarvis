@@ -103,16 +103,17 @@ export function parseInputCommand(cmd) {
     m = raw.match(/^(?:type|write|input|dictate)\s+(?:out\s+)?(.+)$/i);
     if (m) return { intent: 'TYPE_TEXT', text: normalizeDictation(m[1]) };
 
-    /* "search for X" / "google X" — type into whatever is focused, then Enter.
-       "google" is also a COMPANY, and the 1000-prompt harness caught the
-       collision: "google stock price" typed "stock price" into the focused
-       window instead of quoting GOOGL. When the remainder is a financial
-       attribute, the word is the subject of the question, not the verb. */
-    m = raw.match(/^(?:search(?:\s+for)?|google|look\s+up)\s+(.+)$/i);
-    const asksAboutSubject = m && /^(?:stock|share)s?\s+price|^(?:price|earnings|market\s+cap|revenue|dividend|valuation|shares?)\b/i.test(m[1]);
-    if (m && !asksAboutSubject && !/\b(my|the)\s+(files?|system|processes|network|memory)\b/i.test(m[1])) {
-        return { intent: 'TYPE_TEXT', text: normalizeDictation(m[1]), thenEnter: true, isSearch: true };
-    }
+    /* "search for X" / "google X" deliberately do NOT belong here any more.
+       They used to mean "type this into whatever window is focused, then press
+       Enter", which made Jarvis a keyboard macro rather than something that
+       answers. The interaction log shows what that cost: "search about jamie
+       diamond", "search bitcoin price today" and "search latest stocks data"
+       were all captured here and typed somewhere, while the user was asking
+       Jarvis a question. This matcher runs long before the web-search router,
+       so claiming the phrase here made the router unreachable.
+
+       Dictating into a focused window is still available, explicitly, through
+       the "type ..." branch above — including "type search foo". */
 
     // "switch to chrome" / "focus notepad" / "bring up edge"
     m = t.match(/^(?:switch to|focus(?:\s+on)?|bring up|go to|activate)\s+(?:the\s+)?([a-z0-9 ._-]{2,30}?)(?:\s+window)?$/);

@@ -4,7 +4,7 @@
 #
 # Protocol (ws://127.0.0.1:8771):
 #   Client sends JSON text frames:
-#     {"type":"speak", "id":N, "text":"...", "voice":"en-US-GuyNeural", "speed":1.0}
+#     {"type":"speak", "id":N, "text":"...", "voice":"en-US-EmmaNeural", "speed":1.0}
 #     {"type":"interrupt", "id":N}
 #     {"type":"voices"}
 #
@@ -35,7 +35,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("jarvis-tts")
 
 PORT = int(os.environ.get("JARVIS_TTS_PORT", "8771"))
-DEFAULT_VOICE = os.environ.get("JARVIS_TTS_VOICE", "en-US-GuyNeural")
+DEFAULT_VOICE = os.environ.get("JARVIS_TTS_VOICE", "en-US-EmmaNeural")
 DEFAULT_SPEED = float(os.environ.get("JARVIS_TTS_SPEED", "1.0"))
 
 async def handle(ws):
@@ -157,7 +157,7 @@ async def synthesize_and_stream(ws, text, voice, speed, utt_id=None):
                 total_bytes += len(data)
 
     ms = int((time.time() - t0) * 1000)
-    log.info(f"[{ms} ms] streamed {total_bytes} bytes for: {text[:60]!r}")
+    log.info(f"[{ms} ms] {voice} streamed {total_bytes} bytes for: {text[:60]!r}")
     await ws.send(json.dumps({
         "type": "done",
         "id": utt_id,

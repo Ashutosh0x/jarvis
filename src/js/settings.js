@@ -13,7 +13,14 @@ class SettingsManager {
                fact before the next arrives. The gap sits INSIDE the microphone
                gate, so Jarvis cannot hear its own next line during it. */
             speechGapMs: 450,
-            voiceName: null, // Will be set automatically to a male voice
+            voiceName: null, // SAPI fallback voice; set automatically to a female voice
+            /* edge-tts neural voice used by the local TTS server — the voice
+               you actually hear. Emma is cheerful and conversational;
+               en-US-AriaNeural is a more clipped assistant register,
+               en-US-AvaNeural warmer, en-GB-SoniaNeural British. Ask the server
+               for the full list with a {"type":"voices"} frame rather than
+               guessing at names. */
+            neuralVoice: 'en-US-EmmaNeural',
             visualizerMode: 'sphere',
             visualizerSensitivity: 1.0,
             pttMode: false, // Push-to-Talk: false = always listening (default), true = hold space to talk
@@ -35,9 +42,24 @@ class SettingsManager {
             autoGainControl: false,   // off preserves natural dynamics
 
             // --- OCR ---
-            ocrProvider: 'auto'       // 'auto' = local Unlimited-OCR if server is up, else cloud vision
+            ocrProvider: 'auto',      // 'auto' = local Unlimited-OCR if server is up, else cloud vision
+
+            /* Bumped whenever a default below must beat the copy already in
+               localStorage. See MIGRATED_KEYS. */
+            settingsVersion: 2
         };
         this.settings = this.loadSettings();
+    }
+
+    /* Keys reset to their default when the stored settingsVersion is behind.
+       Stored values normally win the merge, which is right for anything the
+       user chose — but it also means a changed default can never reach an
+       existing install. That bites harder than it looks: set() writes the whole
+       merged object back, so a key the user never touched still ends up
+       persisted at whatever the default was on the day it was first saved, and
+       is pinned there forever. */
+    static get MIGRATED_KEYS() {
+        return ['neuralVoice'];
     }
 
     // Load settings from localStorage
@@ -47,7 +69,22 @@ class SettingsManager {
             if (stored) {
                 const loaded = JSON.parse(stored);
                 // Merge with defaults to ensure all keys exist
-                return { ...this.defaultSettings, ...loaded };
+                const merged = { ...this.defaultSettings, ...loaded };
+
+                if ((loaded.settingsVersion || 0) < this.defaultSettings.settingsVersion) {
+                    for (const key of SettingsManager.MIGRATED_KEYS) {
+                        if (merged[key] !== this.defaultSettings[key]) {
+                            console.log(`Settings migration: ${key} ${merged[key]} -> ${this.defaultSettings[key]}`);
+                            merged[key] = this.defaultSettings[key];
+                        }
+                    }
+                    merged.settingsVersion = this.defaultSettings.settingsVersion;
+                    try {
+                        localStorage.setItem(this.storageKey, JSON.stringify(merged));
+                    } catch { /* migration is re-run next launch if this fails */ }
+                }
+
+                return merged;
             }
         } catch (error) {
             console.warn('Failed to load settings:', error);

@@ -1,0 +1,260 @@
+name: release
+
+# Tag-driven. Pushing v1.2.0 builds all three platforms, verifies every
+# artifact, and publishes a GitHub Release with checksums and update metadata.
+#
+#   git tag v1.2.0 && git push origin v1.2.0
+#
+# Pre-release tags (v1.2.0-beta.1) publish as GitHub pre-releases and feed the
+# matching electron-updater channel, so a beta tester is never silently moved
+# onto stable and a stable user never receives a beta.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (must already exist)'
+        required: true
+
+permissions:
+  contents: write        # required to create the Release and upload assets
+
+jobs:
+  # Fail fast on a bad tag BEFORE spending ~30 minutes of matrix build time.
+  verify:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: v
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          [ "${{ github.event_name }}" = "workflow_dispatch" ] && TAG="${{ inputs.tag }}"
+          VERSION="${TAG#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          # Semver, optionally with a prerelease suffix.
+          if ! echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|nightly)\.[0-9]+)?$'; then
+            echo "::error::'$VERSION' is not semver (expected 1.2.3 or 1.2.3-beta.1)"
+            exit 1
+          fi
+
+          if echo "$VERSION" | grep -q -- '-'; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # The tag and package.json must agree, or the published latest.yml
+          # advertises a version the binary does not report and every client
+          # re-downloads the same update forever.
+          PKG=$(node -p "require('./package.json').version")
+          if [ "$PKG" != "$VERSION" ]; then
+            echo "::error::tag is $VERSION but package.json says $PKG"
+            exit 1
+          fi
+          echo "releasing $VERSION (prerelease=$(cat "$GITHUB_OUTPUT" | grep prerelease))"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Seed the placeholder config
+        run: cp src/config.example.js src/config.js
+
+      - name: Install
+        run: npm install --omit=dev --no-audit --no-fund
+
+      # A release must never ship a red suite.
+      - name: Tests
+        run: node scripts/run-tests.mjs
+
+  build:
+    needs: verify
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux
+            target: '--linux'
+          - os: windows-latest
+            name: windows
+            target: '--win'
+          - os: macos-latest
+            name: macos
+            target: '--mac'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Seed the placeholder config
+        shell: bash
+        run: cp src/config.example.js src/config.js
+
+      - name: Install
+        run: npm install --no-audit --no-fund
+
+      - name: Stub absent platform packages
+        run: node scripts/prepare-native-deps.mjs
+
+      - name: Generate the icon
+        run: npm run icons
+
+      - name: Build renderer
+        run: npm run build
+
+      # Signing and notarization happen only when the secrets exist. A fork, or
+      # this repo before certificates are configured, still produces complete
+      # unsigned artifacts rather than a failed release.
+      - name: Package
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Windows + macOS code signing
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          # macOS notarization
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # Without a certificate, tell electron-builder not to hunt for one.
+          CSC_IDENTITY_AUTO_DISCOVERY: ${{ secrets.CSC_LINK && 'true' || 'false' }}
+        run: npx electron-builder ${{ matrix.target }} --publish never
+
+      # Chromium's setuid sandbox helper must be root-owned and mode 4755.
+      # dpkg/rpm set that when the package is INSTALLED; the unpacked directory
+      # the smoke test launches has the runner's ownership, and Electron aborts
+      # rather than run unsandboxed. Reproducing the installed permissions tests
+      # the same configuration a user gets, which --no-sandbox would not.
+      - name: Smoke test (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo chown root:root release/linux-unpacked/chrome-sandbox
+          sudo chmod 4755 release/linux-unpacked/chrome-sandbox
+          xvfb-run --auto-servernum node scripts/smoke-test.mjs
+
+      - name: Smoke test
+        if: matrix.os != 'ubuntu-latest'
+        run: node scripts/smoke-test.mjs
+
+      # Per-platform sums; the publish job re-verifies across all of them.
+      - name: Checksums
+        run: npm run checksums && npm run checksums:verify
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.name }}
+          path: |
+            release/*.exe
+            release/*.dmg
+            release/*.zip
+            release/*.AppImage
+            release/*.deb
+            release/*.rpm
+            release/*.tar.gz
+            release/*.blockmap
+            release/latest*.yml
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # full history, for the changelog
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: staging
+
+      # Three per-platform directories collapse into one release/.
+      - name: Collect artifacts
+        run: |
+          mkdir -p release
+          find staging -type f -exec cp -n {} release/ \;
+          ls -la release/
+
+      # One SHA256SUMS covering every platform, then re-verified. A checksum
+      # file that is generated and never checked proves only that bytes exist.
+      - name: Checksums
+        run: |
+          node scripts/checksums.mjs
+          node scripts/checksums.mjs --verify
+
+      - name: Changelog
+        id: changelog
+        shell: bash
+        run: |
+          PREV=$(git describe --tags --abbrev=0 --exclude="${GITHUB_REF#refs/tags/}" 2>/dev/null || true)
+          if [ -n "$PREV" ]; then
+            RANGE="$PREV..HEAD"
+            echo "changes since $PREV"
+          else
+            RANGE="HEAD"
+            echo "first release"
+          fi
+
+          {
+            echo "## What changed"
+            echo
+            # Conventional-commit prefixes when present; everything else lands
+            # under Other so nothing is silently dropped from the notes.
+            for pair in "feat:Features" "fix:Fixes" "perf:Performance" "sec:Security" "docs:Documentation"; do
+              KEY="${pair%%:*}"; TITLE="${pair##*:}"
+              BODY=$(git log $RANGE --no-merges --pretty='- %s (%h)' --grep="^${KEY}" || true)
+              [ -n "$BODY" ] && { echo "### $TITLE"; echo; echo "$BODY"; echo; }
+            done
+            OTHER=$(git log $RANGE --no-merges --pretty='- %s (%h)' \
+              --invert-grep --grep='^feat' --grep='^fix' --grep='^perf' --grep='^sec' --grep='^docs' || true)
+            [ -n "$OTHER" ] && { echo "### Other"; echo; echo "$OTHER"; echo; }
+
+            echo "## Verifying your download"
+            echo
+            echo '```'
+            echo 'sha256sum -c SHA256SUMS --ignore-missing'
+            echo '```'
+            echo
+            if [ -z "${{ secrets.CSC_LINK }}" ]; then
+              echo "> **These builds are unsigned.** Windows SmartScreen will warn on first run"
+              echo "> (More info → Run anyway), and macOS requires right-click → Open, or"
+              echo "> \`xattr -dr com.apple.quarantine /Applications/Jarvis.app\`."
+            fi
+          } > NOTES.md
+          cat NOTES.md
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Jarvis ${{ needs.verify.outputs.version }}
+          body_path: NOTES.md
+          prerelease: ${{ needs.verify.outputs.prerelease == 'true' }}
+          fail_on_unmatched_files: true
+          files: |
+            release/*.exe
+            release/*.dmg
+            release/*.zip
+            release/*.AppImage
+            release/*.deb
+            release/*.rpm
+            release/*.tar.gz
+            release/*.blockmap
+            release/latest*.yml
+            release/SHA256SUMS

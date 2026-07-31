@@ -1,0 +1,209 @@
+# Packaging for Windows, macOS and Linux.
+#
+# Lives here rather than in package.json's "build" key because that inline
+# config shipped a BROKEN app: its files glob was [dist, electron.js,
+# preload.js], while electron.js requires eleven sibling CommonJS modules
+# (webSearch, rpcHedge, chainWatch, companionBridge, adbService and the rest)
+# and spawns two Python servers from server/. None of those were packaged, so
+# the installer produced an app that crashed on launch at the first require.
+#
+# Signing and notarization are OPTIONAL throughout. When the corresponding
+# secrets are absent the build still produces usable unsigned artifacts —
+# CI must not fail because a fork has no certificate.
+
+appId: com.jarvis.ai
+productName: Jarvis
+
+# Pinned, NOT derived. electron-builder defaults the Linux executable name to
+# package.json's `name`, which is now the scoped `@ashutosh0x/jarvis` — that
+# produced a binary literally called `@ashutosh0xjarvis`. The npm package name
+# and the command a user types are different things and should not be coupled.
+executableName: jarvis
+copyright: Copyright © 2026 JARVIS
+
+directories:
+  output: release
+  buildResources: build
+
+# Everything the main process reaches for at runtime. Verified against the
+# actual require() graph, not guessed.
+files:
+  - dist/**/*
+  - electron.js
+  - preload.js
+  # Root CommonJS modules. The main process cannot import the renderer's ES
+  # modules, so its pure logic lives at the root; all of it must ship.
+  - adbService.js
+  - chainProviders.js
+  - chainWatch.js
+  - companionBridge.js
+  - edgarGuard.js
+  - metricStore.js
+  - rpcHedge.js
+  - sectorMove.js
+  - streamGuard.js
+  - visionRouter.js
+  - webSearch.js
+  - sec-company-tickers.json
+  - package.json
+  - '!**/*.map'
+  - '!**/__tests__/**'
+  - '!**/*.test.mjs'
+  # @napi-rs/canvas declares every platform as an optionalDependency; npm
+  # installs only the host's. Excluding the rest keeps the collector off
+  # directories that were never installed.
+  - '!node_modules/@napi-rs/canvas-android-*'
+  - '!node_modules/@napi-rs/canvas-darwin-*'
+  - '!node_modules/@napi-rs/canvas-linux-*'
+  - '!node_modules/@napi-rs/canvas-freebsd-*'
+  - '!node_modules/@napi-rs/canvas-win32-ia32-*'
+  - '!node_modules/@napi-rs/canvas-win32-arm64-*'
+
+# The STT and TTS servers are spawned with `uv run`, so they must exist on disk
+# next to the app rather than inside the asar archive.
+extraResources:
+  - from: server
+    to: server
+    filter: ['**/*.py']
+  - from: static
+    to: static
+    filter: ['**/*']
+
+asar: true
+# Native .node binaries must sit on the real filesystem, not inside asar.
+asarUnpack:
+  - '**/*.node'
+
+# The only native dependency is @napi-rs/canvas, reached through
+# pdf-to-img -> pdfjs-dist, and napi-rs ships prebuilt binaries for every
+# platform — there is nothing to compile.
+#
+# Leaving the rebuild on actively breaks the build: @napi-rs/canvas lists all
+# platform variants as optionalDependencies, npm installs only the one matching
+# the host (canvas-win32-x64-msvc here), and the rebuild scan then walks the
+# whole declared list and dies on the first absent one:
+#
+#   ENOENT: no such file or directory, scandir '.../@napi-rs/canvas-android-arm64'
+npmRebuild: false
+
+# Where electron-updater looks for latest*.yml. Also what tells electron-builder
+# to emit that metadata at all.
+publish:
+  provider: github
+  owner: Ashutosh0x
+  repo: jarvis
+  releaseType: release
+
+# ----------------------------------------------------------------- Windows --
+win:
+  icon: build/icon.png
+  target:
+    - target: nsis
+      arch: [x64]
+    - target: portable
+      arch: [x64]
+    - target: zip
+      arch: [x64]
+  # Signing is picked up from CSC_LINK / CSC_KEY_PASSWORD when present.
+  # electron-builder skips it silently when they are not.
+  artifactName: ${productName}-${version}-${arch}.${ext}
+  verifyUpdateCodeSignature: false
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Jarvis
+  artifactName: ${productName}-Setup-${version}-${arch}.${ext}
+  # A voice assistant that survives reboots is expected to come back on its own.
+  runAfterFinish: true
+
+portable:
+  artifactName: ${productName}-Portable-${version}-${arch}.${ext}
+
+# ------------------------------------------------------------------- macOS --
+mac:
+  icon: build/icon.png
+  category: public.app-category.productivity
+  # Universal so one download serves Apple Silicon and Intel.
+  target:
+    - target: dmg
+      arch: [universal]
+    - target: zip
+      arch: [universal]
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  artifactName: ${productName}-${version}-${arch}.${ext}
+  # Microphone and screen capture are core features; macOS refuses them
+  # silently without a stated purpose.
+  extendInfo:
+    NSMicrophoneUsageDescription: >-
+      Jarvis listens for your voice commands. Audio is transcribed locally.
+    NSCameraUsageDescription: >-
+      Jarvis uses the camera only when you ask it to look at something.
+    NSAppleEventsUsageDescription: >-
+      Jarvis controls other applications when you ask it to open or focus them.
+
+dmg:
+  artifactName: ${productName}-${version}-${arch}.${ext}
+  contents:
+    - x: 130
+      y: 220
+    - x: 410
+      y: 220
+      type: link
+      path: /Applications
+
+# Notarization runs only when APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD and
+# APPLE_TEAM_ID are all set; afterSign checks and skips cleanly otherwise.
+afterSign: scripts/notarize.cjs
+
+# ------------------------------------------------------------------- Linux --
+linux:
+  icon: build/icon.png
+  # .deb and .rpm REQUIRE a maintainer. electron-builder derives it from
+  # package.json `author`, which must be the object form with an email — a
+  # bare "Name" string fails the Linux build with "Please specify author
+  # 'email'". Stated here as well so the two cannot drift apart.
+  maintainer: Ashutosh Kumar Singh <ashutoshkumarsingh0x@gmail.com>
+  category: Utility
+  synopsis: Local-first desktop assistant
+  description: >-
+    A local-first voice assistant with hybrid retrieval, live web search
+    and deterministic finance engines.
+  # electron-builder 26 nests raw .desktop keys under `entry`; putting them at
+  # the top level fails schema validation.
+  desktop:
+    entry:
+      StartupWMClass: Jarvis
+  target:
+    - target: AppImage
+      arch: [x64]
+    - target: deb
+      arch: [x64]
+    - target: rpm
+      arch: [x64]
+    - target: tar.gz
+      arch: [x64]
+  artifactName: ${productName}-${version}-${arch}.${ext}
+
+deb:
+  # Chromium needs these; without them the .deb installs and the app will not
+  # start on a minimal system.
+  depends:
+    - libgtk-3-0
+    - libnotify4
+    - libnss3
+    - libxss1
+    - libxtst6
+    - xdg-utils
+    - libatspi2.0-0
+    - libsecret-1-0
+
+rpm:
+  depends:
+    - libXScrnSaver

@@ -324,7 +324,7 @@ export class NeuralTTSService {
                     type: 'speak',
                     id,
                     text: text,
-                    voice: opts.voice || 'en-US-GuyNeural',
+                    voice: opts.voice || 'en-US-EmmaNeural',
                     speed: opts.speed || 1.0
                 }));
             } catch (e) {

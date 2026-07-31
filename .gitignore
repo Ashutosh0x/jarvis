@@ -27,3 +27,7 @@ eval/results/
 # Python bytecode from the local STT/TTS servers
 __pycache__/
 *.pyc
+
+# Generated from "jarvis icon.png" by scripts/make-icon.mjs. Not committed:
+# a 2 MB binary that a script reproduces is churn in every diff.
+build/icon.png

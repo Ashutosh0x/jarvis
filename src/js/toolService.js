@@ -1,6 +1,7 @@
 import { GoogleGenAI } from "@google/genai";
 import { config } from "../config.js";
 import perf from "./services/perf.js";
+import { health } from "./services/selfHeal.js";
 
 // Initialize standard client for tool execution
 let genAI = null;
@@ -95,6 +96,15 @@ export async function describeImageLocal(imageInput, question) {
 export const FIRST_TOKEN_TIMEOUT_MS = 25000;
 export const STALL_TIMEOUT_MS = 15000;
 
+/* These two are now STARTING points, not fixed limits. The 30 Jul log shows
+   first-token times of 13.4s, 15.3s, 17.9s, 21.4s and 21.8s against a 25s
+   constant — comfortably inside it, but only just, and a machine one step
+   slower would have failed every one of them with no way to learn better.
+   The budget widens toward FIRST_TOKEN_CEILING_MS as this machine demonstrates
+   it needs the room, and narrows again when it stops. */
+export const FIRST_TOKEN_CEILING_MS = 60000;
+export const STALL_CEILING_MS = 30000;
+
 /** Error marker so callers can distinguish a timeout from a real Ollama fault. */
 export class LocalTimeoutError extends Error {
     constructor(phase, ms) {
@@ -121,7 +131,14 @@ export async function generateContentLocal(messages, onChunk, opts = {}) {
     let timer = null;
     const arm = (phase, ms) => {
         clearTimeout(timer);
-        timer = setTimeout(() => { timedOut = new LocalTimeoutError(phase, ms); ctrl.abort(); }, ms);
+        timer = setTimeout(() => {
+            timedOut = new LocalTimeoutError(phase, ms);
+            /* A missed deadline is evidence too — without recording it the
+               budget only ever sees calls that fit inside it and can never
+               learn that it is set too low. */
+            (phase === 'first-token' ? firstTokenBudget : stallBudget).recordTimeout(ms);
+            ctrl.abort();
+        }, ms);
     };
     const onExternalAbort = () => ctrl.abort();
     if (opts.signal) {
@@ -133,7 +150,17 @@ export async function generateContentLocal(messages, onChunk, opts = {}) {
         opts.signal?.removeEventListener('abort', onExternalAbort);
     };
 
-    arm('first-token', FIRST_TOKEN_TIMEOUT_MS);
+    /* Learned deadlines. Seeded from the constants so behaviour is unchanged on
+       a cold install, then tracked to whatever this machine actually does. */
+    const firstTokenBudget = health.budget('llm.firstToken', {
+        min: 5000, max: FIRST_TOKEN_CEILING_MS, initial: FIRST_TOKEN_TIMEOUT_MS, factor: 2,
+    });
+    const stallBudget = health.budget('llm.stall', {
+        min: 5000, max: STALL_CEILING_MS, initial: STALL_TIMEOUT_MS, factor: 2,
+    });
+    const firstTokenMs = firstTokenBudget.value;
+
+    arm('first-token', firstTokenMs);
 
     let response;
     try {
@@ -183,9 +210,11 @@ export async function generateContentLocal(messages, onChunk, opts = {}) {
                         if (_firstTokenAt === null) {
                             _firstTokenAt = Date.now();
                             perf.stage('llm.firstToken', _firstTokenAt - _t0);
+                            // Teach the budget what this machine really needs.
+                            firstTokenBudget.record(_firstTokenAt - _t0);
                         }
                         // Progress: restart the clock on the stall deadline.
-                        arm('stall', STALL_TIMEOUT_MS);
+                        arm('stall', stallBudget.value);
                         fullText += piece;
                         if (onChunk) onChunk(piece);
                     }
@@ -323,7 +352,13 @@ export async function performSearch(query) {
         const result = await ai.models.generateContent({
             model: "gemini-2.0-flash",
             contents: [{ role: 'user', parts: [{ text: query }] }],
-            tools: [{ googleSearchRetrieval: {} }],
+            /* `googleSearch`, not `googleSearchRetrieval`. Google's grounding
+               docs are explicit: "Older models use a google_search_retrieval
+               tool. For all current models, use the google_search tool." The
+               legacy name was still being sent to gemini-2.0-flash, so grounding
+               was not actually being applied and the model answered unaided —
+               which is consistent with the invented citations in the log. */
+            tools: [{ googleSearch: {} }],
         });
 
         const text = result.text || "I found some information.";

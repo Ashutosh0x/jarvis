@@ -28,8 +28,104 @@
   <img src="https://img.shields.io/badge/platform-Windows%2011-0078D6?style=flat-square&logo=windows&logoColor=white" alt="Platform" />
   <img src="https://img.shields.io/badge/runs-100%25%20offline-success?style=flat-square" alt="Offline" />
   <img src="https://img.shields.io/badge/cloud%20API-none-critical?style=flat-square" alt="No cloud" />
-  <img src="https://img.shields.io/badge/license-ISC-blue?style=flat-square" alt="License" />
 </p>
+
+<p align="center">
+  <a href="https://www.npmjs.com/package/@ashutosh0x/jarvis"><img src="https://img.shields.io/npm/v/@ashutosh0x/jarvis?style=flat-square&color=CB3837&logo=npm&logoColor=white" alt="npm version" /></a>
+  <a href="https://www.npmjs.com/package/@ashutosh0x/jarvis"><img src="https://img.shields.io/npm/dm/@ashutosh0x/jarvis?style=flat-square&color=CB3837&logo=npm&logoColor=white" alt="npm downloads" /></a>
+  <img src="https://img.shields.io/badge/node-%E2%89%A522-339933?style=flat-square&logo=node.js&logoColor=white" alt="Node 22+" />
+  <img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License" />
+</p>
+
+## Install
+
+```bash
+npm install -g @ashutosh0x/jarvis
+jarvis
+```
+
+Or without installing anything permanently:
+
+```bash
+npx @ashutosh0x/jarvis
+```
+
+**No API key is required to start.** Web search works out of the box. Every key
+you add unlocks a feature, and the app degrades honestly without one rather than
+erroring — run `jarvis doctor` to see exactly what is and is not available on
+your machine:
+
+```
+  Jarvis 0.1.0
+
+  Runtime
+    ✓ Node                   v22.14.0
+    ✓ Platform               win32 x64
+    ✓ Electron               installed
+    ✓ Interface built
+
+  Optional services
+    · GEMINI_API_KEY         unset — conversational answers disabled
+    ✓ Ollama                 http://127.0.0.1:11434
+    · SearXNG                unset — using public search providers
+```
+
+Everything marked `·` is optional.
+
+> The package bundles Electron, so the first install downloads a platform
+> binary (~100 MB). That is the price of `npm i -g` producing a working app
+> instead of a list of instructions. Prefer a native installer? See
+> [releases](https://github.com/Ashutosh0x/jarvis/releases) for signed `.exe`,
+> `.dmg`, `.AppImage`, `.deb` and `.rpm` builds, each with a SHA-256 checksum.
+
+### Use the search engine as a library
+
+The search engine has **no Electron dependency and no DOM** — it is plain Node,
+independently tested, and installable on its own terms:
+
+```js
+import { search } from '@ashutosh0x/jarvis';
+
+const { results, answer, providers } = await search('rust async runtime comparison');
+console.log(answer);      // extracted answer, or null
+console.log(providers);   // ['crates', 'github', 'hn', …]
+```
+
+<details>
+<summary><b>Individual exports</b></summary>
+
+```js
+import {
+  rrfFuse,          // Reciprocal Rank Fusion, k=60
+  bm25Search,       // BM25, k1=1.2 b=0.75
+  editDistance,     // Damerau-Levenshtein
+  isTimeSensitive,  // does this answer change by the hour?
+  gatherAll,        // parallel provider fan-out, returns on quorum
+  SearchCache,
+  hedgedRace,       // race N RPC endpoints, take the first good one
+} from '@ashutosh0x/jarvis';
+
+import { stats, rollup } from '@ashutosh0x/jarvis/metrics';
+```
+
+**Search** — `search`, `buildProviders`, `detectIntents`, `isTimeSensitive`,
+`gatherAll`, `rrfFuse`, `bm25Search`, `rankResults`, `dedupeResults`,
+`extractAnswer`, `verifyAnswer`, `providerWeights`, `editDistance`,
+`shouldApplyCorrection`, `htmlToText`, `SearchCache`
+
+**Metrics** — `stats`, `windowed`, `rollup`, `rollupByDay`, `pruneRaw`, `makeSample`
+
+**Networking** — `hedgedRace`, `createStickyOrder`, `backoffDelay`,
+`createDedup`, `createBlockTracker`, `prioritizeAlerts`
+
+**Market analytics** — `dailyReturns`, `correlation`, `beta`, `peerIndex`,
+`realizedVol`, `trailingReturn`, `drawdown`, `PEER_GROUPS`
+
+</details>
+
+The full architecture, feature reference and configuration guide follow below.
+
+---
 
 JARVIS is a desktop assistant whose intelligence runs entirely on your own
 machine. Speech recognition, language understanding, retrieval, and vision all
@@ -49,10 +145,12 @@ extends the same interface and control surface to a paired phone over Wi-Fi.
 
 ## Contents
 
+- [Install](#install)
 - [What makes this different](#what-makes-this-different)
 - [Architecture](#architecture)
 - [Feature reference](#feature-reference)
 - [On-chain intelligence](#on-chain-intelligence)
+- [Web search](#web-search)
 - [Retrieval engine](#retrieval-engine)
 - [Evaluation](#evaluation)
 - [Android companion](#android-companion)
@@ -60,7 +158,6 @@ extends the same interface and control surface to a paired phone over Wi-Fi.
 - [Running](#running)
 - [Configuration](#configuration)
 - [Network ports](#network-ports)
-- [Project layout](#project-layout)
 - [Troubleshooting](#troubleshooting)
 - [Known limits](#known-limits)
 
@@ -91,101 +188,7 @@ search string, an address. Inference never leaves the machine.
 
 ### System overview
 
-```mermaid
-flowchart TB
-    MIC(["Microphone"]):::io
-    SPK(["Speech out plus visualizer"]):::io
-
-    subgraph REN["Renderer process - DOM and WebGL, no Node APIs"]
-        direction TB
-        VOICE["voiceService.js<br/>VAD, mic selection, echo guard"]:::renderer
-        ROUTER{"jarvis.js<br/>intent router"}:::router
-        REGEX["Regex intents<br/>apps, wifi, volume, files"]:::renderer
-        PHONE["phoneTools.js<br/>NL to structured intent"]:::renderer
-        LLM["toolService.js<br/>chat, vision, JSON routing"]:::renderer
-        RAG["ragService.js<br/>hybrid retrieval"]:::renderer
-        VIZ["scripts.js<br/>Three.js scene"]:::renderer
-    end
-
-    subgraph MAIN["Electron main - electron.js, Node APIs, no DOM"]
-        direction TB
-        SUP["Service supervisor"]:::main
-        IPC["IPC handlers<br/>preload.js bridge"]:::main
-        BRIDGE["companionBridge.js<br/>WS server plus mDNS"]:::main
-        ADB["adbService.js<br/>tier 3 control"]:::main
-    end
-
-    subgraph LOCAL["Local services - loopback only"]
-        direction TB
-        STT["faster-whisper<br/>port 8770"]:::ai
-        OLLAMA["Ollama<br/>port 11434"]:::ai
-        GEMMA["Gemma 3<br/>chat and vision"]:::ai
-        EMBED["nomic-embed-text<br/>embeddings"]:::ai
-        OCR["Unlimited-OCR<br/>port 10000, optional"]:::ai
-    end
-
-    subgraph PHONEDEV["Android companion - over Wi-Fi"]
-        direction TB
-        LINK["LinkService<br/>WebSocket client"]:::android
-        EXEC["DeviceCommandExecutor<br/>tier 1 and 2"]:::android
-        A11Y["AccessibilityService<br/>UI automation"]:::android
-        AVIZ["WebView<br/>copied visualizer"]:::android
-    end
-
-    WEB(["DuckDuckGo HTML<br/>only outbound traffic"]):::external
-    DISK[("Local disk<br/>rag-store, vault, settings")]:::store
-
-    MIC --> VOICE
-    VOICE -->|"PCM16 16kHz"| STT
-    STT -->|transcript| ROUTER
-
-    ROUTER --> REGEX
-    ROUTER --> PHONE
-    ROUTER --> LLM
-
-    LLM --> RAG
-    RAG <-->|"dense vectors"| EMBED
-    RAG -->|"context block"| LLM
-    LLM -->|"streaming tokens"| GEMMA
-    GEMMA --> SPK
-    EMBED -.-> OLLAMA
-    GEMMA -.-> OLLAMA
-
-    REGEX --> IPC
-    PHONE --> IPC
-    RAG <-->|"persist"| IPC
-    IPC --> DISK
-    IPC --> ADB
-    IPC --> BRIDGE
-    IPC -->|"web search"| WEB
-
-    SUP -.->|"spawn and respawn"| STT
-    SUP -.->|"spawn or reuse"| OLLAMA
-    SUP -.-> OCR
-
-    BRIDGE <-->|"ws 8766, token"| LINK
-    LINK --> EXEC
-    EXEC --> A11Y
-    LINK --> AVIZ
-    ADB -.->|"tier 3, optional"| PHONEDEV
-
-    VOICE --> VIZ
-    VIZ --> SPK
-
-    classDef io fill:#1f2933,stroke:#7b8794,stroke-width:2px,color:#ffffff
-    classDef renderer fill:#5b21b6,stroke:#a78bfa,stroke-width:2px,color:#ffffff
-    classDef router fill:#7c2d12,stroke:#fb923c,stroke-width:3px,color:#ffffff
-    classDef main fill:#164e63,stroke:#22d3ee,stroke-width:2px,color:#ffffff
-    classDef ai fill:#065f46,stroke:#34d399,stroke-width:2px,color:#ffffff
-    classDef android fill:#14532d,stroke:#4ade80,stroke-width:2px,color:#ffffff
-    classDef external fill:#7f1d1d,stroke:#f87171,stroke-width:2px,color:#ffffff
-    classDef store fill:#422006,stroke:#d97706,stroke-width:2px,color:#ffffff
-
-    style REN fill:#2e1065,stroke:#8b5cf6,stroke-width:2px,color:#ffffff
-    style MAIN fill:#083344,stroke:#06b6d4,stroke-width:2px,color:#ffffff
-    style LOCAL fill:#022c22,stroke:#10b981,stroke-width:2px,color:#ffffff
-    style PHONEDEV fill:#052e16,stroke:#22c55e,stroke-width:2px,color:#ffffff
-```
+> **Diagram:** [System overview →](docs/ARCHITECTURE.md#1-system-overview)
 
 | Colour | Layer |
 | --- | --- |
@@ -202,33 +205,7 @@ retrieval.
 
 ### Voice pipeline
 
-```mermaid
-flowchart LR
-    A(["Microphone"]):::io --> B["_pickMicDevice<br/>excludes loopback<br/>ranks headset, internal"]:::step
-    B --> C["AudioContext graph<br/>highpass 80Hz<br/>compressor"]:::step
-    C --> D["Analyser<br/>FFT bands"]:::viz
-    C --> E["capture-processor<br/>PCM16 16kHz"]:::step
-    D -->|"bass, mid, treble"| F["Three.js orb<br/>vertex displacement"]:::viz
-
-    E --> G{"Adaptive VAD<br/>3x noise floor"}:::gate
-    G -->|"below threshold"| H["Discard"]:::drop
-    G -->|"speech detected"| I["Buffer<br/>320ms preroll<br/>1.44s hangover"]:::step
-    I --> J["faster-whisper<br/>ws 8770"]:::ai
-    J --> K{"Echo guard<br/>60 percent overlap<br/>with spoken text"}:::gate
-    K -->|"self-talk"| L["Drop, show ECHO IGNORED"]:::drop
-    K -->|"user speech"| M["processCommand"]:::router
-    M --> N["Streaming TTS<br/>speak per sentence"]:::step
-    N -.->|"sets ttsActive<br/>gates mic"| G
-    N -.->|"_rememberSpoken"| K
-
-    classDef io fill:#1f2933,stroke:#7b8794,stroke-width:2px,color:#ffffff
-    classDef step fill:#5b21b6,stroke:#a78bfa,stroke-width:2px,color:#ffffff
-    classDef gate fill:#7c2d12,stroke:#fb923c,stroke-width:3px,color:#ffffff
-    classDef ai fill:#065f46,stroke:#34d399,stroke-width:2px,color:#ffffff
-    classDef viz fill:#0c4a6e,stroke:#38bdf8,stroke-width:2px,color:#ffffff
-    classDef drop fill:#450a0a,stroke:#ef4444,stroke-width:2px,color:#ffffff
-    classDef router fill:#134e4a,stroke:#2dd4bf,stroke-width:2px,color:#ffffff
-```
+> **Diagram:** [Voice pipeline →](docs/ARCHITECTURE.md#2-voice-pipeline)
 
 Two feedback loops are load-bearing. The dashed edges back into the VAD and echo
 guard are what stop JARVIS transcribing its own voice, and both are required:
@@ -237,47 +214,7 @@ cancellation, so the text-level guard catches what the gate misses.
 
 ### Process supervision
 
-```mermaid
-stateDiagram-v2
-    [*] --> Probe: app.whenReady
-
-    state "Probe port 11434" as Probe
-    state "Reuse existing instance" as Reuse
-    state "Spawn ollama serve" as Spawn
-    state "Poll readiness, 30x1s" as Poll
-    state "Preload model" as Preload
-    state "Serving" as Serving
-    state "Wait 15s" as Wait
-    state "Degraded, BM25 only" as Degraded
-
-    Probe --> Reuse: 200 within 1.5s
-    Probe --> Spawn: no response
-
-    Reuse --> Preload: never killed on quit
-    Spawn --> Poll
-    Poll --> Preload: ready
-    Poll --> Degraded: all attempts fail
-
-    Preload --> Serving: keep_alive 60m
-
-    Serving --> Wait: process exit
-    Wait --> Spawn: still running
-    Wait --> [*]: app quitting
-    Serving --> [*]: quit, kill only if spawned
-    Degraded --> [*]
-
-    classDef probe fill:#374151,stroke:#9ca3af,stroke-width:2px,color:#ffffff
-    classDef good fill:#065f46,stroke:#34d399,stroke-width:2px,color:#ffffff
-    classDef work fill:#1e3a8a,stroke:#60a5fa,stroke-width:2px,color:#ffffff
-    classDef warn fill:#7c2d12,stroke:#fb923c,stroke-width:2px,color:#ffffff
-    classDef bad fill:#7f1d1d,stroke:#f87171,stroke-width:2px,color:#ffffff
-
-    class Probe probe
-    class Reuse,Serving good
-    class Spawn,Poll,Preload work
-    class Wait warn
-    class Degraded bad
-```
+> **Diagram:** [Process supervision →](docs/ARCHITECTURE.md#3-process-supervision)
 
 Two invariants are encoded above. **Only kill what you spawned:** an Ollama the
 user started is reused and left running on quit. **Preload is not optional:**
@@ -488,19 +425,7 @@ from a guess.
 A websocket subscription to new block headers. Each confirmed block is scanned
 for large movements, and everything announced is a fact read out of that block.
 
-```mermaid
-flowchart LR
-    WS(["newHeads over wss"]) --> BLK["eth_getBlockByNumber"]
-    WS --> LOGS["eth_getLogs<br/>Transfer topic, verified tokens"]
-    BLK --> NAT["scanBlockTxs<br/>native transfers >= 100 ETH"]
-    LOGS --> TOK["scanTokenLogs<br/>token transfers >= $1M"]
-    LOGS --> ISS["scanIssuanceLogs<br/>mints and burns"]
-    TOK --> AGG["aggregateTokenWhales<br/>one transaction = one movement"]
-    NAT --> RANK["prioritizeAlerts<br/>ranked by measured USD"]
-    AGG --> RANK
-    RANK --> SAY["Announce top 2, summarise the rest"]
-    ISS --> SAY
-```
+> **Diagram:** [Real-time whale stream →](docs/ARCHITECTURE.md#4-real-time-whale-stream)
 
 - **Token flows, not just native.** Most large value on Ethereum moves as
   stablecoins. Sampled over five live blocks: 0-2 native ETH whales versus 16
@@ -570,49 +495,154 @@ which public RPC cannot enumerate, so it awaits an Etherscan-family key.
 
 ---
 
+## Web search
+
+`webSearch.js` (main process) and `src/js/services/webSearchIntent.js`
+(renderer) answer questions from the live internet. Split along the process
+boundary, not by topic: the renderer cannot fetch these origins because CORS
+blocks it, and Rollup cannot take named imports from a CommonJS module.
+
+### Why it exists
+
+There was no web search. `search about elon musk` was classified `TYPE_TEXT` —
+the dictation intent — so asking for a search typed the words into whatever
+window had focus. Anything that instead reached `AI_COMMAND` was answered by
+the local model, which has no network access. It did not decline; it invented:
+
+```
+"search about elon musk"       -> "...recognized as a trillionaire in US dollars ."
+"list latest vulnerabilities"  -> "According to OpenCVE, Google released Chrome 151
+                                   with patches for 382 vulnerabilities"
+"latest cve number of chrome"  -> "According to Google's Chrome Releases,
+                                   CVE-2026-15905 is the latest critical vulnerability"
+```
+
+Those citations are fabricated. A fabricated CVE number is worse than a refusal.
+
+### Pipeline
+
+> **Diagram:** [Pipeline →](docs/ARCHITECTURE.md#5-pipeline)
+
+### Providers are measured, not assumed
+
+HTML scraping was tried first and does not work:
+
+| Endpoint | Result |
+| --- | --- |
+| `html.duckduckgo.com` | HTTP 202 + challenge page, 0 results |
+| `lite.duckduckgo.com` | HTTP 202 + challenge page, 0 results |
+| `mojeek.com` | HTTP 200, body is an altcha CAPTCHA |
+| `searx.be` | HTTP 200, JSON output disabled |
+
+The first DuckDuckGo query of a session usually succeeds, which makes this
+especially deceptive: it looks like it works until it is used twice.
+
+Keyless general open-web search is not available in 2026. Google's Custom Search
+JSON API closed to new signups in 2025 and shuts down on 1 Jan 2027; Bing's
+Search APIs were retired on 11 Aug 2025; Brave withdrew its free tier. So the
+providers below are the keyless endpoints that **are** official, each measured
+before being added:
+
+| Provider | Measured | Intent |
+| --- | --- | --- |
+| DuckDuckGo Instant Answer | 361 ms | general (sourced abstract) |
+| Wikipedia | 541 ms | general (encyclopedic) |
+| Google News RSS | 642 ms | news, anything current |
+| Hacker News (Algolia) | 831 ms | discuss |
+| crates.io | 1147 ms | code (Rust) |
+| Open Library | 1259 ms | book |
+| NVD | 1462 ms | security |
+| GitHub repos | 1523 ms | code |
+| Stack Overflow | 1555 ms | code, discuss |
+| arXiv | 1973 ms | academic |
+| npm | 2078 ms | code (JS) |
+| Brave | — | general, only with `BRAVE_API_KEY` |
+
+Probed and **rejected**: GitHub code search (HTTP 401, needs auth), Semantic
+Scholar (HTTP 429), Reddit (HTTP 403 to datacentre traffic).
+
+### Gather, don't race
+
+Providers here are complementary rather than interchangeable — a Rust question
+wants the crates.io entry *and* the GitHub repo *and* the Stack Overflow thread
+— so `gatherAll` collects everything that arrives inside the budget instead of
+resolving on the first success.
+
+The early exit counts **providers, not results**. Counting results was tried
+first and silently destroyed the feature: Google News alone returns six, which
+satisfied a result quota instantly and ended the query before any other source
+replied — measured as `answered 1: google-news` on every single query, a
+first-wins race wearing a gather's clothes.
+
+`rrfFuse` merges the ranked lists by position only (k=60), because GitHub stars,
+Stack Overflow votes and news recency cannot be normalised against each other.
+Provider weights are derived from the query, after plain RRF put npm's
+`uniffi-bindgen-react-native` first for *"best rust crate for async runtime"* —
+an off-target index's rank-1 beating a relevant index's rank-2.
+
+### Query understanding
+
+Spelling and entity correction run **concurrently** with the search, so they
+cost nothing when nothing needs correcting, and the corrected query is only
+re-run when the original returned fewer than three results — and only kept if
+it did better. A bad suggestion cannot make results worse.
+
+**Jarvis auto-corrects your spelling.** Mistype a word and it recognises what
+you meant, fixes it, and shows you what it searched for — so a typo never
+silently returns nothing.
+
+There is no hardcoded dictionary. Building one from the local corpus was tried
+and measured useless: 721 feed items yield 2652 "entities" that are almost
+entirely filing boilerplate (`Filer`, `Filed`, `AccNo`), and the result knew
+none of the terms people actually mistype. Wikipedia's search API knows all of
+them, live, and stays current for free.
+
+Two kinds of correction, handled differently:
+
+| Kind | Example | Behaviour |
+| --- | --- | --- |
+| **Spelling** | `situtational` → situational | corrected silently, shown on screen |
+| **Entity** | a misspelt name → the right one | corrected **and spoken aloud** |
+
+The difference matters. Reading "showing results for situational awareness"
+aloud after a one-letter typo is noise. But a misheard *name* resolves to a
+different person entirely, and answering about someone else without saying so is
+indistinguishable from being wrong — so entity corrections are always announced.
+
+Suggestions are never applied blindly. The decision is made locally on
+Damerau-Levenshtein distance relative to word length, and a correction is only
+kept if it actually returned better results than the original. A bad suggestion
+cannot make things worse.
+
+### Latency
+
+Search returns in **46–956 ms** against 31–51 s for the old path, which ran
+retrieval plus local generation. Repeat queries are **0 ms** (cached).
+
+Connection warmth was measured rather than assumed. Node 22's default dispatcher
+holds pooled connections for at least **120 s** idle — far longer than the ~4 s
+commonly quoted — so no custom `undici` dispatcher is needed and none is added:
+
+```
+cold (first ever fan-out)   7812 ms
+after   0s idle              664 ms
+after  60s idle              690 ms
+after 120s idle              564 ms
+```
+
+Only the cold start is worth removing, so the three **general** origins are
+warmed once, 3 s after launch. The eight specialised providers are intent-gated
+and left cold. There is no repeating warmer: warmth already survives a session,
+and periodic warming would be unsolicited traffic to third parties.
+
+---
+
 ## Retrieval engine
 
 `src/js/services/ragService.js` implements hybrid retrieval. Design choices are
 evidence-driven and each is traceable to a measurement or a paper.
 
-```mermaid
-flowchart TB
-    Q(["Query"]):::io --> TOK["tokenize<br/>stopwords, min length 2"]:::prep
-
-    TOK --> BM25["BM25<br/>inverted index<br/>k1 1.5, b 0.75"]:::sparse
-    TOK --> DENSE["Dense<br/>nomic-embed-text<br/>cosine, cutoff 0.3"]:::dense
-    BM25 -->|"top 4 chunks"| PRFX["PRF<br/>top 6 non-query terms"]:::prf
-    PRFX --> PRF2["BM25 second pass"]:::sparse
-
-    BM25 -->|"weight 1.0"| RRF{{"Reciprocal Rank Fusion<br/>k equals 60<br/>tie-break on chunk index"}}:::fuse
-    DENSE -->|"weight 1.0"| RRF
-    PRF2 -->|"weight 0.5"| RRF
-
-    RRF --> TOP["Top 5 passages"]:::result
-
-    TOP --> GATE{"Ambiguity gate<br/>top1 minus top2<br/>over top1 under 0.15"}:::gate
-    GATE -->|"clear winner<br/>about 50 percent<br/>90ms"| SENT
-    GATE -->|"ambiguous<br/>and rerank opt-in<br/>4800ms"| RERANK["LLM rerank<br/>Gemma 3, JSON, temp 0"]:::ai
-    RERANK -->|"timeout or bad JSON"| SENT
-    RERANK -->|"reordered"| SENT
-
-    SENT["Late sentence selection<br/>IDF-weighted overlap<br/>lead bias, budget 10"]:::select
-    SENT --> ENT["Entity context<br/>Levenshtein 0.25<br/>relation-grouped"]:::select
-    ENT --> CTX(["Context block<br/>best result first"]):::io
-
-    Q -.->|"exact miss"| ENT
-
-    classDef io fill:#1f2933,stroke:#7b8794,stroke-width:2px,color:#ffffff
-    classDef prep fill:#374151,stroke:#9ca3af,stroke-width:2px,color:#ffffff
-    classDef sparse fill:#1e3a8a,stroke:#60a5fa,stroke-width:2px,color:#ffffff
-    classDef dense fill:#065f46,stroke:#34d399,stroke-width:2px,color:#ffffff
-    classDef prf fill:#0c4a6e,stroke:#38bdf8,stroke-width:2px,color:#ffffff
-    classDef fuse fill:#5b21b6,stroke:#a78bfa,stroke-width:3px,color:#ffffff
-    classDef result fill:#3f3f46,stroke:#a1a1aa,stroke-width:2px,color:#ffffff
-    classDef gate fill:#7c2d12,stroke:#fb923c,stroke-width:3px,color:#ffffff
-    classDef ai fill:#831843,stroke:#f472b6,stroke-width:2px,color:#ffffff
-    classDef select fill:#134e4a,stroke:#2dd4bf,stroke-width:2px,color:#ffffff
-```
+> **Diagram:** [Retrieval engine →](docs/ARCHITECTURE.md#6-retrieval-engine)
 
 ### Components
 
@@ -788,70 +818,7 @@ speaking volume.
 
 ### Pairing
 
-```mermaid
-sequenceDiagram
-    autonumber
-    actor U as User
-    participant D as Desktop<br/>electron.js
-    participant B as Bridge<br/>port 8765
-    participant P as Phone<br/>LinkService
-    participant W as WebSocket<br/>port 8766
-
-    rect rgb(46, 16, 101)
-    Note over U,D: Onboarding, once per device
-    U->>D: "Jarvis, connect to my mobile"
-    D->>B: openPairingWindow, 5 minutes
-    D-->>U: QR code on HUD
-    U->>P: scan with camera
-    P->>B: GET /install
-    B-->>P: landing page
-    P->>B: GET /apk
-    B-->>P: app-debug.apk
-    U->>P: tap Install, then open
-    end
-
-    rect rgb(2, 44, 34)
-    Note over P,W: Discovery and pairing, automatic
-    P->>P: NSD discover _jarvis._tcp
-    B-->>P: resolved, filtered addresses
-    Note right of P: drops 169.254.x<br/>and 192.168.56.x
-    P->>B: POST /pair
-    alt window still open
-        B-->>P: 200 token plus wsPort
-    else window closed
-        B-->>P: 403 pairing window is closed
-        Note right of P: retry every 10s
-    end
-    end
-
-    rect rgb(8, 51, 68)
-    Note over P,W: Persistent link
-    P->>W: connect, X-Jarvis-Token
-    W->>W: timingSafeEqual
-    alt token valid
-        W-->>P: accepted
-        P->>W: hello plus capabilities
-        W-->>D: companion-devices event
-        D-->>U: "Linked: Xiaomi M2101K6P"
-    else token invalid
-        W-->>P: close 4001
-    end
-    end
-
-    rect rgb(19, 78, 74)
-    Note over U,W: Steady state
-    U->>D: "open settings on my phone"
-    D->>D: routePhoneCommand
-    D->>W: id, open_app_by_name, name settings
-    W->>P: forward
-    P->>P: resolve name to package
-    P-->>W: ok, com.android.settings
-    W-->>D: result
-    D-->>U: "Settings is now open on your phone, Sir."
-    end
-
-    Note over P,W: on disconnect, reconnect with<br/>exponential backoff capped at 30s
-```
+> **Diagram:** [Pairing →](docs/ARCHITECTURE.md#7-pairing)
 
 The phone always dials outward, which avoids Doze restrictions and handset
 address churn. Pairing retries every 10 seconds while unpaired, because the
@@ -910,6 +877,33 @@ inventing outcomes when it had no execution feedback.
 ---
 
 ## Installation
+
+### Download a build
+
+Prebuilt installers for every tagged release are on the
+[Releases page](../../releases/latest).
+
+| Platform | Download | Notes |
+| --- | --- | --- |
+| Windows | `Jarvis-Setup-<version>-x64.exe` | Installer. `Jarvis-Portable-*.exe` needs no install. |
+| macOS | `Jarvis-<version>-universal.dmg` | One universal build for Apple Silicon and Intel |
+| Linux | `Jarvis-<version>-x64.AppImage` | `chmod +x` and run. `.deb`, `.rpm` and `.tar.gz` are also published. |
+
+Verify what you downloaded:
+
+```bash
+sha256sum -c SHA256SUMS --ignore-missing
+```
+
+Builds are unsigned unless signing certificates are configured for the
+repository. Windows SmartScreen will warn on first run (**More info → Run
+anyway**); macOS needs **right-click → Open** the first time, or
+`xattr -dr com.apple.quarantine /Applications/Jarvis.app`.
+
+The app checks for updates a minute after launch and every six hours after
+that. It never downloads or installs on its own — a voice assistant should not
+restart itself mid-sentence. See [docs/RELEASE.md](docs/RELEASE.md) for the
+full release process, signing and notarization.
 
 ### Prerequisites
 
@@ -974,7 +968,15 @@ on port 5173.
 | `npm run build` | Production bundle into `dist/` |
 | `npm run electron` | Launch against `dist/` |
 | `npm run electron:dev` | Launch against the Vite server |
-| `npm run electron:build` | Build a Windows NSIS installer into `release/` |
+| `npm run icon` | Regenerate `build/icon.png`, the source for every platform icon |
+| `npm run dist` | Package for the current platform into `release/` |
+| `npm run dist:win` | Windows: NSIS installer, portable exe, zip |
+| `npm run dist:mac` | macOS: universal DMG and zip |
+| `npm run dist:linux` | Linux: AppImage, deb, rpm, tar.gz |
+| `npm run checksums` | Write `release/SHA256SUMS` |
+| `npm run checksums:verify` | Re-hash artifacts and fail on any mismatch |
+| `npm run smoke` | Launch the packaged app and assert it starts |
+| `npm run electron:build` | Legacy alias for a plain `electron-builder` run |
 
 ---
 
@@ -1059,79 +1061,6 @@ All listeners bind locally or to the LAN. None are exposed to the internet.
 
 ---
 
-## Project layout
-
-```
-electron.js              Main process. Service supervision, IPC, OS integration
-preload.js               Context-isolated IPC surface
-companionBridge.js       Companion WebSocket server and mDNS advertisement
-adbService.js            Tier 3 wireless ADB control
-
-                         Root CommonJS modules. Main cannot import the
-                         renderer's ES modules, so pure logic it needs lives
-                         here and is unit-tested from src/js/services/__tests__.
-chainProviders.js        Keyed provider layer, chain-ID probe and discovery
-chainWatch.js            Whale, token flow, issuance and aggregation logic
-rpcHedge.js              Hedged endpoint racing with sticky last-good ordering
-streamGuard.js           Backoff, dedup, block-gap tracking, alert priority
-metricStore.js           Telemetry persistence, rollups, threshold events
-sectorMove.js            Peer-relative decomposition: sector move vs own move
-edgarGuard.js            SEC fetch pinning, allowed forms, non-filer registry
-visionRouter.js          Which vision backend parses a document, page reassembly
-
-src/
-  index.html             HUD markup, GLSL shaders, styles
-  config.js              Local credentials, gitignored
-  js/
-    scripts.js           Three.js scene, render loop, FFT blend
-    visualizerModes.js   Sphere, cube, particles, torus, colour mapping
-    jarvis.js            Intent router, command handlers, speech
-    settings.js          Defaults and persistence
-    memory.js            Conversation history
-    toolService.js       Ollama chat, vision, JSON action routing
-    liveService.js       Cloud session, dormant without a key
-    microphone.js        Capture graph
-    screenCapture.js     Screen capture and OCR bridge
-    calendar.js          Reminders and scheduling
-    services/
-      voiceService.js    VAD, mic selection, STT transport
-      ragService.js      Hybrid retrieval engine
-      phoneTools.js      Natural language to structured phone intents
-      quant.js           Deterministic financial mathematics
-      onchain.js         BigInt units, calldata encoding, chain and token maps
-      chainIntel.js      Provider payload parsing, portfolio and Solana output
-      ens.js, keccak.js  ENS resolution over a pure keccak-256
-      tracer.js          Fund tracing, personalized PageRank, patterns
-      ondoRegistry.js    Tokenized-security catalogue and query parsing
-      groundingGuard.js  Blocks invented identifiers before they are spoken
-      factStore.js       Belief memory with confidence and revision
-      __tests__/         987 checks across 27 suites, run with `npm test`
-    capture-processor.js AudioWorklet, capture
-    playback-processor.js AudioWorklet, playback
-
-server/
-  stt-server.py          faster-whisper WebSocket server
-
-companion/               Android companion, Gradle Kotlin DSL
-  app/src/main/
-    java/com/jarvis/companion/
-      MainActivity.kt              WebView host, permissions, JS bridge
-      audio/AudioFft.kt            AudioRecord, Hann window, radix-2 FFT
-      data/Prefs.kt                Pairing state
-      network/DesktopLink.kt       WebSocket client, reconnect with backoff
-      network/NsdDiscoveryHelper.kt mDNS discovery
-      network/CommandExecutor.kt   Command contract
-      services/LinkService.kt      Foreground service, pairing retry loop
-      services/DeviceCommandExecutor.kt  Command implementations
-      services/JarvisAccessibilityService.kt  Tier 2 automation
-    assets/visualizer/     Copied desktop visualizer
-
-docs/
-  OCR-SETUP.md           Unlimited-OCR and local model setup
-  PHONE-BRIDGE.md        MacroDroid relay, the no-app phone path
-```
-
----
 
 ## Troubleshooting
 
@@ -1200,6 +1129,22 @@ These are deliberate or platform-imposed, not defects.
 - **No barge-in.** The microphone is gated while speaking. Synthesised audio
   bypasses Chromium's echo cancellation and would otherwise be transcribed as
   user input.
+- **No general open-web index.** Web search federates official keyless APIs
+  plus a BM25 pass over already-crawled feeds. It is not a crawler and does not
+  try to be: Google indexes hundreds of billions of pages, and a personal
+  crawler would spend its time re-fetching what the live providers already
+  return. Where a personal index genuinely wins is the narrow set the user
+  tracks, which is what the feed poller already collects.
+- **Keyless web search has no general provider.** Google's Custom Search JSON
+  API shuts down 1 Jan 2027, Bing's Search APIs were retired 11 Aug 2025, and
+  Brave dropped its free tier. Without `BRAVE_API_KEY`, coverage is DuckDuckGo's
+  abstracts, Wikipedia, Google News and the intent-gated specialised indexes —
+  strong on entities, current events, code, papers and CVEs; weak on arbitrary
+  open-web pages.
+- **Search answers are extractive, never generated.** A spoken answer is a
+  sentence lifted from a fetched page and checked against it before speaking.
+  Nothing is summarised by a model, because a model summarising search results
+  is how the fabricated citations above got in.
 - **Radio toggles need administrator rights.** Wi-Fi scanning and connecting to
   saved profiles work at user level; enabling the adapter does not. JARVIS opens
   the relevant Settings page and says so plainly.

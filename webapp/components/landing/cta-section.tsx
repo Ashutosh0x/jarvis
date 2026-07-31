@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
-import { ArrowRight } from "lucide-react";
+import { ArrowRight, Copy, Check } from "lucide-react";
 import { AnimatedTetrahedron } from "./animated-tetrahedron";
 
 export function CtaSection() {
@@ -62,25 +62,44 @@ export function CtaSection() {
                   entirely on your own hardware. No cloud model, no account, no cost.
                 </p>
 
-                <div className="flex flex-col sm:flex-row items-start gap-4">
+                {/* The install command IS the call to action. A "Download"
+                    button that opens a page which then tells you to run a
+                    command is one click of pure friction. */}
+                <InstallCommand />
+
+                <div className="flex flex-col sm:flex-row items-start gap-4 mt-6">
                   <Button
+                    asChild
                     size="lg"
                     className="bg-foreground hover:bg-foreground/90 text-background px-8 h-14 text-base rounded-full group"
                   >
-                    Download JARVIS
-                    <ArrowRight className="w-4 h-4 ml-2 transition-transform group-hover:translate-x-1" />
+                    <a
+                      href="https://github.com/Ashutosh0x/jarvis/releases"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                    >
+                      Download installer
+                      <ArrowRight className="w-4 h-4 ml-2 transition-transform group-hover:translate-x-1" />
+                    </a>
                   </Button>
                   <Button
+                    asChild
                     size="lg"
                     variant="outline"
                     className="h-14 px-8 text-base rounded-full border-foreground/20 hover:bg-foreground/5"
                   >
-                    View on GitHub
+                    <a
+                      href="https://github.com/Ashutosh0x/jarvis"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                    >
+                      View on GitHub
+                    </a>
                   </Button>
                 </div>
 
                 <p className="text-sm text-muted-foreground mt-8 font-mono">
-                  No account required
+                  No account required · no API key to start
                 </p>
               </div>
 
@@ -97,5 +116,50 @@ export function CtaSection() {
         </div>
       </div>
     </section>
+  );
+}
+
+/**
+ * The install command, with a copy button.
+ *
+ * `navigator.clipboard` is unavailable on insecure origins and in some
+ * embedded browsers, so the fallback selects the text instead of silently
+ * doing nothing — a copy button that appears to work and does not is worse
+ * than one that hands you the selection.
+ */
+function InstallCommand() {
+  const [copied, setCopied] = useState(false);
+  const commandRef = useRef<HTMLElement>(null);
+  const command = "npm install -g @ashutosh0x/jarvis";
+
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(command);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1600);
+    } catch {
+      const node = commandRef.current;
+      if (!node) return;
+      const range = document.createRange();
+      range.selectNodeContents(node);
+      const selection = window.getSelection();
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+    }
+  }
+
+  return (
+    <div className="inline-flex items-center gap-3 rounded-full border border-foreground/15 bg-foreground/[0.03] pl-6 pr-2 py-2 font-mono text-sm">
+      <span className="text-muted-foreground select-none" aria-hidden="true">$</span>
+      <code ref={commandRef} className="text-foreground">{command}</code>
+      <button
+        type="button"
+        onClick={copy}
+        aria-label={copied ? "Copied" : "Copy install command"}
+        className="ml-1 grid h-9 w-9 place-items-center rounded-full text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
+      >
+        {copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
+      </button>
+    </div>
   );
 }

@@ -7,6 +7,7 @@ import { LiveService } from './liveService.js';
 import { generateContentLocal, checkOllama, routeLocalAction, describeImageLocal } from './toolService.js';
 import { routePhoneCommand, targetsPhone, executePhoneTool } from './services/phoneTools.js';
 import ragService from './services/ragService.js';
+import { parseWebSearchQuery, summarizeForSpeech, formatForDisplay } from './services/webSearchIntent.js';
 import reflectionService from './services/reflectionService.js';
 import * as quant from './services/quant.js';
 import * as portfolio from './services/portfolio.js';
@@ -31,6 +32,7 @@ import { NeuralTTSService } from './services/ttsService.js';
 import { guardOutput } from './services/groundingGuard.js';
 import { config } from '../config.js';
 import perf from './services/perf.js';
+import { diagnoseLocalFailure, health } from './services/selfHeal.js';
 
 class Jarvis {
     constructor() {
@@ -119,6 +121,13 @@ class Jarvis {
             if (ok) console.log('NeuralTTS: edge-tts connected — natural voice active (NOT local)');
             else console.log('NeuralTTS: server unavailable — using SAPI fallback');
         }).catch(() => {});
+
+        /* Learned timeout budgets survive a restart. Without this every launch
+           re-learns this machine's speed from the seed constants, which means
+           the first few turns after every start pay the same too-tight deadline
+           that caused the problem in the first place. */
+        this._restoreHealthState();
+        setInterval(() => this._persistHealthState(), 60000);
 
         // Live Service (Gemini Multimodal Live)
         this.liveService = new LiveService();
@@ -285,6 +294,17 @@ class Jarvis {
         if (weatherKey) this.openWeatherApiKey = weatherKey;
     }
 
+    /* The Web Speech API exposes no gender on SpeechSynthesisVoice, so the
+       judgement has to come off the name. One list, used by both the selection
+       above and `list voices`, so the two can never disagree about what counts.
+       Matching by known female names rather than by excluding male ones keeps
+       an unrecognised voice out of the assistant's mouth instead of letting it
+       through by default. */
+    isFemaleVoice(name) {
+        return /\b(female|zira|aria|jenny|michelle|ava|emma|hazel|samantha|sonia|libby|maisie|natasha|clara|molly|neerja|victoria|karen|moira|tessa|fiona)\b/i
+            .test(String(name || ''));
+    }
+
     // Initialize voice selection
     initializeVoice() {
         // Wait for voices to be loaded
@@ -292,60 +312,64 @@ class Jarvis {
             const voices = this.synthesis.getVoices();
             const savedVoiceName = this.settings.get('voiceName');
 
-            if (savedVoiceName) {
-                // Try to find the saved voice
+            /* The saved name wins over the defaults on merge, so an install
+               that already stored a male system voice would keep speaking with
+               it forever and the selection below would never run. A stored name
+               is therefore honoured only while it still passes isFemaleVoice —
+               that is what evicts the old default, without this file having to
+               carry a list of male names to match against. */
+            if (savedVoiceName && this.isFemaleVoice(savedVoiceName)) {
                 const savedVoice = voices.find(v => v.name === savedVoiceName);
                 if (savedVoice) {
                     this.selectedVoice = savedVoice;
                     console.log('Using saved voice:', savedVoice.name);
                     return;
                 }
+            } else if (savedVoiceName) {
+                console.log('Discarding stored non-female voice:', savedVoiceName);
+                this.settings.set('voiceName', null);
             }
 
-            // Find a male voice (prefer English, male-sounding names)
-            const maleVoiceNames = [
-                'Microsoft David', 'Microsoft Mark', 'Microsoft Zira',
-                'Google US English', 'Alex', 'Daniel', 'Fred', 'Tom',
-                'Microsoft David Desktop', 'Microsoft Mark Desktop'
+            /* Preferred order for the stand-in voice, best-first: Windows 11
+               "Natural" voices, then the classic SAPI ones (Zira is the only
+               female voice on a stock Windows install), then Chromium's own. */
+            const preferredVoices = [
+                'Microsoft Aria', 'Microsoft Jenny', 'Microsoft Michelle', 'Microsoft Ava',
+                'Microsoft Emma', 'Microsoft Sonia', 'Microsoft Libby', 'Microsoft Hazel',
+                'Microsoft Zira Desktop', 'Microsoft Zira',
+                'Google UK English Female',
+                'Samantha', 'Victoria', 'Karen', 'Moira', 'Tessa'
             ];
 
-            // First try to find by preferred names
-            for (const name of maleVoiceNames) {
+            for (const name of preferredVoices) {
                 const voice = voices.find(v => v.name.includes(name) || name.includes(v.name));
                 if (voice) {
                     this.selectedVoice = voice;
                     this.settings.set('voiceName', voice.name);
-                    console.log('Selected male voice:', voice.name);
+                    console.log('Selected female voice:', voice.name);
                     return;
                 }
             }
 
-            // Fallback: find any male voice (check lang and name)
-            const maleVoice = voices.find(v => {
-                const name = v.name.toLowerCase();
-                const lang = v.lang.toLowerCase();
-                return lang.startsWith('en') && (
-                    name.includes('male') ||
-                    name.includes('david') ||
-                    name.includes('mark') ||
-                    name.includes('daniel') ||
-                    name.includes('alex') ||
-                    name.includes('fred') ||
-                    name.includes('tom') ||
-                    name.includes('john') ||
-                    name.includes('james')
-                );
-            });
+            // Nothing preferred is installed — take any English voice that reads as female.
+            const femaleVoice = voices.find(v =>
+                v.lang.toLowerCase().startsWith('en') && this.isFemaleVoice(v.name));
 
-            if (maleVoice) {
-                this.selectedVoice = maleVoice;
-                this.settings.set('voiceName', maleVoice.name);
-                console.log('Selected male voice (fallback):', maleVoice.name);
+            if (femaleVoice) {
+                this.selectedVoice = femaleVoice;
+                this.settings.set('voiceName', femaleVoice.name);
+                console.log('Selected female voice (fallback):', femaleVoice.name);
             } else {
-                // Last resort: use default voice
+                /* No female voice installed at all. The system default is left
+                   in place because there is nothing better to pick — on a stock
+                   Windows install that default is male, so this is warned about
+                   rather than logged quietly. It is only ever reached when the
+                   neural server is also down; installing a voice under
+                   Settings > Time & language > Speech fixes it. */
                 this.selectedVoice = voices.find(v => v.default) || voices[0];
                 if (this.selectedVoice) {
-                    console.log('Using default voice:', this.selectedVoice.name);
+                    console.warn('No female system voice installed — falling back to',
+                        this.selectedVoice.name);
                 }
             }
         };
@@ -909,7 +933,7 @@ class Jarvis {
                 this._ttsSafetyTimer = setTimeout(() => { this.ttsActive = false; }, maxMs);
 
                 this.neuralTTS.speak(clean, {
-                    voice: this.settings.get('neuralVoice') || 'en-US-GuyNeural',
+                    voice: this.settings.get('neuralVoice') || 'en-US-EmmaNeural',
                     speed: this.settings.get('speechRate') || 1.0
                 }).then((ok) => {
                     clearTimeout(this._ttsSafetyTimer);
@@ -1468,6 +1492,15 @@ class Jarvis {
         const news = this.parseNewsQuery(cmd);
         if (news) return { intent: 'NEWS_QUERY', topic: news.topic };
 
+        /* Real web search. Must sit AFTER news and the other specialised
+           handlers (they are faster and better sourced) but BEFORE dictation:
+           "search about jamie diamond" was being classified TYPE_TEXT, so
+           asking for a search started typing instead. Anything that reached the
+           local model instead was answered with invented citations, which is
+           what this exists to stop. */
+        const websearch = parseWebSearchQuery(cmd);
+        if (websearch) return { intent: 'WEB_SEARCH', query: websearch.query };
+
         // Usage / self-report — surfaces the interaction log so the improvement
         // loop is visible from inside Jarvis ("how am I using you", "usage stats").
         if (/\b(usage stats|interaction stats|how am i using you|how are you performing|self ?report|show (my )?(usage|stats)|your stats)\b/.test(cmd))
@@ -1832,6 +1865,9 @@ class Jarvis {
                     break;
                 case 'NEWS_QUERY':
                     await this.handleNewsQuery(intent.topic);
+                    break;
+                case 'WEB_SEARCH':
+                    await this.handleWebSearch(intent.query);
                     break;
                 case 'SELF_CRITIQUE':
                     await this.handleSelfCritique();
@@ -5267,6 +5303,79 @@ class Jarvis {
         this.speak(headline);
     }
 
+    /**
+     * Web search.
+     *
+     * Modelled on handleNewsQuery rather than on the AI_COMMAND path, and that
+     * is the whole speed story: news returns in 542-1188ms because it fetches
+     * and reads out, while the old search route ran retrieval plus local
+     * generation and measured 31-51s. Results are spoken as titles and sources
+     * only — nothing is passed to the model to summarise, because a model
+     * summarising search results is how the fabricated citations got in.
+     */
+    async handleWebSearch(query) {
+        if (!window.electronAPI?.webSearch) {
+            this.speak('Web search is not available in this environment.');
+            return;
+        }
+        this.displayText(`Searching the web for ${query}...`, null);
+
+        let res;
+        try {
+            res = await window.electronAPI.webSearch({ query, limit: 6 });
+        } catch (e) {
+            console.error('Web search error:', e);
+            this.speak(`I could not run that search, Sir.`);
+            return;
+        }
+
+        if (!res || !res.success || !res.results?.length) {
+            /* Say so plainly. The failure mode being replaced is a confident
+               invented answer, so an honest miss is the improvement. */
+            this.speak(`I could not find any results for ${query}, Sir.`);
+            if (res?.error) console.warn('Web search failed:', res.error);
+            return;
+        }
+
+        /* The correction is always SHOWN, but only SPOKEN when it changes the
+           subject. Reading "showing results for situational awareness" aloud
+           after the user said "situtational awareness" is noise — they know
+           what they meant, and hearing it every time trains them to ignore it.
+           An entity fix is different: "jamie diamond" becoming Jamie Dimon is a
+           different person, and answering about someone else without saying so
+           is indistinguishable from being wrong. */
+        const searched = res.correction?.corrected || query;
+        if (res.correction?.kind === 'entity') {
+            this.speak(`I took that as ${searched}.`);
+        }
+
+        this.displayText(formatForDisplay(res.results, searched, {
+            provider: res.cached ? `${res.provider}, cached` : res.provider,
+            answer: res.answer,
+            correction: res.correction ? query : null,
+        }), null);
+        this.speak(summarizeForSpeech(res.results, searched, { answer: res.answer }));
+
+        /* Feed the results to RAG so a follow-up question ("what did the first
+           one say?") has real retrieved text to work from.
+
+           NOT awaited, and batched into ONE ingest. This was six sequential
+           awaited ingests, each costing an embedding round trip, and it ran
+           AFTER the answer had already been spoken — so the user heard the
+           reply at 1.9s while the turn stayed open for 32s, holding the
+           microphone gate and blocking the follow-up question that indexing
+           exists to support. Indexing is a background side effect of answering,
+           never part of it. */
+        const indexable = res.results
+            .map((r) => `${r.title}. ${r.snippet || ''}`.trim())
+            .filter(Boolean)
+            .join('\n\n');
+        if (indexable) {
+            ragService.ingest(indexable, { source: 'web-search', url: res.results[0]?.url })
+                .catch((e) => console.warn('Web search: could not index results', e.message));
+        }
+    }
+
     async handleNewsQuery(topic) {
         if (!window.electronAPI?.getNews) {
             this.speak('News is not available in this environment.');
@@ -5800,24 +5909,11 @@ class Jarvis {
         try {
             const voices = this.synthesis.getVoices();
             const englishVoices = voices.filter(v => v.lang.startsWith('en'));
-            const maleVoices = englishVoices.filter(v => {
-                const name = v.name.toLowerCase();
-                return name.includes('male') ||
-                    name.includes('david') ||
-                    name.includes('mark') ||
-                    name.includes('daniel') ||
-                    name.includes('alex') ||
-                    name.includes('fred') ||
-                    name.includes('tom') ||
-                    name.includes('john') ||
-                    name.includes('james') ||
-                    name.includes('microsoft david') ||
-                    name.includes('microsoft mark');
-            });
+            const femaleVoices = englishVoices.filter(v => this.isFemaleVoice(v.name));
 
-            if (maleVoices.length > 0) {
-                const voiceNames = maleVoices.slice(0, 5).map(v => v.name).join(', ');
-                this.speak(`Available male voices: ${voiceNames}`);
+            if (femaleVoices.length > 0) {
+                const voiceNames = femaleVoices.slice(0, 5).map(v => v.name).join(', ');
+                this.speak(`Available female voices: ${voiceNames}`);
             } else {
                 const voiceNames = englishVoices.slice(0, 5).map(v => v.name).join(', ');
                 this.speak(`Available voices: ${voiceNames}`);
@@ -6862,19 +6958,37 @@ class Jarvis {
        error was spoken verbatim — "Ollama error 500: is 'gemma3:4b' pulled?
        Try: ollama pull gemma3:4b" — which is a developer's message read aloud
        to a user whose real problem was that the machine sat at 97% memory and
-       the model was being evicted. */
+       the model was being evicted.
+
+       That fix then over-corrected into a different lie: every timeout was
+       blamed on memory pressure regardless of cause. On 30 Jul it told the user
+       to close Chrome tabs eleven times while 9GB was free and the model was
+       resident — the real cost was a 6s rerank timeout on every query. The
+       stage timings that say so were already being recorded, so they are read
+       here rather than guessed at. */
+    /** Load learned budgets. Never throws — supervision must not break startup. */
+    _restoreHealthState() {
+        try {
+            const raw = localStorage.getItem('jarvis_health');
+            if (raw) health.load(JSON.parse(raw));
+        } catch (e) {
+            console.warn('Health state restore failed (starting from defaults):', e.message);
+        }
+    }
+
+    _persistHealthState() {
+        try {
+            localStorage.setItem('jarvis_health', JSON.stringify(health.toJSON()));
+        } catch { /* quota or private mode — learning just restarts next launch */ }
+    }
+
     _describeLocalFailure(error) {
-        const msg = String(error?.message || error || '');
-        if (error?.name === 'LocalTimeoutError' || /stalled|produced nothing/i.test(msg)) {
-            return 'The local model did not respond in time, Sir. It is usually memory pressure — closing a few Chrome tabs normally fixes it. Ask me again when you are ready.';
-        }
-        if (/50\d/.test(msg)) {
-            return 'The local model failed to load, Sir. That is normally low memory. I have left the request alone rather than guess an answer.';
-        }
-        if (/fetch|network|ECONNREFUSED|Failed to fetch/i.test(msg)) {
-            return 'I cannot reach the local model server, Sir. Ollama does not appear to be running.';
-        }
-        return 'Local inference failed, Sir, so I have no answer for that rather than an invented one.';
+        return diagnoseLocalFailure({
+            stages: perf.snapshot()?.stages || {},
+            error,
+            // Only claim memory pressure when memory has actually been measured.
+            freeMemoryGb: Number.isFinite(this._freeMemoryGb) ? this._freeMemoryGb : null,
+        });
     }
 
     /* Queued speech for streaming answers: does NOT cancel prior utterances
@@ -6922,11 +7036,6 @@ class Jarvis {
 
         this._speechDraining = true;
         const line = queue.shift();
-        const u = new SpeechSynthesisUtterance(line);
-        if (this.selectedVoice) u.voice = this.selectedVoice;
-        u.rate = this.settings.get('speechRate') || 1.0;
-        u.pitch = this.settings.get('speechPitch') || 1.0;
-        u.volume = this.settings.get('speechVolume') || 1.0;
 
         let settled = false;
         const finish = () => {
@@ -6942,13 +7051,42 @@ class Jarvis {
                 else if (this._utterCount === 0) this.ttsActive = false;
             }, this.settings.get('speechGapMs') ?? 450);
         };
-        u.onend = finish;
-        u.onerror = finish;
+
         /* A line that never reports back must not stall the queue forever —
            the same eventless-death problem as the mic watchdog. Budget is
            generous (SAPI runs ~450ms/word) and only fires if onend does not. */
         const safety = setTimeout(finish, Math.min(line.split(/\s+/).length * 500 + 4000, 40000));
 
+        /* Same voice as speak(). This queue used to go straight to SAPI while
+           speak() went through the neural server, so a streamed local-model
+           answer came out in the system voice and everything else in the neural
+           one — two different voices inside a single reply. Draining one line at
+           a time means the interrupt inside neuralTTS.speak() only ever cancels
+           an utterance that has already finished. */
+        if (this.neuralTTS && this.neuralTTS.isAvailable()) {
+            this.neuralTTS.speak(line, {
+                voice: this.settings.get('neuralVoice') || 'en-US-EmmaNeural',
+                speed: this.settings.get('speechRate') || 1.0
+            }).then((ok) => {
+                if (ok) finish();
+                else this._drainSpeechViaSAPI(line, finish);
+            }).catch(() => this._drainSpeechViaSAPI(line, finish));
+            return;
+        }
+
+        this._drainSpeechViaSAPI(line, finish);
+    }
+
+    /** Speak one queued line through SAPI. Only reached when the neural server
+        is down — it is the fallback for the queue, not the normal path. */
+    _drainSpeechViaSAPI(line, finish) {
+        const u = new SpeechSynthesisUtterance(line);
+        if (this.selectedVoice) u.voice = this.selectedVoice;
+        u.rate = this.settings.get('speechRate') || 1.0;
+        u.pitch = this.settings.get('speechPitch') || 1.0;
+        u.volume = this.settings.get('speechVolume') || 1.0;
+        u.onend = finish;
+        u.onerror = finish;
         this.synthesis.speak(u);
     }
 
