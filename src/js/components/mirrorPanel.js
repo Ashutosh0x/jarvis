@@ -42,6 +42,7 @@ import {
     nextPinchSpread,
     PINCH_SPREAD
 } from '../services/mirrorIntent.js';
+import HapticManager from '../services/hapticManager.js';
 
 const api = () => window.electronAPI?.mirror;
 
@@ -770,6 +771,11 @@ stage?.addEventListener('pointerdown', (e) => {
 
     const v = virtualFor(p, e);
     showCursor(e.clientX, e.clientY, v ? 'pinch' : 'tap');
+    /* The ripple marks WHERE; this marks THAT. Together they close the gap the
+       round trip opens — see the showCursor note above. Audio only: the ripple
+       is already the positioned visual, so `mirror-tap` carries no css channel
+       and cannot double it. */
+    HapticManager.mirrorTap();
     send('touch', { action: 'down', x: p.x, y: p.y, pressure: 1, pointerId: 'mouse' });
     if (v) {
         virtualFingerDown = true;
@@ -945,13 +951,24 @@ document.addEventListener('keyup', (e) => {
 
 /* ---------- chrome ---------- */
 
-closeBtn?.addEventListener('click', () => closeMirror());
-fullscreenBtn?.addEventListener('click', () => toggleMirrorFullscreen());
-muteBtn?.addEventListener('click', () => { setMirrorMuted(!muted); canvas?.focus(); });
+/* The panel chrome is the one place in the mirror where a click is handled
+   locally and returns instantly, so it gets the full press feedback — unlike a
+   touch on the canvas, which is a round trip and uses the positioned ripple. */
+closeBtn?.addEventListener('click', () => { HapticManager.click(closeBtn); closeMirror(); });
+fullscreenBtn?.addEventListener('click', () => {
+    HapticManager.toggle(fullscreenBtn);
+    toggleMirrorFullscreen();
+});
+muteBtn?.addEventListener('click', () => {
+    HapticManager.toggle(muteBtn);
+    setMirrorMuted(!muted);
+    canvas?.focus();
+});
 
 navBar?.addEventListener('click', (e) => {
     const name = e.target?.dataset?.action;
     if (!open || !name) return;
+    HapticManager.click(e.target);
     send('action', { name });
     canvas?.focus();
 });

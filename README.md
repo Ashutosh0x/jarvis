@@ -1539,6 +1539,10 @@ These are deliberate or platform-imposed, not defects.
   on an untrusted network.
 - **The orb is cropped in portrait.** The desktop camera sits at `z=14`, which
   assumes a landscape aspect ratio.
+- **Nothing vibrates on a desktop.** `navigator.vibrate` is callable in Electron
+  and moves nothing, because there is no motor. Feedback is animation plus a
+  short synthesized click; the vibration channel reports itself unavailable
+  rather than pretending. See [docs/FEEDBACK.md](docs/FEEDBACK.md).
 - **The mirror needs USB debugging, and one device.** There is no wireless
   fallback that skips ADB, and with several devices connected JARVIS asks which
   one rather than picking. Ambiguity is an error here, never a coin flip.

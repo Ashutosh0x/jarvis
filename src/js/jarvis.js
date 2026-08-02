@@ -7,6 +7,7 @@ import { LiveService } from './liveService.js';
 import { generateContentLocal, checkOllama, routeLocalAction, describeImageLocal } from './toolService.js';
 import { routePhoneCommand, targetsPhone, executePhoneTool } from './services/phoneTools.js';
 import { parseMirrorCommand } from './services/mirrorIntent.js';
+import HapticManager from './services/hapticManager.js';
 import ragService from './services/ragService.js';
 import { parseWebSearchQuery, summarizeForSpeech, formatForDisplay } from './services/webSearchIntent.js';
 import reflectionService from './services/reflectionService.js';
@@ -79,6 +80,18 @@ class Jarvis {
         // Settings Manager
         this.settings = new SettingsManager();
         this.applySettings();
+
+        /* Feedback. Probes what this machine can actually do rather than
+           assuming — on the desktop that is animation plus a synthesized
+           click, because navigator.vibrate is callable in Electron and moves
+           nothing. The probe result is logged so a missing channel is a stated
+           fact instead of a mystery. */
+        this.haptics = HapticManager;
+        const hapticCaps = HapticManager.init({
+            enabled: this.settings.get('hapticsEnabled') !== false,
+            intensity: this.settings.get('hapticIntensity') ?? 0.7
+        });
+        console.log('Jarvis: feedback channels', hapticCaps);
 
         // No Gemini key -> force local Gemma regardless of stored settings
         // (prevents stale localStorage from routing to a dead cloud endpoint)

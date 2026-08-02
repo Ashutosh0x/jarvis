@@ -53,6 +53,16 @@ class SettingsManager {
             // --- OCR ---
             ocrProvider: 'auto',      // 'auto' = local Unlimited-OCR if server is up, else cloud vision
 
+            /* --- Feedback (haptics) ---
+               On a desktop these are a short animation plus a synthesized
+               click, because navigator.vibrate is callable in Electron and
+               moves nothing — there is no motor. Intensity scales LOUDNESS
+               only; a quieter click is the same click, not a longer one.
+               `prefers-reduced-motion` is honoured separately and gates the
+               animation without silencing the confirmation. */
+            hapticsEnabled: true,
+            hapticIntensity: 0.7,     // full gain is louder than a UI click wants
+
             /* Bumped whenever a default below must beat the copy already in
                localStorage. See MIGRATED_KEYS. */
             settingsVersion: 3

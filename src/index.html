@@ -893,6 +893,90 @@
     @media (max-width: 900px) {
       #mirror-panel { width: auto; left: 0; }
     }
+
+    /* ---------- haptic feedback ----------
+
+       The visual half of hapticManager.js. On a desktop these ARE the haptics:
+       navigator.vibrate is callable in Electron and moves nothing, because
+       there is no motor. So a press has to be sold with motion and sound.
+
+       Durations are short on purpose — 80-150ms for a press. Anything longer
+       stops reading as a response to your click and starts reading as the app
+       doing something of its own. `transform` and `filter` only, so each of
+       these composites on the GPU and cannot cause layout during the
+       always-on visualizer's animation frame. */
+
+    @keyframes haptic-click-anim {
+      0%   { transform: scale(1); }
+      40%  { transform: scale(0.96); }
+      100% { transform: scale(1); }
+    }
+
+    @keyframes haptic-tick-anim {
+      0%   { transform: translateY(0); }
+      50%  { transform: translateY(1px); }
+      100% { transform: translateY(0); }
+    }
+
+    @keyframes haptic-toggle-anim {
+      0%   { transform: scale(1); }
+      50%  { transform: scale(0.98); }
+      100% { transform: scale(1); }
+    }
+
+    /* Success and error are a glow and a shake rather than two colours: the
+       shape carries the meaning without relying on colour alone, which is the
+       one channel a colour-blind user may not have. */
+    @keyframes haptic-success-anim {
+      0%   { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.45); }
+      70%  { box-shadow: 0 0 0 8px rgba(34, 197, 94, 0); }
+      100% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0); }
+    }
+
+    @keyframes haptic-error-anim {
+      0%, 100% { transform: translateX(0); }
+      20%      { transform: translateX(-3px); }
+      40%      { transform: translateX(3px); }
+      60%      { transform: translateX(-2px); }
+      80%      { transform: translateX(2px); }
+    }
+
+    @keyframes haptic-wake-anim {
+      0%   { filter: brightness(1); }
+      50%  { filter: brightness(1.25); }
+      100% { filter: brightness(1); }
+    }
+
+    @keyframes haptic-notification-anim {
+      0%   { transform: translateY(0); }
+      25%  { transform: translateY(-2px); }
+      75%  { transform: translateY(1px); }
+      100% { transform: translateY(0); }
+    }
+
+    .haptic-click        { animation: haptic-click-anim 120ms ease-out; }
+    .haptic-tick         { animation: haptic-tick-anim 80ms ease-out; }
+    .haptic-toggle       { animation: haptic-toggle-anim 150ms ease-out; }
+    .haptic-success      { animation: haptic-success-anim 400ms ease-out; }
+    .haptic-error        { animation: haptic-error-anim 300ms ease-out; }
+    .haptic-wake         { animation: haptic-wake-anim 500ms ease-out; }
+    .haptic-notification { animation: haptic-notification-anim 200ms ease-out; }
+
+    /* Motion off, feedback intact.
+       This kills the ANIMATIONS only. The audio and vibration channels
+       deliberately survive — see resolvePlan() in hapticIntent.js. A user
+       asking for less motion is not asking to lose confirmation, and is the
+       user most likely to be relying on a non-visual signal.
+
+       The mirror's own press ripple is included, because it is motion under
+       the same rule. */
+    @media (prefers-reduced-motion: reduce) {
+      .haptic-click, .haptic-tick, .haptic-toggle, .haptic-success,
+      .haptic-error, .haptic-wake, .haptic-notification {
+        animation: none !important;
+      }
+      .mirror-cursor { animation-duration: 0.01ms !important; opacity: 0; }
+    }
   </style>
 </head>
 
