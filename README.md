@@ -311,6 +311,32 @@ is required. Leading "Jarvis" and common mis-hearings are stripped.
 - Transparent frameless window that floats over other applications
 - F2 toggles between orb-only and full HUD
 
+### Feedback
+
+> **Full write-up:** [docs/FEEDBACK.md](docs/FEEDBACK.md)
+
+Confirmation on the channels the machine actually has. Nothing vibrates on a
+desktop — `navigator.vibrate` is callable in Electron and moves nothing,
+because there is no motor — so a press is carried by a short animation and a
+synthesized click, and the vibration channel reports itself unavailable rather
+than pretending.
+
+- Every heard utterance gets an instant 8 ms acknowledgement, before the answer
+  exists. Speech has no click of its own, so the gap before the first word back
+  was otherwise indistinguishable from not being heard
+- Every unprompted event — a phone notification, a download, a whale transfer,
+  a price alert — carries the same rising marker
+- Destructive actions get the one effect with a **gap** in it: pulse, pause,
+  pulse, falling and low. Every other effect is a single gesture, so it cannot
+  be mistaken for a confirmation. A warning falls; a success rises
+- Audio is synthesized rather than sampled: no binary assets, nothing to fetch,
+  and the sound is a table of numbers that can be reviewed and tested
+- `prefers-reduced-motion` gates the animation only. It is a statement about
+  motion, not about feedback, and silencing the audio would strip the
+  non-visual confirmation from the user who just asked for less movement
+- The paired phone has a real motor, and gets the same vocabulary mapped onto
+  Android's own haptic API — probed by primitive, not by API level
+
 ### System control
 
 - Application launch through an allowlist

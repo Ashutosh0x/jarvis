@@ -1,7 +1,7 @@
 {
   "name": "@ashutosh0x/jarvis",
-  "version": "0.4.0",
-  "description": "A local-first desktop AI assistant: federated live web search with no API key, on-device vision and OCR, neural TTS, live Android screen mirroring with touch control, and a self-healing supervisor. Ships as an Electron app and an importable search library.",
+  "version": "0.5.0",
+  "description": "A local-first desktop AI assistant: federated live web search with no API key, on-device vision and OCR, neural TTS, live Android screen mirroring with touch control, multimodal feedback, and a self-healing supervisor. Ships as an Electron app and an importable search library.",
   "main": "electron.js",
   "scripts": {
     "test": "node scripts/run-tests.mjs",
@@ -47,6 +47,8 @@
     "scrcpy",
     "android",
     "adb",
+    "haptics",
+    "haptic-feedback",
     "jarvis"
   ],
   "author": {
