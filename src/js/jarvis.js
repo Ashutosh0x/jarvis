@@ -466,6 +466,7 @@ class Jarvis {
             // Check for type field (event-based Gemini Live format)
             if (msg.type === 'input_audio_transcription.result') {
                 if (msg.text && msg.text.trim()) {
+                    this.haptics.acknowledge();
                     console.log("🎤 [TRANSCRIPT] User said:", msg.text);
                     this.appendLiveTranscript(msg.text);
                     this.logToHUD(msg.text, 'user');
@@ -475,6 +476,7 @@ class Jarvis {
 
             // Also check serverContent.inputTranscript (SDK format)
             if (msg.serverContent?.inputTranscript) {
+                this.haptics.acknowledge();
                 const transcript = msg.serverContent.inputTranscript;
                 console.log("🎤 [TRANSCRIPT] User said:", transcript);
                 this.appendLiveTranscript(transcript);
@@ -2272,6 +2274,7 @@ class Jarvis {
     }
 
     async handleClearMemory() {
+        this.haptics.warn();
         this.memory.clearHistory();
         this.speak('Conversation history cleared');
     }
@@ -6588,6 +6591,7 @@ class Jarvis {
                 ? `Sir, you have a new message from ${sender} on ${appName}.`
                 : `Sir, new notification from ${appName}.`;
 
+            this.haptics.attention();
             this.speak(announcement);
             const preview = notif.text ? `${sender}: ${notif.text.slice(0, 200)}` : sender;
             this.displayText(`Phone - ${appName}\n${preview}`, null);
@@ -6851,6 +6855,7 @@ class Jarvis {
             return;
         }
 
+        this.haptics.acknowledge();
         this._showTranscript(t, 'acted', 'YOU SAID');
         this._lastInputWasVoice = true;
         this.processCommand(cmd);
@@ -7049,6 +7054,7 @@ class Jarvis {
                 switch (evt.type) {
                     case 'download-added': {
                         const { filePath, name } = evt.payload;
+                        this.haptics.attention();
                         this.speak(`Sir, a new document arrived in Downloads: ${name}.`);
                         // Auto-read it if the local OCR server is up, then memorize
                         if (await this.screenCapture.isOcrAvailable()) {
@@ -7066,6 +7072,7 @@ class Jarvis {
                         // Privacy: only the masked hint ever reaches this process.
                         // Deliberately NOT stored in RAG or trajectory logs.
                         const { kind, masked } = evt.payload;
+                        this.haptics.warn();
                         this.speak(`Sir, careful. I detected what looks like a ${kind} on your clipboard. Mind where you paste it.`);
                         this.displayText(`Clipboard warning: ${kind} detected (${masked})`, null);
                         break;
@@ -7130,7 +7137,7 @@ class Jarvis {
                             `Block ${w.blockNumber}`,
                         ].filter(Boolean).join('\n');
                         this.displayText(detail, null);
-                        if (this._whaleAlertsOn) this.speak(`Sir, significant movement on ${w.chain === 'ethereum' || !w.chain ? 'Ethereum' : w.chain}. ${spokenLine}`);
+                        if (this._whaleAlertsOn) { this.haptics.attention(); this.speak(`Sir, significant movement on ${w.chain === 'ethereum' || !w.chain ? 'Ethereum' : w.chain}. ${spokenLine}`); }
                         break;
                     }
 
@@ -7150,7 +7157,7 @@ class Jarvis {
                             `${e.kind === 'mint' ? 'TO  ' : 'FROM'} ${e.counterparty}`,
                             `TX   ${e.hash}`,
                         ].filter(Boolean).join('\n'), null);
-                        if (this._whaleAlertsOn) this.speak(`Sir, stablecoin supply change. ${line}`);
+                        if (this._whaleAlertsOn) { this.haptics.attention(); this.speak(`Sir, stablecoin supply change. ${line}`); }
                         break;
                     }
 
@@ -7176,6 +7183,7 @@ class Jarvis {
                             `${h.direction === 'out' ? 'TO  ' : 'FROM'} ${h.counterpartyAddress || 'unknown'}${cpInfo.ensName ? ` (${cpInfo.ensName})` : ''}${cpInfo.facts.length ? ` — ${cpInfo.facts.join(', ')}` : ''}`,
                             `TX   ${h.hash}`,
                         ].join('\n'), null);
+                        this.haptics.attention();
                         this.speak(`Sir, your watched wallet has activity. ${line}`);
                         break;
                     }
@@ -7183,6 +7191,7 @@ class Jarvis {
                     case 'price-alert': {
                         // Watchlist target/stop crossing — always announce
                         const { message, type } = evt.payload;
+                        this.haptics.attention();
                         const prefix = type === 'stop' ? 'Sir, heads up.' : 'Sir, good news.';
                         this.speak(`${prefix} ${message}`);
                         this.displayText(`Market alert: ${message}`, null);
