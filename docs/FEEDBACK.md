@@ -89,6 +89,32 @@ rather than a matter of taste.
 unpositioned animation on top of the good one would be worse than nothing. The
 ripple marks **where**; the sound marks **that**.
 
+## Register: three effects that carry tone
+
+Most of the vocabulary confirms a click. These three exist to say *how* rather
+than *that*.
+
+| Effect | Shape | Why |
+|---|---|---|
+| `warn` | pulse, **pause**, pulse — falling, low | Precedes a destructive action |
+| `acknowledge` | the quietest thing here, 8 ms | "Heard you", fired on transcript |
+| `attention` | rises, but softer than success | Unprompted information |
+
+**`warn` is the only effect with a gap in it.** Everything else is a single
+gesture, so a gap is unlike the rest of the vocabulary and cannot be mistaken
+for an ordinary confirmation — which is the entire point of a warning. It is
+also the lowest and slowest tone, because a warning that sounds like a success
+is worse than no warning. Direction does the work: **a warning falls, a success
+rises**, and that holds without the listener being told. On the phone it maps to
+`double-click`, the one Android predefined effect with an internal gap.
+
+**`acknowledge` fires on every utterance**, before an answer exists. Speech has
+no click of its own, so without it the gap between speaking and the first word
+back is indistinguishable from not being heard. It is deliberately the quietest
+entry in the table and carries no animation — anything more would become the
+sound of the room. Asserted in tests rather than left to judgement: no other
+effect may be quieter.
+
 ## Measured
 
 Rendered through `OfflineAudioContext` in the real app, which renders

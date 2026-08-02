@@ -190,6 +190,56 @@ const check = (n, c) => { c ? pass++ : fail++; console.log(`${c ? 'PASS' : 'FAIL
         unmapped.length === 0);
 }
 
+/* --- register effects ----------------------------------------------------- */
+{
+    const caps = capabilitiesFrom({
+        hasAudioContext: true, hasVibrate: true, hasVibrationMotor: true
+    });
+
+    /* A WARNING MUST NOT FEEL LIKE A CONFIRMATION. It precedes a destructive
+       action, so it has to be distinguishable from the effect that says "done"
+       — by structure, not by volume, because volume is user-configurable. */
+    const warn = resolvePlan('warn', { capabilities: caps });
+    const success = resolvePlan('success', { capabilities: caps });
+
+    check('warn has a gap in its pattern (pulse, pause, pulse)',
+        warn.vibrate.length === 3);
+    check('every other effect is a single gesture, so the gap is unique',
+        success.vibrate.length !== 3 || success.vibrate[1] < warn.vibrate[1]);
+
+    // Direction carries the meaning: a warning falls, a success rises.
+    check('warn sweeps DOWN', warn.audio.sweepTo < warn.audio.freq);
+    check('success sweeps UP', success.audio.sweepTo > success.audio.freq);
+    check('warn is lower-pitched than success', warn.audio.freq < success.audio.freq);
+
+    /* Fired on every utterance, so it must be the quietest thing here — the
+       one effect where being noticeable would make it the sound of the room. */
+    const ack = resolvePlan('acknowledge', { capabilities: caps });
+    const others = EFFECT_NAMES
+        .filter((n) => n !== 'acknowledge')
+        .map((n) => resolvePlan(n, { capabilities: caps }))
+        .filter((p) => p.audio);
+    check('acknowledge is the quietest effect',
+        others.every((p) => p.audio.gain >= ack.audio.gain));
+    check('acknowledge is brief enough to sit under speech',
+        ack.audio.durMs <= 10);
+    check('acknowledge adds no animation (it fires while the user is talking)',
+        ack.visual === null);
+
+    // Unprompted information should read as "look up", not as "you did it".
+    const attention = resolvePlan('attention', { capabilities: caps });
+    check('attention rises', attention.audio.sweepTo > attention.audio.freq);
+    check('attention is softer than success', attention.audio.gain < success.audio.gain);
+
+    // A warning must not arrive on the phone as an ordinary click.
+    check('warn maps to the one Android effect with an internal gap',
+        companionEffectFor('warn') === 'double-click');
+    check('acknowledge stays a tick on the phone',
+        companionEffectFor('acknowledge') === 'tick');
+    check('attention maps to notification',
+        companionEffectFor('attention') === 'notification');
+}
+
 /* --- the table itself ----------------------------------------------------- */
 {
     check('the effect vocabulary is non-empty', EFFECT_NAMES.length >= 7);

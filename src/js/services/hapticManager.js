@@ -229,6 +229,12 @@ export const HapticManager = {
     error(el) { return this.fire('error', el); },
     wake(el) { return this.fire('wake', el); },
     notification(el) { return this.fire('notification', el); },
+    /* Before a destructive action — the only effect with a gap in it. */
+    warn(el) { return this.fire('warn', el); },
+    /* "Heard you", fired on transcript, before any answer exists. */
+    acknowledge() { return this.fire('acknowledge'); },
+    /* Unprompted information: an alert, a watcher noticing something. */
+    attention(el) { return this.fire('attention', el); },
     /* The mirror's own ripple already marks the press point, so this adds only
        the audio confirmation — and asks the phone to buzz, which is the one
        place in Jarvis where a real motor is on the other end. */

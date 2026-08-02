@@ -78,6 +78,43 @@ const EFFECTS = {
         css: null,
         vibrate: [5],
         audio: { wave: 'sine', freq: 2400, durMs: 5, gain: 0.03 }
+    },
+
+    /* ---- register ----
+       Three effects that exist to carry tone rather than to confirm a click.
+
+       `warn` is the one that matters. It precedes a destructive action, and it
+       is the ONLY effect with a gap in its pattern: two pulses separated by a
+       pause. Every other effect in this table is a single gesture, so a gap is
+       unlike anything else here and cannot be mistaken for an ordinary
+       confirmation — which is the entire point of a warning. It is also the
+       lowest, slowest tone, because a warning that sounds like a success is
+       worse than no warning at all. */
+    warn: {
+        css: 'haptic-warn',
+        vibrate: [18, 90, 18],
+        audio: { wave: 'triangle', freq: 520, durMs: 130, gain: 0.055, sweepTo: 400 }
+    },
+
+    /* Instant receipt that a spoken command was HEARD — fired on transcript,
+       long before the answer exists. Speech has no click of its own, so
+       without this the gap between speaking and the first word of a reply is
+       indistinguishable from not being heard. Deliberately the quietest thing
+       in the table: it happens on every utterance, and anything louder would
+       become the sound of the room. */
+    acknowledge: {
+        css: null,
+        vibrate: [8],
+        audio: { wave: 'sine', freq: 1400, durMs: 8, gain: 0.022 }
+    },
+
+    /* Unprompted information — an alert firing, a watcher noticing something.
+       Rises like `success` but softer and lower, so it reads as "look up"
+       rather than "you did it". */
+    attention: {
+        css: 'haptic-notification',
+        vibrate: [12, 40, 12],
+        audio: { wave: 'sine', freq: 740, durMs: 80, gain: 0.038, sweepTo: 960 }
     }
 };
 
@@ -234,11 +271,17 @@ export function companionEffectFor(effect) {
     switch (effect) {
         case 'success': return 'success';
         case 'error': return 'error';
-        case 'notification': return 'notification';
+        case 'notification':
+        case 'attention': return 'notification';
         case 'toggle':
         case 'click': return 'click';
         case 'tick':
+        case 'acknowledge':
         case 'mirror-tap': return 'tick';
+        /* A warning must not arrive on the phone as a plain click. double-click
+           is the closest Android predefined effect to the desktop's
+           pulse-gap-pulse, and it is the only one with an internal gap. */
+        case 'warn': return 'double-click';
         case 'wake': return 'heavy-click';
         default: return 'tick';
     }
