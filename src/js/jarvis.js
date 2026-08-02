@@ -8,6 +8,7 @@ import { generateContentLocal, checkOllama, routeLocalAction, describeImageLocal
 import { routePhoneCommand, targetsPhone, executePhoneTool } from './services/phoneTools.js';
 import { parseMirrorCommand } from './services/mirrorIntent.js';
 import HapticManager from './services/hapticManager.js';
+import { parseSystemCommand, SYSTEM_INTENTS } from './services/systemCommands.js';
 import ragService from './services/ragService.js';
 import { parseWebSearchQuery, summarizeForSpeech, formatForDisplay } from './services/webSearchIntent.js';
 import reflectionService from './services/reflectionService.js';
@@ -1638,6 +1639,22 @@ class Jarvis {
         if (/\bwhat (have|did) you learn(ed|t)?\b|\bwhat do you (know|remember) about me\b/.test(cmd))
             return { intent: 'WHAT_LEARNED' };
 
+        /* Windows system commands — lock, sleep, sign out, empty the bin,
+           theme, do-not-disturb, disk, uptime, radio toggles.
+
+           PLACED HERE ON PURPOSE, after REFLECT. "go to sleep and learn" is
+           memory consolidation, not suspend-to-RAM, and it contains the word
+           this parser matches on. The parser carries the same guard, so the
+           rule holds either way — but the ordering is the first line of it.
+
+           From the interaction log of 2 Aug 2026: "empty recycle bin" was
+           answered "You've noted an empty recycle bin, Sir. Is there anything
+           specific you require regarding this observation?" The parser existed
+           and nothing called it. That is the same class as the alarm bug fixed
+           in 606fa69 — a recognised command described instead of executed. */
+        const sysCmd = parseSystemCommand(cmd);
+        if (sysCmd) return { intent: 'SYSTEM_COMMAND', ...sysCmd };
+
         // File Operation Commands
         if (cmd.includes('create folder') || cmd.includes('make folder')) {
             const folderName = cmd.match(/folder (?:named )?([^ ]+)/i)?.[1] || 'NewFolder';
@@ -1815,6 +1832,9 @@ class Jarvis {
                     break;
                 case 'CLEAR_MEMORY':
                     await this.handleClearMemory();
+                    break;
+                case 'SYSTEM_COMMAND':
+                    await this.handleSystemCommand(intent);
                     break;
                 case 'EXPORT_MEMORY':
                     await this.handleExportMemory();
@@ -2277,6 +2297,133 @@ class Jarvis {
         this.haptics.warn();
         this.memory.clearHistory();
         this.speak('Conversation history cleared');
+    }
+
+    /**
+     * Windows system commands.
+     *
+     * Every branch speaks what actually happened, from what the IPC returned —
+     * never a confirmation composed before the call. The whole reason this
+     * handler exists is that "empty recycle bin" was previously answered with
+     * a description of the request instead of the act.
+     *
+     * The destructive ones fire `warn` FIRST — pulse, pause, pulse — so the
+     * feedback lands before the machine locks or the files go, not after.
+     */
+    async handleSystemCommand({ intent, kind, on }) {
+        if (SYSTEM_INTENTS[intent]?.destructive) this.haptics.warn();
+        else this.haptics.click();
+
+        const api = window.electronAPI;
+        try {
+            switch (intent) {
+                case 'LOCK_SCREEN':
+                    await api.systemAction('lock');
+                    break;   // no speech: the screen is already gone
+
+                case 'SLEEP':
+                case 'HIBERNATE':
+                case 'SIGN_OUT': {
+                    const word = { SLEEP: 'sleep', HIBERNATE: 'hibernate', SIGN_OUT: 'sign out' }[intent];
+                    /* Spoken BEFORE the call, uniquely in this handler. These
+                       end the session, so a confirmation afterwards would be
+                       said to nobody — the speech synthesiser goes down with
+                       everything else. */
+                    this.speak(`Going to ${word} now, Sir.`);
+                    await new Promise((r) => setTimeout(r, 1200));
+                    await api.systemAction(
+                        { SLEEP: 'sleep', HIBERNATE: 'hibernate', SIGN_OUT: 'signout' }[intent]
+                    );
+                    break;
+                }
+
+                case 'EMPTY_TRASH': {
+                    const r = await api.emptyRecycleBin();
+                    if (r?.alreadyEmpty) this.speak('The recycle bin is already empty, Sir.');
+                    else if (r?.success) { this.haptics.success(); this.speak('Recycle bin emptied, Sir.'); }
+                    else this.speak(`I could not empty it, Sir. ${r?.error || ''}`.trim());
+                    break;
+                }
+
+                case 'DARK_MODE':
+                case 'LIGHT_MODE': {
+                    const mode = intent === 'DARK_MODE' ? 'dark' : 'light';
+                    const r = await api.setTheme(mode);
+                    this.speak(r?.success ? `Switched to ${mode} mode, Sir.`
+                        : 'I could not change the theme, Sir.');
+                    break;
+                }
+
+                case 'DND_ON':
+                case 'DND_OFF': {
+                    const on2 = intent === 'DND_ON';
+                    const r = await api.setDnd(on2);
+                    this.speak(r?.success
+                        ? (on2 ? 'Do not disturb is on, Sir.' : 'Notifications are back on, Sir.')
+                        : 'I could not change the notification setting, Sir.');
+                    break;
+                }
+
+                case 'DISK_SPACE': {
+                    const r = await api.diskSpace();
+                    if (!r?.success || !r.disks?.length) { this.speak('I could not read the disks, Sir.'); break; }
+                    /* Exact figures from the measurement, not "running low" —
+                       the register asks for the number when there is one. */
+                    const parts = r.disks.map((d) =>
+                        `${d.drive} has ${d.freeGB} of ${d.totalGB} gigabytes free, ${d.percentFree} percent`);
+                    this.speak(`${parts.join('. ')}.`);
+                    this.displayText(parts.join('\n'), null);
+                    /* Unprompted concern, on a threshold rather than a guess. */
+                    if (r.disks.some((d) => d.percentFree <= 10)) {
+                        this.haptics.attention();
+                        this.speak('That is low enough to cause problems, Sir.');
+                    }
+                    break;
+                }
+
+                case 'UPTIME': {
+                    const r = await api.systemUptime();
+                    if (!r?.success) { this.speak('I could not read the uptime, Sir.'); break; }
+                    const h = Math.floor(r.seconds / 3600);
+                    const m = Math.floor((r.seconds % 3600) / 60);
+                    this.speak(h ? `Up for ${h} hours and ${m} minutes, Sir.`
+                        : `Up for ${m} minutes, Sir.`);
+                    break;
+                }
+
+                case 'RADIO_TOGGLE': {
+                    const label = kind === 'bluetooth' ? 'Bluetooth' : 'Wi-Fi';
+                    /* SIGNATURE: radioSet takes ONE object, {kind, state}, and
+                       state is the string 'on'/'off' — not two positional args
+                       and not a boolean. Called wrongly it silently defaults to
+                       Bluetooth On, which is a wrong radio in a wrong direction.
+
+                       CONFIRMATION IS REQUIRED HERE BY CONVENTION. preload.js
+                       states radioSet "is only called after the user answers an
+                       explicit spoken confirmation", and it earns that: turning
+                       Wi-Fi off drops the network, the phone bridge and the
+                       companion link at once.
+
+                       Armed through _armConfirmation, which stores a STRING
+                       action and a timestamp. A first attempt assigned a
+                       closure to _pendingConfirm directly and would have failed
+                       silently: _consumeConfirmation reads p.at, which is
+                       undefined on a function, and dispatches on p.action,
+                       which would never match — the ask would be spoken and the
+                       answer would do nothing. */
+                    this._armConfirmation(`radio-${kind}-${on ? 'on' : 'off'}`,
+                        `turn ${label} ${on ? 'on' : 'off'}`);
+                    this.speak(`That will turn ${label} ${on ? 'on' : 'off'}, Sir. Shall I?`);
+                    break;
+                }
+
+                default:
+                    this.speak('I recognised that but have no handler for it, Sir.');
+            }
+        } catch (e) {
+            this.haptics.error();
+            this.speak(`That failed, Sir. ${e.message}`);
+        }
     }
 
     async handleExportMemory() {
@@ -4513,6 +4660,27 @@ class Jarvis {
         }
         if (p.action === 'bluetooth-list') { await this.handleBluetoothDevices(); return true; }
         if (p.action === 'dictate-start') { await this.handleDictateStart(); return true; }
+
+        /* Radio toggles armed by SYSTEM_COMMAND. Both directions and both
+           radios, and like the branch above it reports what the radio actually
+           reads afterwards rather than what was requested — `applied` is the
+           radio's own answer, and a request that did not take is not a
+           success. */
+        const radio = p.action.match(/^radio-(bluetooth|wifi)-(on|off)$/);
+        if (radio) {
+            const [, kind, state] = radio;
+            const label = kind === 'bluetooth' ? 'Bluetooth' : 'Wi-Fi';
+            this.displayText(`Switching ${label} ${state}...`, null);
+            const r = await window.electronAPI.radioSet({ kind, state });
+            if (r?.success && r.applied) {
+                this.haptics?.success();
+                this.speak(`${label} is ${state}, Sir.`);
+            } else {
+                this.haptics?.error();
+                this.speak(`I could not switch ${label} ${state}, Sir. ${r?.error || `the radio still reads ${r?.state || 'unknown'}`}.`);
+            }
+            return true;
+        }
         return false;
     }
 

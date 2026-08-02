@@ -85,7 +85,13 @@ export function parseSystemCommand(text) {
         return hit('LOCK_SCREEN');
     }
     if (/\bhibernate\b/.test(q)) return hit('HIBERNATE');
-    if (/\b(sleep|suspend)\b/.test(q) && !/\b(alarm|timer|remind)\b/.test(q)) {
+    /* "go to sleep and learn" is the REFLECT command — memory consolidation,
+       not suspend-to-RAM. It routes earlier than this parser, but the guard
+       lives here too so the rule survives a reordering rather than depending
+       on one. Same for alarms: "set an alarm to wake me" mentions sleep
+       without asking for it. */
+    if (/\b(sleep|suspend)\b/.test(q)
+        && !/\b(alarm|timer|remind|learn|reflect|consolidate|memory)\b/.test(q)) {
         return hit('SLEEP');
     }
     if (/\b(sign out|signout|log off|logoff|log out|logout)\b/.test(q)) {

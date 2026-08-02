@@ -50,6 +50,15 @@ contextBridge.exposeInMainWorld('electronAPI', {
     companionClosePairing: () => ipcRenderer.invoke('companion-close-pairing'),
     companionDevices: () => ipcRenderer.invoke('companion-devices'),
     companionCommand: (action, params) => ipcRenderer.invoke('companion-command', action, params),
+    /* Windows system commands. `systemAction` covers the four that end the
+       session (lock, sleep, hibernate, sign out) and is fire-and-forget by
+       nature — the process that would confirm is going away. */
+    systemAction: (action) => ipcRenderer.invoke('system-action', action),
+    emptyRecycleBin: () => ipcRenderer.invoke('empty-recycle-bin'),
+    setTheme: (mode) => ipcRenderer.invoke('set-theme', mode),
+    setDnd: (on) => ipcRenderer.invoke('set-dnd', on),
+    diskSpace: () => ipcRenderer.invoke('disk-space'),
+    systemUptime: () => ipcRenderer.invoke('system-uptime'),
     /* Feedback on the one surface that has a motor.
        Deliberately fire-and-forget: this is called from inside pointer
        handlers, and a rejected promise from a phone that just disconnected

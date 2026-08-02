@@ -113,6 +113,46 @@ const check = (n, c) => { c ? pass++ : fail++; console.log(`${c ? 'PASS' : 'FAIL
     check('hostOf: junk yields empty', hostOf('not a url') === '');
 }
 
+/* --- the verb at the END, from the interaction log of 2 Aug 2026 ----------
+   "latest trending meme coin search" reached the local model and was answered
+   "I do not have access to real-time trending data or the ability to perform
+   searches". That answer was correct and the routing was not: the prefix form
+   needs `search` in front, the question form needs a question word in front,
+   and this had neither. Spoken English puts the verb at either end. */
+{
+    const q = (s) => parseWebSearchQuery(s)?.query ?? null;
+
+    check('the exact logged failure now routes',
+        q('latest trending meme coin search') === 'latest trending meme coin');
+    check('a trailing verb is stripped from the query',
+        q('meme coin search') === 'meme coin');
+    check('trailing works for other subjects too',
+        q('bitcoin price search') === 'bitcoin price');
+    check('the leading form still works',
+        q('search latest trending meme coins') === 'latest trending meme coins');
+
+    /* THE VERB LEAKED INTO THE QUERY. `google` matched before `google search
+       for` could, so this searched the web for the words "search for rust". */
+    check('a compound verb is fully consumed', q('google search for rust') === 'rust');
+    check('web search for X', q('web search for tokio runtime') === 'tokio runtime');
+
+    // Time-sensitive phrasing has no verb and no question word, and cannot be
+    // answered from weights — the answer postdates training.
+    check('leading time words route to the network',
+        q('latest trending meme coins') === 'latest trending meme coins');
+    check('current X routes', q('current ethereum gas fees') === 'current ethereum gas fees');
+
+    // And the guards that must survive all three new entry paths.
+    for (const local of [
+        'empty recycle bin', 'search my files', 'what time is it',
+        'open notepad', 'thank you', 'mirror my phone', 'lock the screen',
+        'latest on my screen',   // time word + self-directed: stays local
+        'whats on my screen'
+    ]) {
+        check(`"${local}" still stays local`, parseWebSearchQuery(local) === null);
+    }
+}
+
 
 console.log(`
 ${pass} passed, ${fail} failed`);

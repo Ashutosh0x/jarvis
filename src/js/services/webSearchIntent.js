@@ -48,14 +48,60 @@ export function parseWebSearchQuery(cmd) {
         return null;
     }
 
+    /* LONGEST FORM FIRST. The alternation is ordered, so a bare `google` placed
+       before `google search for` would match first and leave "search for rust"
+       as the query — Jarvis would then search the web for the words "search for
+       rust". Observed: "google search for rust" produced exactly that. Compound
+       phrasings therefore precede the single words they start with. */
+    const VERB = '(?:web ?search for|web ?search|search the web for|search the web|'
+        + 'search online for|search online|google search for|google search|google for|google|'
+        + 'look up|search up|search for|search|'
+        + 'find (?:information |info |stuff )?(?:about |on |for )?|find)';
+
     const m = text.match(
-        /^(?:can you |could you |please )?(?:do a |do |run a |run )?(?:web ?search|search the web|search online|google|look up|search up|search for|search|find (?:information |info |stuff )?(?:about |on |for )?|find)\b[:\s]*(.*)$/i
+        new RegExp('^(?:can you |could you |please )?(?:do a |do |run a |run )?' + VERB + '\\b[:\\s]*(.*)$', 'i')
     );
     if (m) {
         const query = cleanQuery(m[1]);
         // "can you do web search" is a capability question, not a search request.
         if (!query || /^(please|now|it|that|this)$/i.test(query)) return null;
         return { query };
+    }
+
+    /* THE VERB ALSO COMES LAST, and requiring it to lead is what sent a real
+       request to the local model. From the interaction log of 2 Aug 2026:
+       "latest trending meme coin search" matched nothing — the prefix form
+       above needs `search` at the front, and the question form below needs a
+       question word at the front — so it fell through to Gemma, which has no
+       network and correctly answered that it could not search. The honesty
+       worked; the routing did not.
+
+       Spoken English puts the verb at either end ("search meme coins" /
+       "meme coin search"), and only one of those worked. */
+    const trailing = text.match(/^(.+?)[,\s]+(?:web ?search|google search|google it|search)$/i);
+    if (trailing) {
+        const query = cleanQuery(trailing[1]);
+        if (query && query.split(/\s+/).length >= 1 && !isSelfDirected(query)) {
+            return { query };
+        }
+    }
+
+    /* TIME-SENSITIVE PHRASES ARE SEARCHES EVEN WITHOUT A VERB OR A QUESTION
+       WORD. "latest trending meme coins" is not answerable from a local model's
+       weights by construction — the answer did not exist when they were
+       trained. Left to the model it produces a plausible list, which is the
+       fabrication class groundingGuard.js exists to catch. Routing it to the
+       network is both more useful and more honest.
+
+       Deliberately narrow: only leading time words, and the self-directed
+       guard still applies, so "latest on my screen" stays local. */
+    const timely = text.match(/^(?:the\s+)?(?:latest|current|todays?|today's|trending|recent|newest|breaking)\b\s*(.*)$/i);
+    if (timely) {
+        const query = cleanQuery(text);   // keep the time word; it sharpens the query
+        if (query && timely[1].trim().split(/\s+/).filter(Boolean).length >= 1
+            && !isSelfDirected(query)) {
+            return { query };
+        }
     }
 
     /* An explicit "search" prefix is NOT required, and requiring it was the
@@ -76,13 +122,20 @@ export function parseWebSearchQuery(cmd) {
 
     /* Self-directed and device questions stay local — Jarvis knows its own
        state and the machine's better than the web does. */
-    if (/\b(you|your|yourself|jarvis|my (screen|system|cpu|ram|memory|file|note|battery)|this (screen|window|page)|time|date|weather here)\b/i.test(query)) {
-        return null;
-    }
+    if (isSelfDirected(query)) return null;
     // Too short to be a real question ("what", "how so").
     if (query.split(/\s+/).length < 3) return null;
 
     return { query };
+}
+
+/* Jarvis knows its own state and this machine better than the web does.
+   Extracted so every entry path applies it — the trailing-verb and
+   time-sensitive branches need the same guard the question branch always had,
+   and duplicating the pattern three times is how they drift apart. */
+function isSelfDirected(query) {
+    return /\b(you|your|yourself|jarvis|my (screen|system|cpu|ram|memory|file|note|battery)|this (screen|window|page)|time|date|weather here)\b/i
+        .test(String(query || ''));
 }
 
 function cleanQuery(raw) {
