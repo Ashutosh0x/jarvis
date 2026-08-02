@@ -9,6 +9,12 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Feedback the user can feel. Normal permission, granted at install with
+         no runtime prompt. Needed because the haptic path runs from the link
+         service rather than from a View: performHapticFeedback() requires no
+         permission but requires a View, and there is none in a background
+         service. -->
+    <uses-permission android:name="android.permission.VIBRATE" />
     <!-- NsdManager needs this to see services on the local network (Android 12+). -->
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
 

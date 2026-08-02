@@ -11,6 +11,7 @@ import android.os.BatteryManager
 import android.os.Build
 import android.speech.tts.TextToSpeech
 import android.util.Log
+import com.jarvis.companion.haptic.HapticHelper
 import com.jarvis.companion.network.CommandExecutor
 import org.json.JSONArray
 import org.json.JSONObject
@@ -83,6 +84,11 @@ class DeviceCommandExecutor(
             .put("tts", ttsReady)
             .put("flashlight", hasTorch())
             .put("volume", true)
+            /* Probed, and reported as the tier it can actually render — a
+               device with a motor but no composition support feels a plain
+               buzz where the desktop asked for a rising confirmation, and the
+               desktop should be able to know that rather than assume. */
+            .put("haptic", HapticHelper.describe(context))
             // Every one of these routes through the accessibility service.
             .put("ui_automation", a11y)
             .put("screenshot", a11y && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R)
@@ -150,6 +156,25 @@ class DeviceCommandExecutor(
                     } else {
                         cm.setTorchMode(id, on)
                         reply.done(true, JSONObject().put("on", on), null)
+                    }
+                }
+
+                /**
+                 * Feedback the user can actually feel.
+                 *
+                 * The desktop has no motor, so a tap on the mirrored screen or
+                 * a command that landed on this device is confirmed here
+                 * instead. `fire` returns the tier it managed to use and null
+                 * when there is no vibrator at all — reported rather than
+                 * swallowed, because a confirmation nobody feels is the exact
+                 * failure this path exists to prevent.
+                 */
+                "haptic" -> {
+                    val tier = HapticHelper.fire(context, params.optString("effect", "tick"))
+                    if (tier == null) {
+                        reply.done(false, null, "this device has no vibration motor")
+                    } else {
+                        reply.done(true, JSONObject().put("tier", tier), null)
                     }
                 }
 

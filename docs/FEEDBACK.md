@@ -106,19 +106,50 @@ attempt at this measured before it was corrected.
 All well inside the 150 ms bound. CSS verified separately by enumerating
 `document.styleSheets` in the built page: all seven keyframe rules present.
 
+## The phone, where there is a real motor
+
+`HapticManager.mirrorTap()` and anything else passing `{companion: true}`
+relays to the paired phone. It rides the **existing** authenticated command
+channel — `companionCommand('haptic', {effect})` — rather than opening a second
+route, so it inherits the same token and the same bounds. No new IPC handler
+exists for it.
+
+`preload.js` exposes it fire-and-forget on purpose: it is called from inside
+pointer handlers, and a rejected promise from a phone that just disconnected
+must never surface as an error in the middle of a click.
+
+### Three tiers, descending
+
+Android's haptic APIs arrived over several releases and the newer ones have no
+automatic fallback, so `HapticHelper.kt` probes rather than assumes:
+
+| Tier | Requires | What it can express |
+|---|---|---|
+| `composition` | API 30+ **and** the specific primitives | rise, fall, thud — shape, not just duration |
+| `predefined` | API 29+ | system-tuned CLICK / TICK / HEAVY_CLICK |
+| `duration` | anything older | a raw millisecond buzz |
+
+Composition support is checked with `arePrimitivesSupported`, which is the only
+honest way to ask: composing with an unsupported primitive is **silently
+dropped**, so a composition can "succeed" and produce nothing at all.
+
+`fire()` returns the tier it actually used, and `null` when the device has no
+motor — reported back over the wire rather than swallowed, because a
+confirmation nobody feels is the exact failure this path exists to prevent. The
+tier also appears in `capabilities()`, so the desktop can tell a rich
+composition from a plain buzz instead of assuming every phone felt the same
+thing.
+
+Success **rises** and error **falls**, matching the desktop's tones, so the two
+are distinguishable without being explained.
+
+> **Compiled, not yet felt.** `:app:assembleDebug` is green, `HapticHelper.class`
+> is in the APK and `android.permission.VIBRATE` is in the merged manifest — but
+> no device was attached when this was written, so nothing has been verified
+> vibrating on real hardware. The desktop half is measured; this half is built
+> and unproven.
+
 ## Not built
-
-**The companion relay is inert, deliberately rather than accidentally.** The
-desktop half exists and is tested — `companionEffectFor()` maps the semantic
-vocabulary onto Android's (`EFFECT_CLICK`, compositions). The receiving half is
-a Kotlin `HapticHelper` in the companion app that does not exist yet. Until it
-does, `electronAPI.sendCompanionHaptic` is absent from the bridge and
-`relayToCompanion()` returns `false`, which is surfaced on the returned plan as
-`relayed: false`. The gap is visible rather than presenting as a buzz that never
-arrives.
-
-The phone is the one surface in Jarvis with a real motor on the other end, so
-this is the highest-value remaining piece.
 
 **Windows `InputHapticsManager`** is real, needs a haptic trackpad or mouse, and
 is a native WinRT binding rather than a renderer API. Out of scope here.

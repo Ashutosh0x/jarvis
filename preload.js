@@ -50,6 +50,17 @@ contextBridge.exposeInMainWorld('electronAPI', {
     companionClosePairing: () => ipcRenderer.invoke('companion-close-pairing'),
     companionDevices: () => ipcRenderer.invoke('companion-devices'),
     companionCommand: (action, params) => ipcRenderer.invoke('companion-command', action, params),
+    /* Feedback on the one surface that has a motor.
+       Deliberately fire-and-forget: this is called from inside pointer
+       handlers, and a rejected promise from a phone that just disconnected
+       must never surface as an error in the middle of a click. It rides the
+       existing authenticated command channel rather than opening a second
+       route, so it inherits the same token and the same bounds. */
+    sendCompanionHaptic: (effect) => {
+        ipcRenderer.invoke('companion-command', 'haptic', {
+            effect: String(effect).slice(0, 32)
+        }).catch(() => { /* no device, or the link is down */ });
+    },
     onCompanionPaired: createSafeListener('companion-paired'),
     onCompanionEvent: createSafeListener('companion-event'),
     onCompanionDevices: createSafeListener('companion-devices'),
