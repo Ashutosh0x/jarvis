@@ -5428,6 +5428,26 @@ const PHONE_BRIDGE_PORT = 8765;
 let phoneBridgeServer = null;
 let phoneBridgeToken = null;
 
+/**
+ * Compare two secrets without leaking where they diverge.
+ *
+ * Mirrors safeEqual() in companionBridge.js. Kept as its own copy rather than
+ * imported because that module is the WebSocket bridge and this is the HTTP
+ * one; a require here to borrow one helper would couple two servers that are
+ * otherwise independent.
+ *
+ * crypto.timingSafeEqual throws on a length mismatch, so lengths are checked
+ * first. That does leak the token's LENGTH, which is not a secret — it is
+ * generated here at a fixed size — while the contents stay constant-time.
+ */
+function constantTimeEqual(a, b) {
+    if (typeof a !== 'string' || typeof b !== 'string') return false;
+    const ba = Buffer.from(a);
+    const bb = Buffer.from(b);
+    if (ba.length !== bb.length) return false;
+    return crypto.timingSafeEqual(ba, bb);
+}
+
 /* ---- Android companion ---- */
 const COMPANION_APK_PATH = path.join(
     __dirname, 'companion', 'app', 'build', 'outputs', 'apk', 'debug', 'app-debug.apk'
@@ -5577,9 +5597,18 @@ function startPhoneBridge() {
             return;
         }
 
-        /* ---- everything below requires the token ---- */
+        /* ---- everything below requires the token ----
+
+           CONSTANT-TIME, like the WebSocket path in companionBridge.js. This
+           was a plain `!==`, which returns on the first differing byte and so
+           leaks the length of the shared prefix. The bridge is on the LAN and
+           these routes reach file operations, clipboard and app launch, so the
+           attacker model — someone on the same Wi-Fi who can retry freely — is
+           exactly the one a byte-at-a-time compare loses to. The two auth
+           paths guarded the same secret to different standards; now they do
+           not. */
         const token = req.headers['x-jarvis-token'] || url.searchParams.get('token');
-        if (token !== phoneBridgeToken) {
+        if (!phoneBridgeToken || !constantTimeEqual(token, phoneBridgeToken)) {
             res.writeHead(401, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ error: 'invalid token' }));
             return;
