@@ -94,7 +94,16 @@ export function parseSystemCommand(text) {
         && !/\b(alarm|timer|remind|learn|reflect|consolidate|memory)\b/.test(q)) {
         return hit('SLEEP');
     }
-    if (/\b(sign out|signout|log off|logoff|log out|logout)\b/.test(q)) {
+    /* "sign ME out" and "log ME off" put a pronoun between the verb and the
+       particle, which a contiguous match misses. Found by the routing
+       measurement: "sign me out of windows" fell through here and was then
+       picked up SEMANTICALLY as screen_vision, because "windows" the operating
+       system embeds close to "window" the UI element. Harmless in that
+       direction — the worst case was describing the screen — but it is a
+       destructive command reaching the wrong layer, and destructive commands
+       are supposed to be settled deterministically before the router sees
+       them. */
+    if (/\b(sign|log)\s+(?:me\s+|us\s+)?(out|off)\b/.test(q) || /\b(signout|logoff|logout)\b/.test(q)) {
         return hit('SIGN_OUT');
     }
     if (/\b(recycle bin|trash|rubbish)\b/.test(q) && /\b(empty|clear|clean)\b/.test(q)) {

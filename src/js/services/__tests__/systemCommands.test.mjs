@@ -116,5 +116,21 @@ const intentOf = (s) => parseSystemCommand(s)?.intent ?? null;
     check('undefined input is safe', parseSystemCommand(undefined) === null);
 }
 
+/* --- pronoun-separated sign-out, found by the routing measurement ---------
+   "sign me out of windows" missed a contiguous "sign out" match, fell through
+   to the semantic router, and was picked up as screen_vision — because
+   "windows" the operating system embeds close to "window" the UI element. A
+   destructive command has to be settled deterministically, before the router
+   ever sees it. */
+{
+    for (const say of ['sign me out of windows', 'log me off', 'sign us out', 'log out']) {
+        check(`"${say}" -> SIGN_OUT`, intentOf(say) === 'SIGN_OUT');
+    }
+    // The words must still mean nothing on their own.
+    for (const say of ['sign the document', 'signal strength']) {
+        check(`"${say}" is not a sign-out`, intentOf(say) !== 'SIGN_OUT');
+    }
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
