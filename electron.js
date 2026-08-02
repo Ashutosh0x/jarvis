@@ -1766,6 +1766,117 @@ ipcMain.handle('open-settings', (event, page) => {
     return { success: true, page };
 });
 
+/* ---- system commands that had no voice route ----
+
+   Each is a single documented Windows call. The destructive ones (sleep,
+   hibernate, sign-out, empty-bin) are gated in the renderer behind the `warn`
+   haptic and a confirmation; this layer performs, it does not decide.
+
+   `shutdown /l` and SetSuspendState are used rather than a WinRT wrapper
+   because they are the documented, non-elevated paths and they behave
+   identically on every Windows 11 build this targets. */
+const SYSTEM_ACTIONS = {
+    lock: 'rundll32.exe user32.dll,LockWorkStation',
+    // Third arg 0 = do not disable wake events. Second arg 1 = force.
+    sleep: 'rundll32.exe powrprof.dll,SetSuspendState 0,1,0',
+    hibernate: 'shutdown.exe /h',
+    signout: 'shutdown.exe /l'
+};
+
+ipcMain.handle('system-action', async (event, action) => {
+    const cmd = SYSTEM_ACTIONS[String(action || '').toLowerCase()];
+    if (!cmd) return { success: false, error: `unknown system action '${action}'` };
+    try {
+        /* Fire and report. These commands end the session, so awaiting a clean
+           exit is meaningless — the process that would report it is going
+           away. Reported as issued, never as completed. */
+        exec(cmd, { windowsHide: true });
+        return { success: true, action, note: 'issued' };
+    } catch (e) { return { success: false, error: e.message }; }
+});
+
+/* Emptying the bin is the one action here that destroys user data, so unlike
+   the others it waits for a result and reports what actually happened. */
+ipcMain.handle('empty-recycle-bin', async () => {
+    const raw = await runPowerShell(`
+try { Clear-RecycleBin -Force -ErrorAction Stop; [pscustomobject]@{ ok=$true } | ConvertTo-Json -Compress }
+catch { [pscustomobject]@{ ok=$false; err=$_.Exception.Message } | ConvertTo-Json -Compress }`, 30000);
+    if (!raw) return { success: false, error: 'could not empty the recycle bin' };
+    try {
+        const j = JSON.parse(raw);
+        /* An already-empty bin throws, and that is not a failure worth
+           reporting as one — it is the requested end state. */
+        if (!j.ok && /empty/i.test(String(j.err || ''))) {
+            return { success: true, alreadyEmpty: true };
+        }
+        return j.ok ? { success: true } : { success: false, error: j.err };
+    } catch { return { success: false, error: 'unreadable result' }; }
+});
+
+/** Windows theme. Registry only — no restart, applies immediately. */
+ipcMain.handle('set-theme', async (event, mode) => {
+    const light = String(mode).toLowerCase() === 'light' ? 1 : 0;
+    const raw = await runPowerShell(`
+$p = 'HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize'
+Set-ItemProperty -Path $p -Name AppsUseLightTheme -Value ${light} -Type Dword -Force
+Set-ItemProperty -Path $p -Name SystemUsesLightTheme -Value ${light} -Type Dword -Force
+[pscustomobject]@{ ok=$true; light=${light} } | ConvertTo-Json -Compress`, 15000);
+    if (!raw) return { success: false, error: 'theme change failed' };
+    return { success: true, mode: light ? 'light' : 'dark' };
+});
+
+/** Focus Assist / notification toasts. */
+ipcMain.handle('set-dnd', async (event, on) => {
+    const enabled = on ? 0 : 1;   // toasts ENABLED = 1, so DND on means 0
+    const raw = await runPowerShell(`
+$p = 'HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\PushNotifications'
+if (-not (Test-Path $p)) { New-Item -Path $p -Force | Out-Null }
+Set-ItemProperty -Path $p -Name ToastEnabled -Value ${enabled} -Type Dword -Force
+[pscustomobject]@{ ok=$true } | ConvertTo-Json -Compress`, 15000);
+    if (!raw) return { success: false, error: 'could not change notification state' };
+    return { success: true, dnd: !!on };
+});
+
+/** Free space per fixed disk, measured.
+
+    NO -AsArray. It is PowerShell 7+ only and this machine runs Windows
+    PowerShell 5.1, where it is a hard parameter-binding error — the whole
+    script fails and the handler returns null. Caught by running the query
+    rather than by reading it.
+
+    Its absence means a SINGLE disk serialises as an object, not a
+    one-element array, so the shape is normalised on this side instead. That
+    is the right place for it anyway: the JSON contract stays stable no
+    matter which PowerShell answered. */
+ipcMain.handle('disk-space', async () => {
+    const raw = await runPowerShell(`
+Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" |
+  ForEach-Object { [pscustomobject]@{
+    drive=$_.DeviceID
+    freeGB=[math]::Round($_.FreeSpace/1GB,1)
+    totalGB=[math]::Round($_.Size/1GB,1)
+    percentFree=[math]::Round(($_.FreeSpace/$_.Size)*100)
+  } } | ConvertTo-Json -Compress`, 15000);
+    if (!raw) return { success: false, error: 'could not read disk space' };
+    try {
+        const parsed = JSON.parse(raw);
+        return { success: true, disks: Array.isArray(parsed) ? parsed : [parsed] };
+    } catch { return { success: false, error: 'unreadable disk data' }; }
+});
+
+/** Uptime, from the real boot time rather than a process start. */
+ipcMain.handle('system-uptime', async () => {
+    const raw = await runPowerShell(`
+$b = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
+$s = [math]::Round(((Get-Date) - $b).TotalSeconds)
+[pscustomobject]@{ seconds=$s; bootedAt=$b.ToString('o') } | ConvertTo-Json -Compress`, 15000);
+    if (!raw) return { success: false, error: 'could not read uptime' };
+    try {
+        const j = JSON.parse(raw);
+        return { success: true, seconds: Number(j.seconds), bootedAt: j.bootedAt };
+    } catch { return { success: false, error: 'unreadable uptime' }; }
+});
+
 // Clipboard Handlers
 ipcMain.handle('read-clipboard', () => {
     return clipboard.readText();
