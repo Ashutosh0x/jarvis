@@ -183,7 +183,9 @@ with the network unplugged.
 
 It presents as a frameless, transparent 3D visualizer that floats above your
 desktop, listens continuously, and answers by voice. A companion Android app
-extends the same interface and control surface to a paired phone over Wi-Fi.
+extends the same interface and control surface to a paired phone over Wi-Fi,
+and a spoken "mirror my phone" puts that phone's live screen on the desktop
+with touch and keyboard control.
 
 ---
 
@@ -199,6 +201,7 @@ extends the same interface and control surface to a paired phone over Wi-Fi.
 - [Retrieval engine](#retrieval-engine)
 - [Evaluation](#evaluation)
 - [Android companion](#android-companion)
+- [Screen mirror](#screen-mirror)
 - [Installation](#installation)
 - [Running](#running)
 - [Configuration](#configuration)
@@ -490,6 +493,9 @@ autostart.
   passed through, so "what error is showing" reaches the model intact
 - Optional Unlimited-OCR server for dense text
 - Downloads are watched, OCR'd, and ingested into memory automatically
+- Your Android screen, live on the desktop with touch and keyboard control —
+  see [Screen mirror](#screen-mirror). "take a phone screenshot" grabs the
+  current frame and describes it through the same local vision path
 
 ### Knowledge
 
@@ -1087,6 +1093,116 @@ inventing outcomes when it had no execution feedback.
 
 ---
 
+## Screen mirror
+
+> **Full write-up:** [docs/SCREEN-MIRROR.md](docs/SCREEN-MIRROR.md) ·
+> **Diagram:** [Screen mirror →](docs/ARCHITECTURE.md#8-screen-mirror)
+
+Your Android screen on the desktop, with touch and keyboard control, from one
+spoken sentence.
+
+```
+"mirror my phone"          -> panel slides in, phone appears
+"stop mirroring"           -> session ends, nothing left on the device
+"take a phone screenshot"  -> grabs the current frame and describes it locally
+```
+
+`Alt+Shift+M` closes it too, as does the `✕` on the panel.
+
+USB works out of the box; Wi-Fi works once the phone has been paired over
+Wireless Debugging. **Nothing is installed on the phone** — the scrcpy server
+jar is pushed to `/data/local/tmp` for the session and removed when it ends.
+
+### How it is split
+
+```
+phone  --H.264 over adb-->  main process  --IPC-->  renderer  --WebGL-->  canvas
+                                 ^                     |
+                                 +---- touch/keys -----+
+```
+
+| Piece | File | Runs in |
+| --- | --- | --- |
+| Voice routing, coordinate and key mapping | `src/js/services/mirrorIntent.js` | pure, no I/O |
+| scrcpy session, control injection | `mirrorService.js` | main |
+| IPC wire | `electron.js`, `preload.js` | main / bridge |
+| Decode, draw, input relay | `src/js/components/mirrorPanel.js` | renderer |
+
+The session lives in **main** because it needs a TCP socket to the local ADB
+server on `127.0.0.1:5037`, which the renderer cannot open. The decode lives in
+the **renderer** because WebCodecs hands frames to WebGL without them entering
+JavaScript memory. Decoding in main would mean shipping raw frames over IPC —
+1920×1080×4 bytes at 60 fps is about 500 MB/s. What crosses IPC instead is the
+compressed elementary stream, roughly 1 MB/s.
+
+### Decisions worth knowing
+
+- **The server jar is pinned to scrcpy 3.3.3, not "latest".** The client
+  implements the protocol up to 3.3.3 and scrcpy compares version strings
+  exactly, so dropping a 4.x jar in produces a session that dies at handshake
+  rather than an upgrade. The SHA-256 is checked on every start and asserted in
+  tests, because a substituted jar otherwise just hangs.
+- **`maxSize` defaults to 0, meaning device native.** Measured on a 1080×2400
+  handset, `maxSize` caps the *longer* edge — the obvious-looking 1920 produced
+  **864×1920**, narrower than 1080. At native size the stream measured 4.1 Mbps
+  against an 8 Mbps ceiling, so the downscale bought nothing.
+- **The panel is sized from the phone, not the other way round.** Width is
+  derived from the stage's *measured* height times the device aspect ratio, so
+  there are zero letterbox bars in either direction, and rotation refits both
+  axes. A 20:9 phone in an 800px-tall window is 360px wide — that is the phone's
+  real shape, and the only way to a bigger mirror is a taller Jarvis window.
+- **Printable keys are sent as text, not keycodes.** A keycode replays a
+  physical key and is resolved through the *device's* layout, so on a phone set
+  to anything but the host layout the wrong character appears. Enter, Backspace,
+  arrows and modifiers have no text and must be keycodes.
+- **Audio is raw PCM, and mutable.** Phone audio out of the speakers can be
+  transcribed back as a user turn, so it ships with a mute button and
+  `buildMirrorOptions({audio:false})`. Renderer playback goes through Chromium's
+  render path and *is* seen by the echo canceller, unlike the SAPI voice that
+  bypassed it. Transport is verified; audible content is not — see the doc.
+- **Right-click is Back, Escape is Back.** scrcpy convention, and it is what
+  makes the mirror usable.
+
+### Measured — Xiaomi M2101K6P (Android 16), USB, 2 Aug 2026
+
+Driven through the shipped modules, not a harness reimplementation.
+
+| | |
+| --- | --- |
+| Resolution | **1080×2400**, device native |
+| Handshake | **1078 ms** cold, **629 ms** warm |
+| First frame | **1289 ms** cold, **799 ms** warm |
+| Frame rate | **60.5 fps** received; 49 fps presented on a live screen |
+| Bitrate | **4.11 Mbps** at native size (ceiling 8 Mbps) |
+| Control round trip | back / home / recents / notifications / rotate, **≤1 ms** each |
+
+Picture verified by pixel statistics rather than by looking: mean luma tracked
+the device — 60 → 39 when the notification shade was opened over the control
+channel, back to 60 on collapse. A frozen surface cannot do that. Cleanup
+confirmed after `stop()`: no `app_process` running, jar removed, nothing
+installed.
+
+The **LAG badge is not glass-to-glass latency** and does not claim to be. The
+device's capture clock and the host's clock have no shared origin, so their
+difference is an unknown constant. What the badge shows is arrival delay above
+the smallest value seen this session — queueing on top of the fastest path
+actually observed. The label says LAG rather than latency for that reason.
+
+### Failure messages
+
+Each is produced by `mirrorService`, not the model, and names the thing you
+control:
+
+| Message | Fix |
+| --- | --- |
+| `no Android device is connected over USB or Wi-Fi ADB` | plug it in, or `adb connect` |
+| `your phone has not authorised this computer` | accept the USB debugging prompt |
+| `N devices are connected — say which one, or unplug the others` | ambiguity is an error here, never a coin flip |
+| `the ADB server is not reachable on port 5037` | `adb start-server` (tried automatically first) |
+| `does not match the pinned v3.3.3 build` | `resources/scrcpy-server.jar` was replaced |
+
+---
+
 ## Installation
 
 ### Download a build
@@ -1302,6 +1418,11 @@ All listeners bind locally or to the LAN. None are exposed to the internet.
 | 10000 | Unlimited-OCR, optional | `127.0.0.1` | Loopback only |
 | 5173 | Vite dev server | `127.0.0.1` | Development only |
 
+One port is **connected to** rather than listened on: `127.0.0.1:5037`, the ADB
+server, used by Tier 3 phone control and by the screen mirror. JARVIS does not
+bind it — `adb` owns it, and JARVIS starts the server if it is not already
+running.
+
 ---
 
 
@@ -1357,6 +1478,21 @@ is fine.
 $env:JAVA_HOME = "C:\Program Files\Microsoft\jdk-21.0.9.10-hotspot"
 ```
 
+### The mirror opens black, or will not start
+
+The messages in [Screen mirror](#failure-messages) name the cause directly —
+they come from `mirrorService`, not the model, so treat them literally. The two
+that are not self-explanatory:
+
+- `does not match the pinned v3.3.3 build` means `resources/scrcpy-server.jar`
+  was replaced. A newer scrcpy jar is not an upgrade; the client speaks the
+  3.3.3 protocol and the handshake compares version strings exactly.
+- A black panel with a healthy-looking session is the decoder never receiving
+  scrcpy's `configuration` packet, which carries SPS/PPS. Packets are queued
+  from before the handshake and replayed once the decoder exists, so this should
+  not recur — if it does, check that the video subscription is opened *before*
+  `start()`.
+
 ### Answers ignore stored memory
 
 Check `stats()` on the retrieval service. Chunks stored while Ollama was
@@ -1403,6 +1539,16 @@ These are deliberate or platform-imposed, not defects.
   on an untrusted network.
 - **The orb is cropped in portrait.** The desktop camera sits at `z=14`, which
   assumes a landscape aspect ratio.
+- **The mirror needs USB debugging, and one device.** There is no wireless
+  fallback that skips ADB, and with several devices connected JARVIS asks which
+  one rather than picking. Ambiguity is an error here, never a coin flip.
+- **The scrcpy server jar is pinned, not tracked.** It is upgraded when the
+  client library implements a newer protocol, not when scrcpy releases. A
+  version bump is a code change with a hash change, by design.
+- **Glass-to-glass mirror latency is not measurable from inside the app.** The
+  device and host clocks share no origin. The LAG badge reports arrival delay
+  above the session's best observed path, which is a real measurement of a
+  different thing.
 - **No order placement, no signing.** The finance and on-chain modules are
   read-only by construction. No code path anywhere in the project can place a
   trade, sign a transaction, or handle a private key.

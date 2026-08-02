@@ -55,6 +55,32 @@ contextBridge.exposeInMainWorld('electronAPI', {
     onCompanionDevices: createSafeListener('companion-devices'),
     // Tier 3: wireless ADB (curated methods only — no raw shell passthrough)
     adbCommand: (method, args) => ipcRenderer.invoke('adb-command', method, args),
+    /* Live screen mirroring over scrcpy. The encoded video arrives on its own
+       channel and NOT through createSafeListener: that wrapper is built for
+       occasional events, and the mirror pushes ~60 messages a second. It gets
+       a single dedicated subscription that the panel replaces on each session,
+       so a leaked handler cannot double-decode the stream. */
+    mirror: {
+        devices: () => ipcRenderer.invoke('mirror-devices'),
+        start: (opts) => ipcRenderer.invoke('mirror-start', opts || {}),
+        stop: () => ipcRenderer.invoke('mirror-stop'),
+        status: () => ipcRenderer.invoke('mirror-status'),
+        serverInfo: () => ipcRenderer.invoke('mirror-server-info'),
+        input: (kind, payload) => ipcRenderer.invoke('mirror-input', kind, payload),
+        onVideo: (cb) => {
+            ipcRenderer.removeAllListeners('mirror-video');
+            ipcRenderer.on('mirror-video', (_e, packet) => cb(packet));
+            return () => ipcRenderer.removeAllListeners('mirror-video');
+        },
+        // Same single-subscription rule as video: PCM arrives continuously, and
+        // a leaked handler would feed the player twice.
+        onAudio: (cb) => {
+            ipcRenderer.removeAllListeners('mirror-audio');
+            ipcRenderer.on('mirror-audio', (_e, chunk) => cb(chunk));
+            return () => ipcRenderer.removeAllListeners('mirror-audio');
+        },
+        onStatus: createSafeListener('mirror-status')
+    },
     // Event-driven core (JARVIS v4)
     onJarvisEvent: createSafeListener('jarvis-event'),
     getBluetoothAudio: () => ipcRenderer.invoke('get-bluetooth-audio'),

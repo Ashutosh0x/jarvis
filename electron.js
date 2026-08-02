@@ -23,6 +23,7 @@ const axios = require('axios');
 const QRCode = require('qrcode');
 const { CompanionBridge, WS_PORT: COMPANION_WS_PORT } = require('./companionBridge');
 const adbService = require('./adbService');
+const mirrorService = require('./mirrorService');
 const { hedgedRace, createStickyOrder } = require('./rpcHedge');
 const webSearch = require('./webSearch');
 const chainProviders = require('./chainProviders');
@@ -448,6 +449,12 @@ app.whenReady().then(async () => {
 });
 
 app.on('window-all-closed', () => {
+    /* A mirror session outlives the window otherwise: the scrcpy server keeps
+       encoding on the phone, the packet pump keeps running, and the phone is
+       held awake by `stayAwake` with nothing on screen to show for it. The
+       tray keeps Jarvis alive deliberately; it must not keep this alive. */
+    mirrorService.stop().catch(() => { /* nothing was running */ });
+
     // Closing the window hides it; the tray keeps Jarvis alive so alarms still
     // fire and meetings are still watched. Only an explicit Quit exits.
     if (autostart.isQuitting() && process.platform !== 'darwin') {
@@ -455,7 +462,10 @@ app.on('window-all-closed', () => {
     }
 });
 
-app.on('before-quit', () => autostart.beginQuit());
+app.on('before-quit', () => {
+    mirrorService.stop().catch(() => { /* nothing was running */ });
+    autostart.beginQuit();
+});
 
 /* =========================
    IPC / SYSTEM HANDLERS
@@ -5761,6 +5771,116 @@ ipcMain.handle('adb-command', async (_e, method, args) => {
     try {
         const result = await fn(...(Array.isArray(args) ? args : []));
         return { ok: true, result };
+    } catch (e) {
+        return { ok: false, error: e.message };
+    }
+});
+
+/* =========================
+   SCREEN MIRROR (scrcpy)
+
+   The session lives in mirrorService.js; this is only the wire. Two channels,
+   for two very different traffic shapes:
+
+     'mirror-video'  — one message per encoded frame, pushed. At 1080p60/8Mbps
+                       that is ~60 msg/s of ~16 KB. It carries a Uint8Array,
+                       which the structured clone moves as a single memcpy;
+                       there is no JSON in this path and there must not be.
+     'mirror-status' — lifecycle only, pushed on change.
+
+   Everything the renderer can call is invoke/handle so a failure comes back as
+   a value it can speak, rather than vanishing.
+========================= */
+
+function sendToRenderer(channel, payload) {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    mainWindow.webContents.send(channel, payload);
+}
+
+/* A frame arriving after the window closed is not an error — it is the normal
+   race between the device's encoder and a user pressing Alt+F4 — but it must
+   also not keep the session alive, so the service is stopped on window loss. */
+function onMirrorPacket(packet) {
+    if (!mainWindow || mainWindow.isDestroyed()) {
+        mirrorService.stop().catch(() => { /* already gone */ });
+        return;
+    }
+    mainWindow.webContents.send('mirror-video', packet);
+}
+
+/* Audio rides its own channel. Raw PCM at 48 kHz stereo is ~1.5 Mbps in small
+   frequent chunks, and interleaving it with video would make one stream's
+   backpressure the other's problem — a stutter in the picture must not become
+   a gap in the sound. */
+function onMirrorAudio(chunk) {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    mainWindow.webContents.send('mirror-audio', chunk);
+}
+
+function onMirrorStatus(status) {
+    sendToRenderer('mirror-status', status);
+}
+
+ipcMain.handle('mirror-devices', async () => {
+    try {
+        return { ok: true, devices: await mirrorService.listDevices() };
+    } catch (e) {
+        return { ok: false, error: e.message, devices: [] };
+    }
+});
+
+ipcMain.handle('mirror-start', async (_e, opts = {}) => {
+    try {
+        const status = await mirrorService.start({
+            serial: typeof opts.serial === 'string' ? opts.serial : undefined,
+            scrcpyOptions: opts.scrcpyOptions,
+            onPacket: onMirrorPacket,
+            onAudio: onMirrorAudio,
+            onStatus: onMirrorStatus
+        });
+        return { ok: true, status };
+    } catch (e) {
+        return { ok: false, error: e.message, status: mirrorService.status() };
+    }
+});
+
+ipcMain.handle('mirror-stop', async () => {
+    try {
+        return { ok: true, status: await mirrorService.stop() };
+    } catch (e) {
+        return { ok: false, error: e.message };
+    }
+});
+
+ipcMain.handle('mirror-status', () => ({ ok: true, status: mirrorService.status() }));
+
+ipcMain.handle('mirror-server-info', () => {
+    try {
+        return { ok: true, server: mirrorService.verifyServerJar() };
+    } catch (e) {
+        return { ok: false, error: e.message };
+    }
+});
+
+/* Input injection. One handler per kind rather than a generic
+   `mirrorService[method](...args)` bridge — the adb-command handler above had
+   to bolt on a denylist for exactly that reason, and a denylist on a module
+   that grows is a hole waiting to open. */
+const MIRROR_INPUT = {
+    touch: (p) => mirrorService.injectTouch(p),
+    scroll: (p) => mirrorService.injectScroll(p),
+    key: (p) => mirrorService.injectKey(p),
+    text: (p) => mirrorService.injectText(p?.text),
+    clipboard: (p) => mirrorService.setClipboard(p?.text),
+    action: (p) => mirrorService.action(p?.name)
+};
+
+ipcMain.handle('mirror-input', async (_e, kind, payload) => {
+    const fn = MIRROR_INPUT[kind];
+    if (!fn) return { ok: false, error: `unknown mirror input '${kind}'` };
+    try {
+        await fn(payload || {});
+        return { ok: true };
     } catch (e) {
         return { ok: false, error: e.message };
     }

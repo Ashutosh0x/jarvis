@@ -35,6 +35,12 @@ const features = [
   },
   {
     number: "06",
+    title: "Your phone, on your desktop",
+    description: "Say \"mirror my phone\" and its live screen appears, with touch and keyboard control. H.264 straight off the device, decoded on the GPU — 1080×2400 at 60 fps, first frame in under a second. Nothing is installed on the phone, and the session leaves no trace when it ends.",
+    visual: "mirror",
+  },
+  {
+    number: "07",
     title: "Private by design",
     description: "No hosted model, no model API keys, no conversation data leaving your disk. Outbound traffic is limited to live-data lookups — a search, a quote, a block — each carrying only the subject of the question. Per-query cost is zero.",
     visual: "security",
@@ -244,6 +250,46 @@ function SecurityVisual() {
   );
 }
 
+/* A phone streaming frames to a desktop, and control travelling back — the
+   two directions of the mirror, which is the thing worth showing. */
+function MirrorVisual() {
+  return (
+    <svg viewBox="0 0 200 160" className="w-full h-full">
+      {/* Phone, drawn at a real handset aspect (20:9) because that shape is
+          what the panel is sized from. */}
+      <rect x="18" y="34" width="42" height="92" rx="6" fill="none" stroke="currentColor" strokeWidth="2" />
+      <line x1="32" y1="41" x2="46" y2="41" stroke="currentColor" strokeWidth="2" opacity="0.5" />
+      <rect x="24" y="49" width="30" height="66" rx="2" fill="currentColor" opacity="0.12">
+        <animate attributeName="opacity" values="0.12;0.3;0.12" dur="2.4s" repeatCount="indefinite" />
+      </rect>
+
+      {/* Desktop panel, the same picture at the same aspect */}
+      <rect x="118" y="26" width="62" height="108" rx="4" fill="none" stroke="currentColor" strokeWidth="2" />
+      <rect x="124" y="32" width="50" height="96" rx="2" fill="currentColor" opacity="0.12">
+        <animate attributeName="opacity" values="0.12;0.3;0.12" dur="2.4s" begin="0.35s" repeatCount="indefinite" />
+      </rect>
+
+      {/* Frames travelling phone -> desktop */}
+      {[0, 1, 2].map((i) => (
+        <rect key={`f${i}`} x="66" y="62" width="10" height="6" rx="1" fill="currentColor" opacity="0">
+          <animate attributeName="x" values="66;108" dur="1.5s" begin={`${i * 0.5}s`} repeatCount="indefinite" />
+          <animate attributeName="opacity" values="0;0.9;0" dur="1.5s" begin={`${i * 0.5}s`} repeatCount="indefinite" />
+        </rect>
+      ))}
+
+      {/* Touch and keys travelling desktop -> phone */}
+      {[0, 1].map((i) => (
+        <circle key={`c${i}`} cx="108" cy="98" r="2.5" fill="currentColor" opacity="0">
+          <animate attributeName="cx" values="108;66" dur="1.5s" begin={`${0.25 + i * 0.75}s`} repeatCount="indefinite" />
+          <animate attributeName="opacity" values="0;0.9;0" dur="1.5s" begin={`${0.25 + i * 0.75}s`} repeatCount="indefinite" />
+        </circle>
+      ))}
+
+      <line x1="64" y1="80" x2="114" y2="80" stroke="currentColor" strokeWidth="1" opacity="0.2" strokeDasharray="3 3" />
+    </svg>
+  );
+}
+
 function AnimatedVisual({ type }: { type: string }) {
   switch (type) {
     case "deploy":
@@ -252,6 +298,8 @@ function AnimatedVisual({ type }: { type: string }) {
       return <AIVisual />;
     case "collab":
       return <CollabVisual />;
+    case "mirror":
+      return <MirrorVisual />;
     case "security":
       return <SecurityVisual />;
     default:

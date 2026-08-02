@@ -1,7 +1,7 @@
 {
   "name": "@ashutosh0x/jarvis",
-  "version": "0.3.0",
-  "description": "A local-first desktop AI assistant: federated live web search with no API key, on-device vision and OCR, neural TTS, and a self-healing supervisor. Ships as an Electron app and an importable search library.",
+  "version": "0.4.0",
+  "description": "A local-first desktop AI assistant: federated live web search with no API key, on-device vision and OCR, neural TTS, live Android screen mirroring with touch control, and a self-healing supervisor. Ships as an Electron app and an importable search library.",
   "main": "electron.js",
   "scripts": {
     "test": "node scripts/run-tests.mjs",
@@ -43,6 +43,10 @@
     "ocr",
     "rag",
     "offline-first",
+    "screen-mirroring",
+    "scrcpy",
+    "android",
+    "adb",
     "jarvis"
   ],
   "author": {
@@ -52,6 +56,14 @@
   "license": "MIT",
   "dependencies": {
     "@google/genai": "^1.34.0",
+    "@yume-chan/adb": "^2.6.2",
+    "@yume-chan/adb-scrcpy": "^2.3.2",
+    "@yume-chan/adb-server-node-tcp": "^2.5.2",
+    "@yume-chan/pcm-player": "^1.0.0",
+    "@yume-chan/scrcpy": "^2.3.0",
+    "@yume-chan/scrcpy-decoder-webcodecs": "^2.5.3",
+    "@yume-chan/stream-extra": "^2.6.1",
+    "@yume-chan/struct": "^2.3.2",
     "axios": "^1.6.0",
     "bonjour-service": "^1.4.3",
     "chokidar": "^5.0.0",
@@ -106,6 +118,7 @@
     "src/",
     "server/",
     "companion/",
+    "resources/scrcpy-server.jar",
     "build/icon.png",
     "autostart.js",
     "googleCalendar.js",
@@ -113,6 +126,7 @@
     "preload.js",
     "webSearch.js",
     "metricStore.js",
+    "mirrorService.js",
     "rpcHedge.js",
     "sectorMove.js",
     "visionRouter.js",

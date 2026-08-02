@@ -42,6 +42,7 @@ files:
   - edgarGuard.js
   - googleCalendar.js
   - metricStore.js
+  - mirrorService.js
   - rpcHedge.js
   - sectorMove.js
   - streamGuard.js
@@ -71,6 +72,13 @@ extraResources:
   - from: static
     to: static
     filter: ['**/*']
+  # scrcpy-server.jar is pushed to the phone with adb, which reads it off the
+  # real filesystem — a path inside the asar archive does not exist as far as
+  # anything outside Electron is concerned. mirrorService.serverJarPath()
+  # looks for this exact layout.
+  - from: resources
+    to: resources
+    filter: ['**/*.jar']
 
 asar: true
 # Native .node binaries must sit on the real filesystem, not inside asar.

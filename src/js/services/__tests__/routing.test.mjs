@@ -568,5 +568,52 @@ routes('remind me about vines1vzrYbzLMRdu58ou5XTby4qAqVRLmqo36NKPTg', null);
         price('how is the weather doing') === null);
 }
 
+/* --- SCREEN MIRROR, through the real detectIntent ----------------------------
+   mirrorIntent.test.mjs proves the parser; this proves its PLACE. The mirror
+   branch sits above targetsPhone, and "mirror to my phone" satisfies both —
+   so the only thing that decides which one wins is the order in the shipped
+   file, which is exactly what a unit test of the pure module cannot see.
+
+   Bound to an object inheriting the prototype so the sibling parsers
+   detectIntent calls (parseWebsiteIntent and the rest) resolve normally. */
+{
+    const detect = Cls.prototype.detectIntent.bind(Object.create(Cls.prototype));
+    const intent = (text) => {
+        try { return detect(text)?.intent ?? null; } catch (e) { return `THREW ${e.message}`; }
+    };
+    const routesTo = (text, expected) => {
+        const got = intent(text);
+        check(`mirror routing: "${text}" -> ${expected}${got === expected ? '' : ` (GOT ${got})`}`, got === expected);
+    };
+
+    routesTo('mirror my phone', 'MIRROR_START');
+    routesTo('show my phone screen', 'MIRROR_START');
+    routesTo('cast my phone', 'MIRROR_START');
+    routesTo('mirror my redmi', 'MIRROR_START');
+    routesTo('stop mirroring', 'MIRROR_STOP');
+    routesTo('close the mirror', 'MIRROR_STOP');
+    routesTo('take a phone screenshot', 'MIRROR_SNAPSHOT');
+
+    // The overlap cases: both matchers claim these, the mirror must win.
+    routesTo('mirror to my phone', 'MIRROR_START');
+    routesTo('stop mirroring to my phone', 'MIRROR_STOP');
+
+    /* And the reverse — putting the mirror first must not cost the phone tools
+       or the companion flow anything. */
+    routesTo('open whatsapp on my phone', 'PHONE_TOOL');
+    routesTo('flashlight on my phone', 'PHONE_TOOL');
+    routesTo('battery on my phone', 'PHONE_TOOL');
+    routesTo('connect to my mobile', 'COMPANION_PAIR');
+    routesTo('why is my phone offline', 'COMPANION_STATUS');
+
+    // Nor the desktop commands that share vocabulary.
+    check('mirror routing: "take a screenshot" is not a mirror snapshot',
+        intent('take a screenshot') !== 'MIRROR_SNAPSHOT');
+    check('mirror routing: "open chrome" still opens the app',
+        intent('open chrome') === 'OPEN_APP');
+    check('mirror routing: "what is screen mirroring" is not a command',
+        !String(intent('what is screen mirroring')).startsWith('MIRROR_'));
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

@@ -37,6 +37,7 @@ const suites = [
     ...discovered,
     path.join(root, 'metricStore.test.mjs'),
     path.join(root, 'edgarGuard.test.mjs'),
+    path.join(root, 'mirrorService.test.mjs'),
     path.join(root, 'visionRouter.test.mjs'),
     path.join(root, 'sectorMove.test.mjs'),
     path.join(root, 'webSearch.test.mjs'),

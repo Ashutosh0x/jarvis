@@ -6,6 +6,7 @@ import SettingsManager from './settings.js';
 import { LiveService } from './liveService.js';
 import { generateContentLocal, checkOllama, routeLocalAction, describeImageLocal } from './toolService.js';
 import { routePhoneCommand, targetsPhone, executePhoneTool } from './services/phoneTools.js';
+import { parseMirrorCommand } from './services/mirrorIntent.js';
 import ragService from './services/ragService.js';
 import { parseWebSearchQuery, summarizeForSpeech, formatForDisplay } from './services/webSearchIntent.js';
 import reflectionService from './services/reflectionService.js';
@@ -1192,6 +1193,19 @@ class Jarvis {
         const looksPasted = command.length > 280 || (command.match(/\n/g) || []).length >= 2;
         if (looksPasted) return { intent: 'AI_COMMAND', pastedDocument: true };
 
+        /* Screen mirroring. Checked BEFORE targetsPhone, because "mirror to my
+           phone" and "stop mirroring to my phone" satisfy that matcher too and
+           would be handed to routePhoneCommand, which has no mirror tool and
+           returns null — the command would fall through to the model and be
+           answered with an apology. mirrorIntent.test.mjs asserts both the
+           overlap and that nothing is stolen from the phone tools. */
+        const mirrorCmd = parseMirrorCommand(cmd);
+        if (mirrorCmd) {
+            if (mirrorCmd.action === 'stop') return { intent: 'MIRROR_STOP' };
+            if (mirrorCmd.action === 'snapshot') return { intent: 'MIRROR_SNAPSHOT' };
+            return { intent: 'MIRROR_START' };
+        }
+
         // Phone-targeted commands: "open whatsapp on my phone", "flashlight on
         // my phone". Checked before every desktop matcher, otherwise "open
         // chrome on my phone" opens Chrome on the PC.
@@ -1738,6 +1752,15 @@ class Jarvis {
 
         try {
             switch (intent.intent) {
+                case 'MIRROR_START':
+                    await this.handleMirrorStart();
+                    break;
+                case 'MIRROR_STOP':
+                    await this.handleMirrorStop();
+                    break;
+                case 'MIRROR_SNAPSHOT':
+                    await this.handleMirrorSnapshot();
+                    break;
                 case 'PHONE_TOOL':
                     await this.handlePhoneTool(intent.phoneIntent);
                     break;
@@ -6827,6 +6850,107 @@ class Jarvis {
      * results ("Tab opened, rows closed") because it had no execution feedback;
      * here every spoken confirmation comes from what the phone reported back.
      */
+    /**
+     * Opens the live screen mirror.
+     *
+     * Speaks only what the session actually reported. An earlier version of
+     * this file's phone handlers announced success before the phone answered,
+     * which is the failure mode this project keeps re-learning: the mirror
+     * either produced a resolution and a codec or it did not, and there is no
+     * useful sentence in between.
+     */
+    async handleMirrorStart() {
+        if (!window.jarvisMirror || !window.electronAPI?.mirror) {
+            this.speak('Screen mirroring is not available in this build, Sir.');
+            return;
+        }
+        if (window.jarvisMirror.isOpen()) {
+            this.speak('Your phone is already on screen, Sir.');
+            return;
+        }
+
+        this.displayText('Starting the phone mirror…', null);
+        const res = await window.jarvisMirror.open();
+
+        if (!res.ok) {
+            /* The service turns library errors into a sentence naming the
+               thing the user controls — an unauthorised device, a missing ADB
+               server — so it is spoken verbatim rather than summarised. */
+            this.speak(`I could not mirror your phone, Sir. ${res.error}`);
+            return;
+        }
+
+        const s = res.status || {};
+        const where = s.connection === 'tcpip' ? 'over Wi-Fi' : 'over USB';
+        const size = s.width && s.height ? ` at ${s.width} by ${s.height}` : '';
+        this.speak(`Mirroring ${s.model || 'your phone'} ${where}${size}, Sir.`);
+
+        /* The timings are printed only when they were actually measured. The
+           first version of this line said "first frame ?ms" every time,
+           because the status was snapshotted before any frame had arrived —
+           a placeholder that reads like a real reading is worse than no
+           reading, which is the rule this project already applies to prices
+           and IP addresses. */
+        const timings = [
+            s.startMs !== null && s.startMs !== undefined ? `handshake ${s.startMs}ms` : null,
+            s.firstFrameMs !== null && s.firstFrameMs !== undefined ? `first frame ${s.firstFrameMs}ms` : null
+        ].filter(Boolean).join(', ');
+        this.displayText(
+            `Mirror: ${s.model || s.serial} ${where}, ${s.width}x${s.height} ${s.codec}` +
+            (timings ? ` — ${timings}` : ''), null);
+    }
+
+    async handleMirrorStop() {
+        if (!window.jarvisMirror) {
+            this.speak('Screen mirroring is not available in this build, Sir.');
+            return;
+        }
+        if (!window.jarvisMirror.isOpen()) {
+            this.speak('The mirror is not running, Sir.');
+            return;
+        }
+        await window.jarvisMirror.close();
+        this.speak('Mirror closed, Sir.');
+    }
+
+    /**
+     * Grabs a still from the live mirror and describes it with local vision.
+     *
+     * Distinct from PHONE_TOOL's phone.screenshot, which goes through the
+     * companion's AccessibilityService and needs the APK installed and
+     * enabled. This one reads the frame already on screen, so it works
+     * whenever the mirror does — but it only works when the mirror is up, and
+     * it says so rather than silently starting one.
+     */
+    async handleMirrorSnapshot() {
+        if (!window.jarvisMirror?.isOpen()) {
+            this.speak('The mirror is not running, Sir. Say mirror my phone first.');
+            return;
+        }
+
+        const dataUrl = await window.jarvisMirror.snapshot();
+        if (!dataUrl) {
+            this.speak('I could not capture a frame, Sir.');
+            return;
+        }
+
+        this.displayText('Captured your phone screen.', null);
+
+        // Describing it is best-effort: without a local vision model the
+        // capture still happened, and claiming otherwise would be a lie in
+        // either direction.
+        try {
+            const description = await describeImageLocal(dataUrl, 'Describe what is on this phone screen.');
+            if (description) {
+                this.speak(description);
+                return;
+            }
+        } catch (e) {
+            console.warn('Mirror snapshot description failed:', e.message);
+        }
+        this.speak('I have your phone screen, Sir, but no local vision model is available to read it.');
+    }
+
     async handlePhoneTool(phoneIntent) {
         if (!window.electronAPI?.companionCommand) {
             this.speak('The companion bridge is not available in this build, Sir.');

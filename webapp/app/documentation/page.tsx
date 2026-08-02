@@ -102,6 +102,7 @@ const toc = [
   { id: "doing", label: "Doing the work" },
   { id: "calendar", label: "Calendar and meetings" },
   { id: "companion", label: "Android companion" },
+  { id: "mirror", label: "Screen mirror" },
   { id: "ports", label: "Network ports" },
   { id: "privacy", label: "Privacy model" },
   { id: "install", label: "Install & run" },
@@ -866,7 +867,56 @@ You     yes`}</Code>
             </p>
           </Section>
 
-          <Section id="ports" eyebrow="20" title="Network ports">
+          <Section id="mirror" eyebrow="20" title="Screen mirror">
+            <p>
+              <Term>&quot;mirror my phone&quot;</Term> puts the device&apos;s live screen on
+              the desktop, with touch and keyboard control. <Term>&quot;stop
+              mirroring&quot;</Term>, <Term>Alt+Shift+M</Term> or the panel&apos;s close
+              button ends it. Nothing is installed on the phone: the scrcpy server jar is
+              pushed to <Term>/data/local/tmp</Term> for the session and removed when it
+              ends.
+            </p>
+            <p>
+              The session runs in the <strong>main</strong> process because it needs a TCP
+              socket to the local ADB server, which the renderer cannot open. Decoding runs
+              in the <strong>renderer</strong> because WebCodecs hands frames to WebGL
+              without them entering JavaScript memory — decoding in main would mean shipping
+              raw frames over IPC, about 500 MB/s at 1080p60. What crosses IPC is the
+              compressed elementary stream instead, roughly 1 MB/s.
+            </p>
+            <p>
+              Measured on a Xiaomi M2101K6P over USB, driven through the shipped modules
+              rather than a harness:
+            </p>
+            <Table
+              head={["Metric", "Measured"]}
+              rows={[
+                ["Resolution", "1080×2400, device native"],
+                ["Handshake", "1078 ms cold, 629 ms warm"],
+                ["First frame", "1289 ms cold, 799 ms warm"],
+                ["Frame rate", "60.5 fps received, 49 fps presented"],
+                ["Bitrate", "4.11 Mbps at native size (8 Mbps ceiling)"],
+                ["Control round trip", "≤1 ms — back, home, recents, rotate"],
+              ]}
+            />
+            <p>
+              The panel&apos;s <Term>LAG</Term> badge is <em>not</em> glass-to-glass latency
+              and does not claim to be. The device&apos;s capture clock and the host&apos;s
+              clock share no origin, so their difference is an unknown constant. The badge
+              reports arrival delay above the smallest value seen this session — queueing on
+              top of the fastest path actually observed, which is a real measurement of a
+              different thing.
+            </p>
+            <p>
+              Failures name the thing you control rather than apologising: no device
+              connected, this computer not authorised, several devices connected (which is
+              an error, never a coin flip), the ADB server unreachable, or a server jar that
+              does not match the pinned scrcpy 3.3.3 build. The jar&apos;s SHA-256 is checked
+              on every start.
+            </p>
+          </Section>
+
+          <Section id="ports" eyebrow="21" title="Network ports">
             <p>
               Every listener binds locally or to the LAN. None is exposed to the internet.
             </p>
@@ -880,9 +930,15 @@ You     yes`}</Code>
                 ["10000", "Unlimited-OCR (optional)", "127.0.0.1", "Loopback only"],
               ]}
             />
+            <p>
+              One port is connected to rather than listened on: <Term>127.0.0.1:5037</Term>,
+              the ADB server, used by wireless phone control and the screen mirror. JARVIS
+              does not bind it — <Term>adb</Term> owns it, and JARVIS starts the server if it
+              is not already running.
+            </p>
           </Section>
 
-          <Section id="privacy" eyebrow="21" title="Privacy model">
+          <Section id="privacy" eyebrow="22" title="Privacy model">
             <p>
               Privacy is the architecture, not a setting. Your microphone, screen captures,
               and conversations stay on local disk because there is no provider server to
@@ -905,7 +961,7 @@ You     yes`}</Code>
             </p>
           </Section>
 
-          <Section id="install" eyebrow="22" title="Install & run">
+          <Section id="install" eyebrow="23" title="Install & run">
             <p>
               The fastest path is npm. This installs the app and its Electron runtime,
               and puts a <Term>jarvis</Term> command on your PATH.

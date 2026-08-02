@@ -330,3 +330,61 @@ sequenceDiagram
     Note over P,W: on disconnect, reconnect with<br/>exponential backoff capped at 30s
 ```
 
+
+## 8. Screen mirror
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as User
+    participant R as Renderer<br/>mirrorPanel.js
+    participant M as Main<br/>mirrorService.js
+    participant A as ADB server<br/>127.0.0.1:5037
+    participant P as Phone<br/>scrcpy-server 3.3.3
+
+    rect rgb(46, 16, 101)
+    Note over U,M: Start
+    U->>R: "mirror my phone"
+    R->>R: parseMirrorCommand
+    R->>M: mirror:open
+    M->>M: verify jar SHA-256 against the pin
+    M->>A: connect, list devices
+    alt exactly one device, authorised
+        A-->>M: serial
+    else none / unauthorised / several
+        M-->>R: named failure, not a guess
+        R-->>U: speaks the fix
+    end
+    M->>A: push jar to /data/local/tmp
+    M->>P: app_process, start server
+    end
+
+    rect rgb(8, 51, 68)
+    Note over R,P: Video, before the handshake returns
+    R->>M: subscribe to video
+    Note right of R: subscription opened BEFORE start()<br/>so the configuration packet<br/>carrying SPS/PPS is not lost
+    P-->>M: configuration, then H.264 packets
+    M-->>R: packets over IPC, ~1 MB/s
+    R->>R: queue until the codec is known
+    R->>R: VideoDecoder, prefer-hardware
+    R->>R: replay preroll, bounded to one GOP
+    R->>R: WebGL frame renderer, panel fitted to<br/>device aspect, zero letterbox bars
+    end
+
+    rect rgb(2, 44, 34)
+    Note over U,P: Control
+    U->>R: click / type / right-click
+    R->>R: toDevicePoint, printable -> text
+    R->>M: mirror:control
+    M->>P: inject, round trip <= 1 ms
+    end
+
+    rect rgb(69, 26, 3)
+    Note over U,P: Stop
+    U->>R: "stop mirroring" / Alt+Shift+M / close
+    R->>M: mirror:close
+    M->>P: kill app_process
+    M->>A: remove /data/local/tmp/scrcpy-server.jar
+    Note right of P: nothing installed,<br/>device back to its original state
+    end
+```

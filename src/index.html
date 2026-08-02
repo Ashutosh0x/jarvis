@@ -633,6 +633,266 @@
       cursor: pointer;
     }
     #companion-close:hover { background: rgba(26, 204, 255, 0.12); }
+
+    /* ===== Android screen mirror panel — FRAMELESS =====
+       Pure phone screen, no chrome. Header/badges/nav are invisible overlays
+       that appear only on hover. The panel is a black rectangle whose only
+       visible content is the phone's video feed. */
+    #mirror-panel {
+      position: fixed;
+      top: 0;
+      right: 0;
+      bottom: 0;
+      width: min(420px, 34vw);
+      display: flex;
+      flex-direction: column;
+      background: #000;
+      border: none;
+      border-radius: 0;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.8);
+      z-index: 1008;
+      overflow: hidden;
+      /* JS sets width, height and top to the phone's aspect ratio, so `bottom`
+         must not also be pinned — with both set, height is ignored and a
+         landscape phone stays full-height with black above and below it. */
+      bottom: auto;
+      /* Off-canvas until opened */
+      transform: translateX(calc(100% + 24px));
+      opacity: 0;
+      visibility: hidden;
+      /* Width/height/top animate so a device rotation glides between the two
+         shapes instead of snapping. Kept shorter than the slide-in: a rotation
+         is a correction, and a slow one feels like lag rather than polish. */
+      transition:
+        transform 0.3s cubic-bezier(0.22, 1, 0.36, 1),
+        opacity 0.3s ease,
+        width 0.28s cubic-bezier(0.22, 1, 0.36, 1),
+        height 0.28s cubic-bezier(0.22, 1, 0.36, 1),
+        top 0.28s cubic-bezier(0.22, 1, 0.36, 1),
+        visibility 0s linear 0.3s;
+    }
+
+    #mirror-panel.visible {
+      transform: translateX(0);
+      opacity: 1;
+      visibility: visible;
+      transition:
+        transform 0.3s cubic-bezier(0.22, 1, 0.36, 1),
+        opacity 0.3s ease,
+        width 0.28s cubic-bezier(0.22, 1, 0.36, 1),
+        height 0.28s cubic-bezier(0.22, 1, 0.36, 1),
+        top 0.28s cubic-bezier(0.22, 1, 0.36, 1),
+        visibility 0s;
+    }
+
+    /* --- All chrome is an invisible overlay, shown only on hover --- */
+    #mirror-header {
+      position: absolute;
+      top: 0; left: 0; right: 0;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 10px;
+      background: linear-gradient(to bottom, rgba(0,0,0,0.7), transparent);
+      z-index: 10;
+      opacity: 0;
+      transition: opacity 0.25s ease;
+      pointer-events: none;
+    }
+    #mirror-panel:hover #mirror-header,
+    #mirror-header:hover { opacity: 1; pointer-events: auto; }
+
+    #mirror-title {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.5px;
+      color: rgba(255, 255, 255, 0.9);
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    #mirror-close,
+    #mirror-fullscreen,
+    #mirror-mute {
+      background: rgba(255, 255, 255, 0.1);
+      border: none;
+      color: rgba(255, 255, 255, 0.85);
+      width: 24px;
+      height: 24px;
+      border-radius: 50%;
+      font-size: 12px;
+      line-height: 1;
+      cursor: pointer;
+      flex: none;
+      transition: background 0.15s;
+    }
+    #mirror-close:hover,
+    #mirror-fullscreen:hover,
+    #mirror-mute:hover { background: rgba(255, 255, 255, 0.25); }
+
+    /* ===== Local cursor =====
+       Painted on the frame that handled the press, before the device has had
+       any chance to respond. It marks WHERE you pressed — a fact this side
+       already knows — and never implies the tap succeeded. `pointer-events:
+       none` is load-bearing: a ripple that swallowed the next click would
+       break the thing it exists to improve. */
+    .mirror-cursor {
+      position: absolute;
+      width: 14px;
+      height: 14px;
+      margin: -7px 0 0 -7px;
+      border-radius: 50%;
+      border: 2px solid rgba(255, 255, 255, 0.9);
+      background: rgba(255, 255, 255, 0.18);
+      pointer-events: none;
+      z-index: 6;
+      animation: mirror-ripple 0.42s cubic-bezier(0.2, 0.8, 0.3, 1) forwards;
+    }
+
+    .mirror-cursor.pinch {
+      border-color: rgba(120, 220, 255, 0.95);
+      background: rgba(120, 220, 255, 0.2);
+    }
+
+    @keyframes mirror-ripple {
+      from { transform: scale(0.35); opacity: 0.95; }
+      to   { transform: scale(2.6);  opacity: 0; }
+    }
+
+    #mirror-badges {
+      position: absolute;
+      top: 36px; left: 0; right: 0;
+      display: flex;
+      gap: 4px;
+      padding: 4px 10px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      font-size: 9px;
+      font-weight: 500;
+      letter-spacing: 0.3px;
+      color: rgba(255, 255, 255, 0.75);
+      flex-wrap: wrap;
+      z-index: 10;
+      opacity: 0;
+      transition: opacity 0.25s ease;
+      pointer-events: none;
+    }
+    #mirror-panel:hover #mirror-badges { opacity: 1; pointer-events: auto; }
+
+    .mirror-badge {
+      background: rgba(0, 0, 0, 0.5);
+      border: none;
+      border-radius: 10px;
+      padding: 2px 7px;
+      white-space: nowrap;
+      backdrop-filter: blur(4px);
+    }
+
+    #mirror-link { color: rgba(255, 255, 255, 0.6); }
+
+    .mirror-badge.warn {
+      color: #ff6b6b;
+      background: rgba(255, 50, 50, 0.2);
+    }
+
+    /* The stage is the entire panel body — the canvas fills it entirely */
+    #mirror-stage {
+      flex: 1;
+      min-height: 0;
+      position: relative;
+      overflow: hidden;
+      padding: 0;
+      background: #000;
+    }
+
+    /* ===== Fullscreen mirror ===== */
+    /* Fullscreen overrides the fitted box outright. `!important` because the
+       inline width/height/top set by the resize are more specific than any
+       rule here, and without it a fullscreen toggle would keep the panel at
+       the phone's size while claiming to be fullscreen. */
+    #mirror-panel.fullscreen {
+      top: 0 !important;
+      right: 0;
+      bottom: 0 !important;
+      left: 0;
+      width: auto !important;
+      height: auto !important;
+      box-shadow: none;
+    }
+
+    /* Canvas fills stage, letterboxes via object-fit: contain.
+       object-fit: contain is load-bearing — mirrorIntent.mapPointerToDevice
+       does arithmetic that depends on it. */
+    #mirror-canvas {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      outline: none;
+      border-radius: 0;
+      cursor: default;
+      touch-action: none;
+    }
+
+    #mirror-canvas:focus-visible {
+      box-shadow: none;
+    }
+
+    #mirror-status {
+      position: absolute;
+      bottom: 50%; left: 0; right: 0;
+      padding: 10px 14px;
+      font-size: 12px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      letter-spacing: 0.3px;
+      color: rgba(255, 255, 255, 0.7);
+      text-align: center;
+      z-index: 5;
+    }
+    #mirror-status.err { color: #ff6b6b; }
+
+    /* Nav bar — invisible overlay at bottom, appears on hover */
+    #mirror-nav {
+      position: absolute;
+      bottom: 0; left: 0; right: 0;
+      display: flex;
+      gap: 4px;
+      padding: 8px 8px 10px;
+      background: linear-gradient(to top, rgba(0,0,0,0.7), transparent);
+      z-index: 10;
+      opacity: 0;
+      transition: opacity 0.25s ease;
+      pointer-events: none;
+    }
+    #mirror-panel:hover #mirror-nav { opacity: 1; pointer-events: auto; }
+
+    #mirror-nav button {
+      flex: 1;
+      background: rgba(255, 255, 255, 0.08);
+      border: none;
+      color: rgba(255, 255, 255, 0.85);
+      padding: 6px 0;
+      border-radius: 6px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      font-size: 9px;
+      font-weight: 500;
+      letter-spacing: 0.3px;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    #mirror-nav button:hover { background: rgba(255, 255, 255, 0.18); }
+    #mirror-nav button:active { background: rgba(255, 255, 255, 0.3); }
+
+    #mirror-hint {
+      display: none; /* hidden — frameless mode needs no hint text */
+    }
+
+    @media (max-width: 900px) {
+      #mirror-panel { width: auto; left: 0; }
+    }
   </style>
 </head>
 
@@ -808,8 +1068,37 @@
     </div>
   </div>
 
+  <!-- Android screen mirror. Empty until a session starts: the canvas is
+       created by the decoder's frame renderer, so the stage owns no element
+       of its own. -->
+  <div id="mirror-panel">
+    <div id="mirror-header">
+      <div id="mirror-title">Android</div>
+      <button id="mirror-mute" title="Mute phone audio" style="display:none">&#128266;</button>
+      <button id="mirror-fullscreen" title="Fullscreen (F11)">&#10530;</button>
+      <button id="mirror-close" title="Close the mirror (Alt+Shift+M)">&#10005;</button>
+    </div>
+    <div id="mirror-badges">
+      <span class="mirror-badge" id="mirror-fps">IDLE</span>
+      <span class="mirror-badge" id="mirror-lag" style="display:none"></span>
+      <span class="mirror-badge" id="mirror-rate" style="display:none"></span>
+      <span class="mirror-badge" id="mirror-link"></span>
+    </div>
+    <div id="mirror-stage"></div>
+    <div id="mirror-status"></div>
+    <div id="mirror-nav">
+      <button data-action="back">Back</button>
+      <button data-action="home">Home</button>
+      <button data-action="app-switch">Recents</button>
+      <button data-action="notifications">Notifs</button>
+      <button data-action="rotate">Rotate</button>
+    </div>
+    <div id="mirror-hint">Click to control &middot; right-click is Back &middot; F11 fullscreen &middot; LAG is queueing above the best path seen</div>
+  </div>
+
   <script type="module" src="./js/scripts.js"></script>
   <script type="module" src="./js/companionUi.js"></script>
+  <script type="module" src="./js/components/mirrorPanel.js"></script>
 </body>
 
 </html>

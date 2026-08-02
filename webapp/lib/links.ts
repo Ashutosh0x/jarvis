@@ -18,7 +18,7 @@
 // ---------------------------------------------------------------------------
 
 /** Must equal the `version` in the repository-root package.json. */
-export const VERSION = "0.3.0";
+export const VERSION = "0.4.0";
 
 export const REPO_URL = "https://github.com/Ashutosh0x/jarvis";
 export const NPM_URL = "https://www.npmjs.com/package/@ashutosh0x/jarvis";
@@ -55,8 +55,14 @@ export interface Platform {
 
 /**
  * Filenames come from electron-builder's artifactName templates in
- * electron-builder.yml, and the sizes from the v0.3.0 release itself — not
- * estimated. Anything listed here is a file that exists.
+ * electron-builder.yml. Anything listed here is a file the release workflow
+ * actually produces.
+ *
+ * The sizes were measured on the v0.3.0 release rather than estimated, and are
+ * carried forward: 0.4.0 adds the 90 KB scrcpy server jar and the mirror
+ * modules, which does not move a 122 MB installer by a displayed digit. They
+ * are labelled approximate on the page for that reason — re-measure them when a
+ * release changes what is bundled, not on every bump.
  */
 export const PLATFORMS: Platform[] = [
   {

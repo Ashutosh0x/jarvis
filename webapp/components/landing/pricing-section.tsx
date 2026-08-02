@@ -18,6 +18,7 @@ import { PLATFORM_ICONS } from "./platform-icons";
 const HIGHLIGHTS = [
   "Voice control + screen reading",
   "Cognitive memory + reflection",
+  "Live Android mirror + control",
   "Live finance & quant analytics",
   "Keyless on-chain reads + ENS",
 ];
@@ -92,7 +93,9 @@ export function PricingSection() {
                   >
                     <Download className="w-4 h-4" />
                     {primary.label}
-                    <span className="font-mono text-xs opacity-60">{primary.size}</span>
+                    {/* `~` because the size is measured on one release and
+                        carried forward — see the note in lib/links.ts. */}
+                    <span className="font-mono text-xs opacity-60">~{primary.size}</span>
                     <ArrowRight className="w-4 h-4 transition-transform group-hover:translate-x-1" />
                   </a>
 
@@ -104,7 +107,7 @@ export function PricingSection() {
                           href={d.href}
                           download
                           className="flex-1 min-w-[calc(50%-0.25rem)] py-2.5 px-3 text-center text-xs font-mono border border-foreground/20 text-muted-foreground hover:border-foreground hover:text-foreground transition-colors"
-                          title={`${d.label} — ${d.size}`}
+                          title={`${d.label} — ~${d.size}`}
                         >
                           {d.label}
                         </a>
