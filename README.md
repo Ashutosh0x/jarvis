@@ -25,6 +25,7 @@
 </p>
 
 <p align="center">
+  <img src="https://img.shields.io/badge/Spotify-1DB954?style=for-the-badge&logo=spotify&logoColor=white" alt="Spotify Web API" />
   <img src="https://img.shields.io/badge/Android-34A853?style=for-the-badge&logo=android&logoColor=white" alt="Android" />
   <img src="https://img.shields.io/badge/Kotlin-7F52FF?style=for-the-badge&logo=kotlin&logoColor=white" alt="Kotlin" />
   <img src="https://img.shields.io/badge/Gradle-02303A?style=for-the-badge&logo=gradle&logoColor=white" alt="Gradle" />
@@ -202,6 +203,8 @@ with touch and keyboard control.
 - [Evaluation](#evaluation)
 - [Android companion](#android-companion)
 - [Screen mirror](#screen-mirror)
+- [Routing](#routing)
+- [Music](#music)
 - [Installation](#installation)
 - [Running](#running)
 - [Configuration](#configuration)
@@ -1226,6 +1229,122 @@ control:
 | `N devices are connected — say which one, or unplug the others` | ambiguity is an error here, never a coin flip |
 | `the ADB server is not reachable on port 5037` | `adb start-server` (tried automatically first) |
 | `does not match the pinned v3.3.3 build` | `resources/scrcpy-server.jar` was replaced |
+
+---
+
+## Routing
+
+Commands used to be matched by pattern, and every new ability meant another
+regex that only recognised the phrasings someone thought of. `"latest trending
+meme coin search"` reached the local model — which correctly answered that it
+cannot search — because the verb was at the **end**, and no pattern anticipated
+that. Adding a pattern fixes that sentence and not the next one.
+
+Capabilities now describe themselves, and the router matches meaning.
+
+### Measured, not assumed
+
+Held-out phrasings, none of which appear in the capability manifests, scored
+against the live `nomic-embed-text` embedder:
+
+| Router | Accuracy |
+| --- | --- |
+| **As shipped** — deterministic, then semantic | **24/24 · 100%** |
+| Semantic router alone | 23/24 · 95.8% |
+| Regex baseline | 18/24 · 75.0% |
+
+`eval/routing-eval.mjs`. The comparison exists because a smarter architecture is
+a hypothesis until it has a number — an earlier causal-graph retrieval layer in
+this project was obviously better in principle and measured **worse** than plain
+retrieval, 56.6% against 68.8%.
+
+### Blast radius decides the router
+
+```
+"empty the recycle bin"
+"don't empty the recycle bin"
+"what happens if I empty the recycle bin"
+```
+
+These are neighbours in embedding space. Cosine similarity has no reliable
+signal for negation or interrogation — the content words dominate — while a
+regex with a question guard separates them exactly.
+
+A wrong retrieval costs a wasted search. A wrong destructive action costs files.
+So capabilities declare their `effects`, and **only read-only ones are reachable
+by similarity**; anything that writes or destroys needs a deterministic parse.
+Tests route the negated and interrogative forms and assert they cannot reach
+anything destructive.
+
+This is not a rejection of semantic routing. It is semantic routing where being
+approximately right is good enough, and deterministic parsing kept where it is
+not.
+
+### Freshness is the lever
+
+`STATIC` · `DYNAMIC` · `REALTIME`. A local model answering a REALTIME question
+is not recalling — the answer postdates its training, so it is generating, which
+is the path that produced the fabricated citations this project already guards
+against. Freshness catches it *before* the model is asked.
+
+Deliberately lexical rather than model-judged: it runs on every utterance and an
+Ollama round trip would slow the fast path; a 4B model is the least reliable
+possible judge of its own knowledge age, because it does not know what it does
+not know; and a function can be tested against a labelled set where an opinion
+can only be spot-checked. Unrecognised questions fall to `DYNAMIC`, which
+prefers the network — over-searching costs a request, under-searching costs a
+fabricated answer.
+
+A nearest neighbour always exists, so there is a floor (0.55) and a margin
+(0.04): below the floor, or within the margin of the runner-up, nothing is
+chosen. `"thank you"` routes to nothing. No embedder means no opinion, never a
+random capability.
+
+---
+
+## Music
+
+Real-time track resolution through the Spotify Web API, then handed to whatever
+can actually play it.
+
+```
+"play starboy by the weeknd"     -> track:starboy artist:the weeknd
+                                 -> Starboy — The Weeknd, Daft Punk
+"play bohemian rhapsody on spotify"
+"pause" · "skip this song" · "what's this song"
+```
+
+`"X by Y"` becomes a **fielded** query — `track:X artist:Y` — because the plain
+string lets a popular artist name outrank the requested track: "play hello by
+adele" can otherwise return an Adele song that is not Hello.
+
+### What actually plays it
+
+Search is genuinely live and verified. Playback depends on what is installed,
+and Jarvis says which of the three happened rather than reporting "playing" for
+all of them:
+
+| Route | Needs | Result |
+| --- | --- | --- |
+| Web API playback | **Premium** + a running Spotify device | audio starts, nothing opens |
+| `spotify:` desktop URI | Spotify desktop installed | plays in the app, no browser |
+| `open.spotify.com` | nothing | opens a tab, **off by default** |
+
+The browser fallback is disabled by default, because a tab is not background
+playback — it is a window appearing, with still no music until someone presses
+play. With no player present Jarvis reports that it found the track and has
+nothing to play it with.
+
+> **Free accounts:** the Web API playback endpoint is Premium-only, but the
+> desktop URI path works on Free. Installing the Spotify desktop app is what
+> turns this into background playback with no browser.
+>
+> **Not a workaround:** playing the web player inside a hidden Electron window
+> would need Widevine, and Electron ships no CDM — it loads and fails on DRM.
+> Measured, not assumed.
+
+Tokens live in the same `safeStorage` vault as every other secret (DPAPI on
+Windows). None is written to the repository.
 
 ---
 

@@ -43,6 +43,8 @@ files:
   - googleCalendar.js
   - metricStore.js
   - mirrorService.js
+  - spotifyService.js
+  - computerUse.js
   - rpcHedge.js
   - sectorMove.js
   - streamGuard.js
