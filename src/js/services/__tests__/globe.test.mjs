@@ -941,6 +941,28 @@ check('a null response does not throw', normaliseList(null).length === 0);
     check('the README links the globe reference', readme.includes('docs/GLOBE.md'));
     check('and lists the maps key alongside the other provider keys',
         readme.includes('GOOGLE_MAPS_API_KEY'));
+
+    /* The header badges advertise the stack. A `logo=` slug that simple-icons
+       does not have still returns a valid badge — just a bare coloured
+       rectangle with no icon — so a typo is invisible unless someone looks.
+       `usgs` and `luma` are two that do NOT exist and were caught this way.
+       Checked against a known-good list rather than the network, so the suite
+       stays offline. */
+    const KNOWN_SLUGS = new Set([
+        'electron', 'vite', 'three.js', 'threedotjs', 'node.js', 'javascript',
+        'ollama', 'google', 'openai', 'python', 'webgl',
+        'googlecalendar', 'googlemeet', 'auth0', 'webaudio', 'npm',
+        'googlemaps', 'openstreetmap', 'wikipedia', 'wikimediacommons',
+        'googleearth', 'nasa', 'airplayaudio', 'esri',
+        'spotify', 'android', 'kotlin', 'gradle', 'square', 'socketdotio',
+        'windows'
+    ]);
+    const slugs = [...readme.matchAll(/[?&]logo=([\w.-]+)/g)].map((m) => m[1]);
+    const unknown = [...new Set(slugs)].filter((s) => !KNOWN_SLUGS.has(s));
+    check(`every badge logo slug is a real one${unknown.length ? ` — unknown: ${unknown.join(', ')}` : ''}`,
+        unknown.length === 0);
+    check('the globe data sources are advertised in the badges',
+        ['googlemaps', 'openstreetmap', 'wikipedia', 'nasa'].every((s) => slugs.includes(s)));
     /* Line-ending agnostic on purpose. An editing pass that rewrote the file
        as CRLF turned this assertion red for a reason that had nothing to do
        with the claim being tested — the heading was there the whole time. The

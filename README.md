@@ -25,6 +25,22 @@
 </p>
 
 <p align="center">
+  <img src="https://img.shields.io/badge/Google%20Maps%20Platform-4285F4?style=for-the-badge&logo=googlemaps&logoColor=white" alt="Google Maps Platform" />
+  <img src="https://img.shields.io/badge/Natural%20Earth-7EBC6F?style=for-the-badge&logo=openstreetmap&logoColor=white" alt="Natural Earth" />
+  <img src="https://img.shields.io/badge/Nominatim-7EBC6F?style=for-the-badge&logo=openstreetmap&logoColor=white" alt="Nominatim / OpenStreetMap" />
+  <img src="https://img.shields.io/badge/Wikipedia-000000?style=for-the-badge&logo=wikipedia&logoColor=white" alt="Wikipedia REST API" />
+  <img src="https://img.shields.io/badge/Wikimedia%20Commons-006699?style=for-the-badge&logo=wikimediacommons&logoColor=white" alt="Wikimedia Commons" />
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/USGS%20earthquakes-1A6B54?style=for-the-badge&logo=googleearth&logoColor=white" alt="USGS earthquakes" />
+  <img src="https://img.shields.io/badge/NASA%20FIRMS-E03C31?style=for-the-badge&logo=nasa&logoColor=white" alt="NASA FIRMS" />
+  <img src="https://img.shields.io/badge/OpenSky-1B4C7E?style=for-the-badge&logo=airplayaudio&logoColor=white" alt="OpenSky Network" />
+  <img src="https://img.shields.io/badge/Esri%20Imagery-0079C1?style=for-the-badge&logo=esri&logoColor=white" alt="Esri World Imagery" />
+  <img src="https://img.shields.io/badge/Luma%20events-6B21A8?style=for-the-badge&logo=googlecalendar&logoColor=white" alt="Luma events" />
+</p>
+
+<p align="center">
   <img src="https://img.shields.io/badge/Spotify-1DB954?style=for-the-badge&logo=spotify&logoColor=white" alt="Spotify Web API" />
   <img src="https://img.shields.io/badge/Android-34A853?style=for-the-badge&logo=android&logoColor=white" alt="Android" />
   <img src="https://img.shields.io/badge/Kotlin-7F52FF?style=for-the-badge&logo=kotlin&logoColor=white" alt="Kotlin" />
