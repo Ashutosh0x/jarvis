@@ -39,6 +39,7 @@ import { createSatelliteService } from '../services/satellites.js';
 import { createSatelliteLayer } from './layers/satelliteLayer.js';
 import { createLayerManager } from './globeLayers.js';
 import { createSpaceWeatherLayer, fetchKp } from './layers/spaceWeatherLayer.js';
+import { createNaturalEventsLayer, fetchEonet } from './layers/naturalEventsLayer.js';
 import { createLayerPanel } from './layerPanel.js';
 
 /* Files the code column scrolls through — real modules, not filler.
@@ -196,6 +197,14 @@ export async function createGlobeMode({ scene, camera, renderer }) {
     const layerPanel = createLayerPanel(layerManager);
 
     const spaceWeather = createSpaceWeatherLayer(globe, { statusBar });
+    const naturalEvents = createNaturalEventsLayer(globe);
+    layerManager.register({
+        id: 'natural', name: 'Volcanoes & storms', category: 'environment',
+        layer: naturalEvents,
+        fetchFn: fetchEonet,
+        /* EONET updates a few times a day; 30 minutes is generous. */
+        pollMs: 30 * 60 * 1000
+    });
     layerManager.register({
         id: 'aurora', name: 'Aurora / Kp', category: 'space',
         layer: spaceWeather,
@@ -654,6 +663,7 @@ export async function createGlobeMode({ scene, camera, renderer }) {
         scanlines.remove();
         vignette.remove();
         spaceWeather.dispose();
+        naturalEvents.dispose();
         layerPanel.dispose();
         layerManager.dispose();
         satelliteLayer.dispose();

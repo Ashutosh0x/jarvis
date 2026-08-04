@@ -1299,5 +1299,67 @@ check('a null response does not throw', normaliseList(null).length === 0);
     check('nor does taking a photo', !fires('show me my camera feed'));
 }
 
+/* ---------------------------------------------------- natural events (EONET) */
+
+{
+    const { parseEonet, EONET_CATEGORIES } =
+        await import('../../components/layers/naturalEventsLayer.js');
+
+    /* EONET coordinates are [lng, lat] — GeoJSON order. Reading them the other
+       way puts a Pacific typhoon in the Sahara, and it is the single easiest
+       mistake in this file. */
+    const sample = {
+        events: [
+            {
+                id: 'V1', title: 'Some Volcano', link: 'https://x/v1',
+                categories: [{ id: 'volcanoes', title: 'Volcanoes' }],
+                geometry: [{ type: 'Point', coordinates: [-71.38, -36.87], date: '2026-08-01T00:00:00Z' }]
+            },
+            /* A storm is a track; the LAST point is where it is now. */
+            {
+                id: 'S1', title: 'Tracked Storm',
+                categories: [{ id: 'severeStorms', title: 'Severe Storms' }],
+                geometry: [
+                    { type: 'Point', coordinates: [120, 15], date: '2026-08-01T00:00:00Z' },
+                    { type: 'Point', coordinates: [125, 18], date: '2026-08-02T00:00:00Z' }
+                ]
+            },
+            /* A wildfire — EONET is mostly these, and Jarvis draws them from
+               FIRMS already, so this layer must drop them. */
+            {
+                id: 'W1', title: 'A Wildfire',
+                categories: [{ id: 'wildfires', title: 'Wildfires' }],
+                geometry: [{ type: 'Point', coordinates: [10, 20] }]
+            },
+            /* No usable geometry. */
+            { id: 'X1', title: 'Nowhere', categories: [{ id: 'floods' }], geometry: [] }
+        ]
+    };
+
+    const parsed = parseEonet(sample);
+    check('only the non-fire categories are kept', parsed.length === 2);
+    check('a wildfire is dropped — FIRMS already draws those',
+        !parsed.some((e) => e.category === 'wildfires'));
+
+    const volcano = parsed.find((e) => e.id === 'V1');
+    check('the volcano lands in Chile, not the Sahara',
+        Math.abs(volcano.lat + 36.87) < 1e-6 && Math.abs(volcano.lng + 71.38) < 1e-6);
+
+    const storm = parsed.find((e) => e.id === 'S1');
+    check('a moving storm takes its LATEST position',
+        Math.abs(storm.lat - 18) < 1e-6 && Math.abs(storm.lng - 125) < 1e-6);
+
+    check('an event with no point is dropped, not pinned at 0,0',
+        !parsed.some((e) => e.id === 'X1'));
+    check('every kept event has a real coordinate',
+        parsed.every((e) => Math.abs(e.lat) <= 90 && Math.abs(e.lng) <= 180));
+    check('an empty payload parses to nothing', parseEonet({ events: [] }).length === 0);
+    check('a null payload does not throw', parseEonet(null).length === 0);
+    check('every drawn category has a label and a colour',
+        Object.values(EONET_CATEGORIES).every((c) => c.label && Number.isFinite(c.colour)));
+    check('wildfires and earthquakes are NOT in the drawn set',
+        !EONET_CATEGORIES.wildfires && !EONET_CATEGORIES.earthquakes);
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
