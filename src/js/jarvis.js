@@ -1979,6 +1979,9 @@ class Jarvis {
                 case 'GLOBE_SATELLITES':
                     await this.handleGlobeSatellites(intent);
                     break;
+                case 'GLOBE_CAMS':
+                    await this.handleGlobeCams(intent);
+                    break;
                 case 'GLOBE_TOGGLE':
                     await this.handleGlobeToggle(intent);
                     break;
@@ -7481,6 +7484,28 @@ class Jarvis {
                 ? `Tracking ${n} objects in orbit, Sir. Positions are propagated live from the current element set.`
                 : 'The element set came back empty, Sir.'
         );
+    }
+
+    /* Road cameras for wherever the globe is pointed.
+
+       The count is read back from the viewer rather than promised in advance:
+       coverage is London and Singapore only, so most places genuinely have
+       none and saying so is the honest answer. */
+    async handleGlobeCams({ on }) {
+        const globe = window.jarvisGlobe;
+        if (!globe?.cams) {
+            this.speak('The globe view is not available in this build, Sir.');
+            return;
+        }
+        this.haptics.click();
+        if (!on) { globe.cams.hide(); this.speak('Camera feed closed, Sir.'); return; }
+
+        const n = globe.cams.count();
+        if (n) {
+            this.speak(`${n} live road camera${n === 1 ? '' : 's'} on screen, Sir.`);
+            return;
+        }
+        this.speak('No public road cameras near the current target, Sir. Coverage is London and Singapore.');
     }
 
     async handleGlobeToggle({ on }) {

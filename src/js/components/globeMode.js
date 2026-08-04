@@ -33,6 +33,7 @@ import { createLandmarkService } from '../services/landmarks.js';
 import { createGoogleServices, describeDossier, cameraDistanceFor } from '../services/googleServices.js';
 import { createPlaceImages } from '../services/placeImages.js';
 import { createDossierPanel } from './dossierPanel.js';
+import { createCamViewer } from './camViewer.js';
 import { buildAirportIndex, primaryAirport } from '../services/airports.js';
 import { createSatelliteService } from '../services/satellites.js';
 import { createSatelliteLayer } from './layers/satelliteLayer.js';
@@ -141,6 +142,7 @@ export async function createGlobeMode({ scene, camera, renderer }) {
         mount, loadSource: loadText, files: CODE_SOURCES
     });
     const dossierPanel = createDossierPanel({ mount });
+    const camViewer = createCamViewer({ mount });
 
     /* Places index: bundled, so a city lookup works with no network. */
     let placeIndex = [];
@@ -284,6 +286,7 @@ export async function createGlobeMode({ scene, camera, renderer }) {
            dossier for the same attention. One line to bring it back. */
         codeOverlay.setVisible(false);
         dossierPanel.setVisible(on);
+        if (!on) camViewer.hide();
         labelRenderer.domElement.style.display = on ? 'block' : 'none';
         document.body.classList.toggle('globe-mode', on);
         if (on) { mount.appendChild(vignette); mount.appendChild(scanlines); }
@@ -452,6 +455,17 @@ export async function createGlobeMode({ scene, camera, renderer }) {
         if (line) {
             statusBar.pushAlert(`${place.name}: ${line}`, 'alert');
             codeOverlay.log(`google.dossier(${place.name}) -> ${line}`);
+        }
+
+        /* Road cameras near the target. Only at city scale or tighter: a
+           25 km radius around a whole country would pick whichever cameras
+           happen to sit near its centroid, which says nothing about it. */
+        if (!Number.isFinite(place.spanKm) || place.spanKm <= 120) {
+            const n = await camViewer.showNear(place.lat, place.lng, { radiusKm: 25, name: place.name })
+                .catch(() => 0);
+            if (n) codeOverlay.log(`cams.near(${place.name}) -> ${n} live views`);
+        } else {
+            camViewer.hide();
         }
 
         const pictures = await imagesPromise;
@@ -636,6 +650,7 @@ export async function createGlobeMode({ scene, camera, renderer }) {
         statusBar.dispose();
         codeOverlay.dispose();
         dossierPanel.dispose();
+        camViewer.dispose();
         scanlines.remove();
         vignette.remove();
         spaceWeather.dispose();
@@ -650,6 +665,7 @@ export async function createGlobeMode({ scene, camera, renderer }) {
         toggle: () => setActive(!active),
         isActive: () => active,
         update, showLocation, showRoute, dispose,
+        cams: camViewer,
         satellites: { toggle: setSatellites, service: satelliteService, layer: satelliteLayer },
         layers: layerManager,
         layerPanel,

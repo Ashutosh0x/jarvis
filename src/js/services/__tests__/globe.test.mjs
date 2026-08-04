@@ -1240,5 +1240,54 @@ check('a null response does not throw', normaliseList(null).length === 0);
     check('and the storm threshold above that', KP_STORM > KP_VISIBLE - 1);
 }
 
+/* ------------------------------------------------------- traffic cameras */
+
+{
+    const tc = _req(path.resolve(REPO, 'trafficCams.js'));
+
+    /* THE ALLOWLIST IS THE SECURITY BOUNDARY. A camera URL comes from a
+       third-party feed this app did not write, so the host check has to be on
+       the PARSED hostname — "tfl.gov.uk.evil.com" contains "tfl.gov.uk" and a
+       substring check would wave it through. */
+    check('an official camera host is allowed',
+        tc.hostAllowed('https://s3-eu-west-1.amazonaws.com/jamcams.tfl.gov.uk/00002.00865.jpg'));
+    check('and the TfL API host', tc.hostAllowed('https://api.tfl.gov.uk/Place/Type/JamCam'));
+    check('a lookalike domain is refused',
+        tc.hostAllowed('https://tfl.gov.uk.evil.com/x.jpg') === false);
+    check('so is an unrelated host', tc.hostAllowed('https://example.com/a.jpg') === false);
+    check('and garbage does not throw', tc.hostAllowed('not a url') === false);
+    check('a subdomain of an allowed host passes',
+        tc.hostAllowed('https://cdn.api.tfl.gov.uk/x.jpg'));
+
+    /* A URL this process never handed out must not be fetched, even on an
+       allowed host — otherwise the renderer picks the address. */
+    const unknown = await tc.frame({ url: 'https://api.tfl.gov.uk/anything.jpg' });
+    check('an unrecognised URL on an allowed host is still refused',
+        unknown.ok === false && unknown.reason === 'unknown-camera');
+
+    const blocked = await tc.frame({ url: 'https://evil.test/x.jpg' });
+    check('a disallowed host is refused before any fetch',
+        blocked.ok === false && blocked.reason === 'host-not-allowed');
+
+    check('bad coordinates are refused', (await tc.near({ lat: NaN, lng: 0 })).reason === 'bad-coordinates');
+    check('an unknown method is named', (await tc.invoke('nope')).reason === 'unknown-method');
+    check('the source list is stated rather than implied',
+        (await tc.status()).data.sources.length === 2);
+}
+
+/* The camera voice intent. "camera" alone is the webcam on this machine and
+   must not open a road view. */
+{
+    const noun = /\b(?:traffic|road|street|live|cctv)\s+cam(?:era)?s?\b|\bjamcams?\b/i;
+    const verb = /\b(show|display|open|see|watch|hide|close|off)\b/i;
+    const fires = (c) => noun.test(c) && verb.test(c);
+
+    check('"show traffic cameras" opens the view', fires('show traffic cameras'));
+    check('"show me live cameras" too', fires('show me live cameras'));
+    check('"close the traffic camera" closes it', fires('close the traffic camera'));
+    check('a bare camera request does NOT open a road view', !fires('open the camera'));
+    check('nor does taking a photo', !fires('show me my camera feed'));
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

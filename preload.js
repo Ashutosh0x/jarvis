@@ -287,6 +287,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
     /* Real flight routes — origin and destination, which OpenSky lacks. */
     aviation: (method, params) => ipcRenderer.invoke('aviation', method, params),
     aviationStatus: () => ipcRenderer.invoke('aviation', 'status', {}),
+    /* Road cameras. Frames arrive as data URIs; no third-party URL is ever
+       handed to the renderer to load. */
+    trafficCams: (method, params) => ipcRenderer.invoke('traffic-cams', method, params),
     /* Kept as a named shortcut: the landmark ring is the hot path. */
     placesNearby: (opts) => ipcRenderer.invoke('google-maps', 'placesNearby', opts),
     foundryRebuild: (jobId) => ipcRenderer.invoke('foundry-rebuild', jobId),

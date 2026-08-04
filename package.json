@@ -135,6 +135,7 @@
     "googleMaps.js",
     "lumaEvents.js",
     "aviation.js",
+    "trafficCams.js",
     "electron.js",
     "preload.js",
     "webSearch.js",

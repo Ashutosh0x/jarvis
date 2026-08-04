@@ -1186,6 +1186,14 @@ const aviation = require('./aviation');
 ipcMain.handle('aviation', async (event, method, params = {}) =>
     aviation.invoke(String(method || ''), params || {}));
 
+/* Public road cameras. Every frame is fetched HERE and handed over as a data
+   URI — the renderer never points an <img> at a third-party host, and the
+   allowlist is enforced in one place. */
+const trafficCams = require('./trafficCams');
+
+ipcMain.handle('traffic-cams', async (event, method, params = {}) =>
+    trafficCams.invoke(String(method || ''), params || {}));
+
 ipcMain.handle('foundry-mesh', async (event, jobId) => {
     try {
         const { jobMesh } = await import('./src/js/services/foundry/foundryJobs.js');
