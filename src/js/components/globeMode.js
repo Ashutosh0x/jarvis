@@ -260,7 +260,11 @@ export async function createGlobeMode({ scene, camera, renderer }) {
            aesthetic. The bar shows the target, weather/time dossier and seismic
            alerts; the column scrolls real source code with live log entries. */
         statusBar.setVisible(on);
-        codeOverlay.setVisible(on);
+        /* The scrolling source column is off. It is still built and still fed
+           (codeOverlay.log stays the record of what the globe is doing), but
+           it is not drawn — asked for directly, and it competes with the
+           dossier for the same attention. One line to bring it back. */
+        codeOverlay.setVisible(false);
         dossierPanel.setVisible(on);
         labelRenderer.domElement.style.display = on ? 'block' : 'none';
         document.body.classList.toggle('globe-mode', on);
@@ -287,6 +291,22 @@ export async function createGlobeMode({ scene, camera, renderer }) {
      * This is what "show me what's happening in San Francisco" reaches.
      */
     async function showLocation(query, { landmarks = [], speak = null } = {}) {
+        /* A COMMAND IS NOT A PLACE. If the whole utterance arrives here —
+           "show me bengaluru" rather than "bengaluru" — the parser upstream
+           failed to extract, and geocoding it wastes a network round trip to
+           produce a confusing "no coordinates found for <your sentence>".
+           Stripping the lead verb recovers the intent instead of failing it,
+           and the strip is reported so the parser bug stays visible rather
+           than being papered over silently. */
+        const stripped = String(query || '').replace(
+            /^\s*(?:jarvis[,\s]+)?(?:show|display|pull\s+up|bring\s+up|take|fly|zoom|go|bring|point|look)\s+(?:me\s+|my\s+|us\s+)?(?:to\s+|at\s+|the\s+)*/i, ''
+        ).trim();
+        if (stripped && stripped !== String(query).trim()) {
+            console.warn('Globe: a command reached showLocation, not a place —', JSON.stringify(query));
+            codeOverlay.log(`showLocation recovered "${query}" -> "${stripped}"`);
+            query = stripped;
+        }
+
         /* Offline gazetteer first — it is instant, free and works on a train.
            Google is consulted only when that comes back empty or unsure, which
            is where the bundled data's gaps are: Natural Earth 110m has "New
