@@ -16,6 +16,7 @@ import { parseWikiGeosearch, parseGooglePlaces, rankLandmarks, createLandmarkSer
 import { createGoogleServices, describeDossier, parseGeocode, parseGeocodeV4, spanKmFromViewport, cameraDistanceFor, describeRoute, localTime } from '../googleServices.js';
 import { createPlaceImages, sourcesFor, parseWikipediaSummary, parseWikimediaGeosearch, satelliteImage } from '../placeImages.js';
 import { airportsNear, primaryAirport, buildAirportIndex } from '../airports.js';
+import { buildSatrecs, positionAt, positionsAt, groundTrack, createSatelliteService, GROUPS } from '../satellites.js';
 import { createRequire } from 'node:module';
 const _req = createRequire(import.meta.url);
 const { normaliseList } = _req(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..', '..', 'lumaEvents.js'));
