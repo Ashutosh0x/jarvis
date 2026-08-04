@@ -38,8 +38,13 @@ const ALLOWED_HOSTS = [
     'api.tfl.gov.uk',
     's3-eu-west-1.amazonaws.com',
     'api.data.gov.sg',
-    'images.data.gov.sg'
+    'images.data.gov.sg',
+    /* Windy serves its webcam frames through an image proxy. */
+    'imgproxy.windy.com',
+    'api.windy.com'
 ];
+
+const windyKey = () => process.env.WINDY_WEBCAMS_API_KEY || '';
 
 function hostAllowed(url) {
     try {
@@ -51,6 +56,28 @@ function hostAllowed(url) {
 }
 
 let cache = { at: 0, cams: null };
+
+/* URLs this process has handed to the renderer recently, so `frame()` can
+   accept them. Windy's image URLs are token-signed and expire in ten minutes,
+   so they cannot live in the six-hour list cache — they are recorded here as
+   each `near()` call offers them, and pruned. Without this a Windy frame would
+   be refused as "unknown-camera" the moment it was clicked. */
+const recentUrls = new Map();
+const RECENT_TTL_MS = 12 * 60 * 1000;
+
+function rememberUrl(url) {
+    if (url) recentUrls.set(url, Date.now());
+    /* Prune opportunistically rather than on a timer. */
+    if (recentUrls.size > 400) {
+        const cutoff = Date.now() - RECENT_TTL_MS;
+        for (const [u, t] of recentUrls) if (t < cutoff) recentUrls.delete(u);
+    }
+}
+
+function urlOffered(url) {
+    const t = recentUrls.get(url);
+    return !!t && Date.now() - t < RECENT_TTL_MS;
+}
 
 /** TfL JamCams — 882 cameras across London, each with a JPEG and a short MP4. */
 async function fetchTfl() {
@@ -113,7 +140,55 @@ async function fetchSingapore() {
 }
 
 /**
- * Every camera we know about.
+ * Windy webcams near a point.
+ *
+ * QUERIED PER-LOCATION, unlike the government feeds. Windy indexes ~70,000
+ * opt-in public webcams worldwide and answers a nearby-radius query directly,
+ * so there is no global list to cache — and its image URLs expire in ten
+ * minutes, which would make caching them wrong anyway.
+ *
+ * Optional: with no key this returns nothing and the government feeds still
+ * cover London and Singapore.
+ */
+async function fetchWindyNear(lat, lng, radiusKm, limit) {
+    if (!windyKey()) return [];
+    /* Windy's nearby filter is lat,lng,radius-in-km. */
+    const url = `https://api.windy.com/webcams/api/v3/webcams`
+        + `?nearby=${lat},${lng},${Math.min(250, Math.max(1, radiusKm))}`
+        + `&limit=${Math.min(50, Math.max(1, limit))}`
+        + `&include=location,images`;
+    const res = await fetch(url, {
+        headers: { 'x-windy-api-key': windyKey() },
+        signal: AbortSignal.timeout(TIMEOUT_MS)
+    });
+    if (!res.ok) throw new Error(`Windy HTTP ${res.status}`);
+    const json = await res.json();
+    const out = [];
+    for (const w of json?.webcams || []) {
+        /* Only cameras Windy marks live. */
+        if (w.status && w.status !== 'active') continue;
+        const loc = w.location || {};
+        const wlat = Number(loc.latitude), wlng = Number(loc.longitude);
+        if (!Number.isFinite(wlat) || !Number.isFinite(wlng)) continue;
+        /* `preview` is the largest still; `thumbnail` the small one. Neither is
+           a stream — Windy stills refresh on the webcam owner's schedule. */
+        const image = w.images?.current?.preview || w.images?.current?.thumbnail;
+        if (!image) continue;
+        out.push({
+            id: `windy:${w.webcamId}`,
+            name: String(w.title || 'Webcam'),
+            lat: wlat, lng: wlng,
+            image, video: null,
+            view: loc.city || null,
+            operator: 'Windy webcams',
+            city: loc.city || loc.region || null
+        });
+    }
+    return out;
+}
+
+/**
+ * Every fixed-list camera we know about (TfL + Singapore).
  *
  * One source failing must not take the others down — a London outage should
  * not remove Singapore from the globe.
@@ -148,8 +223,11 @@ async function list({ force = false } = {}) {
 async function frame({ url, kind = 'image' } = {}) {
     const target = String(url || '');
     if (!hostAllowed(target)) return { ok: false, reason: 'host-not-allowed' };
-    /* It must be a URL this process handed out. */
-    const known = (cache.cams || []).some((c) => c.image === target || c.video === target);
+    /* It must be a URL this process handed out — from the fixed list OR offered
+       by a recent nearby query (Windy). An allowed host is not enough, or the
+       renderer would get to choose the address. */
+    const known = urlOffered(target)
+        || (cache.cams || []).some((c) => c.image === target || c.video === target);
     if (!known) return { ok: false, reason: 'unknown-camera' };
 
     try {
@@ -182,8 +260,14 @@ async function near({ lat, lng, radiusKm = 25, limit = 12 } = {}) {
     if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
         return { ok: false, reason: 'bad-coordinates' };
     }
-    const all = await list();
-    if (!all.ok) return all;
+    /* The fixed government list and a fresh Windy query, in parallel. Either
+       failing must not sink the other — Windy being down should still leave
+       London's road cameras, and no Windy key should degrade to exactly the
+       previous behaviour rather than an error. */
+    const [fixed, windy] = await Promise.allSettled([
+        list(),
+        fetchWindyNear(lat, lng, radiusKm, limit).catch(() => [])
+    ]);
 
     const R = 6371, rad = Math.PI / 180;
     const dist = (aLat, aLng, bLat, bLng) => {
@@ -193,23 +277,42 @@ async function near({ lat, lng, radiusKm = 25, limit = 12 } = {}) {
         return 2 * R * Math.asin(Math.sqrt(h));
     };
 
-    const cameras = all.data.cameras
+    const pool = [];
+    let coverage = 0;
+    if (fixed.status === 'fulfilled' && fixed.value.ok) {
+        pool.push(...fixed.value.data.cameras);
+        coverage += fixed.value.data.cameras.length;
+    }
+    if (windy.status === 'fulfilled') pool.push(...windy.value);
+
+    if (!pool.length) return { ok: false, reason: 'no-cameras', detail: 'no cameras near this point' };
+
+    const cameras = pool
         .map((c) => ({ ...c, distanceKm: Math.round(dist(lat, lng, c.lat, c.lng)) }))
         .filter((c) => c.distanceKm <= radiusKm)
         .sort((a, b) => a.distanceKm - b.distanceKm)
         .slice(0, Math.max(1, Math.min(50, limit)));
 
-    return { ok: true, data: { cameras, coverage: all.data.cameras.length } };
+    /* Record every URL handed out so frame() will accept it — this is what
+       makes a token-signed Windy URL fetchable after the user clicks it. */
+    for (const c of cameras) { rememberUrl(c.image); rememberUrl(c.video); }
+
+    return { ok: true, data: { cameras, coverage } };
 }
 
 async function status() {
+    const sources = ['Transport for London JamCams', 'LTA Singapore'];
+    if (windyKey()) sources.push('Windy webcams (~70k, worldwide)');
     return {
         ok: true,
         data: {
             configured: true,
-            sources: ['Transport for London JamCams', 'LTA Singapore'],
+            sources,
+            windy: !!windyKey(),
             cached: cache.cams ? cache.cams.length : 0,
-            note: 'Public road cameras published by transport authorities'
+            note: windyKey()
+                ? 'Public road cameras plus opt-in Windy webcams'
+                : 'Public road cameras (London, Singapore). Add WINDY_WEBCAMS_API_KEY for worldwide webcams.'
         }
     };
 }

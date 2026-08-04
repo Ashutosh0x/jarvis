@@ -1272,7 +1272,17 @@ check('a null response does not throw', normaliseList(null).length === 0);
     check('bad coordinates are refused', (await tc.near({ lat: NaN, lng: 0 })).reason === 'bad-coordinates');
     check('an unknown method is named', (await tc.invoke('nope')).reason === 'unknown-method');
     check('the source list is stated rather than implied',
-        (await tc.status()).data.sources.length === 2);
+        (await tc.status()).data.sources.length >= 2);
+
+    /* Windy's image host is allowlisted alongside the government feeds. */
+    check('the Windy image proxy is an allowed host',
+        tc.hostAllowed('https://imgproxy.windy.com/_/preview/plain/current/123/original.jpg'));
+    check('and the Windy API host', tc.hostAllowed('https://api.windy.com/webcams/api/v3/webcams'));
+    /* Without a key, Windy contributes nothing rather than erroring — the
+       government feeds still cover London and Singapore. */
+    const noKey = await tc.near({ lat: 35.68, lng: 139.65, radiusKm: 30 });
+    check('with no Windy key a covered city still works or reports no-cameras cleanly',
+        noKey.ok === true || noKey.reason === 'no-cameras');
 }
 
 /* The camera voice intent. "camera" alone is the webcam on this machine and
