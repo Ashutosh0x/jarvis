@@ -34,6 +34,7 @@ import { createGoogleServices, describeDossier, cameraDistanceFor } from '../ser
 import { createPlaceImages } from '../services/placeImages.js';
 import { createDossierPanel } from './dossierPanel.js';
 import { createCamViewer } from './camViewer.js';
+import { createThemeManager } from './themeManager.js';
 import { buildAirportIndex, primaryAirport } from '../services/airports.js';
 import { createSatelliteService } from '../services/satellites.js';
 import { createSatelliteLayer } from './layers/satelliteLayer.js';
@@ -114,6 +115,17 @@ export function labelFor(name, source) {
 export async function createGlobeMode({ scene, camera, renderer }) {
     const mount = document.body;
 
+    /* Hover state. The raycast in update() reads this rather than adding its
+       own per-move handler with the scene not yet built. */
+    const hoverRay = new THREE.Raycaster();
+    const hoverPt = new THREE.Vector2();
+    let hoverArmed = false;
+    const onPointerMove = (e) => {
+        hoverPt.x = (e.clientX / window.innerWidth) * 2 - 1;
+        hoverPt.y = -(e.clientY / window.innerHeight) * 2 + 1;
+        hoverArmed = true;
+    };
+
     /* Scanlines and vignette. Created once and attached/detached with the
        mode rather than rebuilt each time — two elements that never change are
        not worth reallocating. */
@@ -126,6 +138,7 @@ export async function createGlobeMode({ scene, camera, renderer }) {
        WebGL canvas. pointer-events:none on the container and auto on the
        labels themselves, or the whole overlay would swallow the drag that is
        supposed to rotate the globe. */
+    window.addEventListener('pointermove', onPointerMove);
     const labelRenderer = new CSS2DRenderer();
     labelRenderer.setSize(window.innerWidth, window.innerHeight);
     labelRenderer.domElement.className = 'globe-label-layer';
@@ -240,6 +253,8 @@ export async function createGlobeMode({ scene, camera, renderer }) {
         layer: { setVisible: (on) => { feeds.feeds.events.visible = on; }, group: null }
     });
 
+    const themeManager = createThemeManager(globe, { codeOverlay });
+
     const landmarkService = createLandmarkService();
     const google = createGoogleServices();
     const placeImages = createPlaceImages();
@@ -263,6 +278,7 @@ export async function createGlobeMode({ scene, camera, renderer }) {
 
     let active = false;
     let savedCamera = null;
+    let hoverFrame = 0;
 
     function setActive(on) {
         if (on === active) return active;
@@ -284,7 +300,7 @@ export async function createGlobeMode({ scene, camera, renderer }) {
         /* Layers follow the globe: hidden when it is, and restored to whatever
            was switched on when it comes back. */
         if (on) layerManager.restore(); else layerManager.hideAll();
-        if (!on) { satelliteLayer.setVisible(false); layerPanel.hide(); }
+        if (!on) { satelliteLayer.setVisible(false); layerPanel.hide(); renderer.domElement.style.cursor = ''; }
         /* The status bar and code overlay complete the Iron Man command-centre
            aesthetic. The bar shows the target, weather/time dossier and seismic
            alerts; the column scrolls real source code with live log entries. */
@@ -642,6 +658,19 @@ export async function createGlobeMode({ scene, camera, renderer }) {
         globe.update(dt, audioEnergy);
         satelliteLayer.update(dt);
         layerManager.update(dt);
+
+        /* Hover cursor, every third frame — a full-scene raycast every frame
+           for a cosmetic cursor is not worth the cost, and the pointer does not
+           move far in 50ms. Only marker dots are tested; the globe itself is
+           draggable, not clickable. */
+        hoverFrame = (hoverFrame + 1) % 3;
+        if (hoverArmed && hoverFrame === 0) {
+            hoverRay.setFromCamera(hoverPt, camera);
+            const dots = markers.markers.map((m) => m.dot).filter((d) => d && d.visible);
+            const hit = dots.length && hoverRay.intersectObjects(dots, false).length > 0;
+            const cursor = hit ? 'pointer' : '';
+            if (renderer.domElement.style.cursor !== cursor) renderer.domElement.style.cursor = cursor;
+        }
         markers.update();
         labelRenderer.render(scene, camera);
     }
@@ -653,6 +682,9 @@ export async function createGlobeMode({ scene, camera, renderer }) {
 
     function dispose() {
         window.removeEventListener('resize', resize);
+        window.removeEventListener('pointermove', onPointerMove);
+        themeManager.dispose();
+        renderer.domElement.style.cursor = '';
         feeds.stop();
         markers.dispose();
         globe.dispose();
@@ -676,6 +708,7 @@ export async function createGlobeMode({ scene, camera, renderer }) {
         isActive: () => active,
         update, showLocation, showRoute, dispose,
         cams: camViewer,
+        theme: themeManager,
         satellites: { toggle: setSatellites, service: satelliteService, layer: satelliteLayer },
         layers: layerManager,
         layerPanel,

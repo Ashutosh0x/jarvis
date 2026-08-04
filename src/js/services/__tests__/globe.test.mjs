@@ -1361,5 +1361,47 @@ check('a null response does not throw', normaliseList(null).length === 0);
         !EONET_CATEGORIES.wildfires && !EONET_CATEGORIES.earthquakes);
 }
 
+/* -------------------------------------------------------------- themes */
+
+{
+    const { THEMES, createThemeManager } =
+        await import('../../components/themeManager.js');
+    const { GLOBE_COLORS } = await import('../../components/globeRenderer.js');
+
+    check('every theme carries the four colours a coherent switch needs',
+        Object.values(THEMES).every((t) =>
+            Number.isFinite(t.network) && Number.isFinite(t.atmosphere)
+            && /^#/.test(t.css) && t.label));
+    check('amber is present and is the default identity', !!THEMES.amber);
+
+    /* A fake globe with just the surfaces the manager touches, plus a jsdom-free
+       document shim so setProperty does not throw under node. */
+    const layerMat = () => ({ material: { color: { copy() { this.copied = true; } } } });
+    const fakeGlobe = {
+        atmosphere: { material: { uniforms: { uColor: { value: { set(v) { this.v = v; } } } } } },
+        layers: { coastline: layerMat(), borders: layerMat(), land: layerMat() }
+    };
+    const origAmberNetwork = GLOBE_COLORS.network;
+    const tm = createThemeManager(fakeGlobe);
+
+    tm.setTheme('ghost');
+    check('switching theme mutates GLOBE_COLORS so new layers inherit it',
+        GLOBE_COLORS.network === THEMES.ghost.network);
+    check('and pushes the colour to the atmosphere uniform',
+        fakeGlobe.atmosphere.material.uniforms.uColor.value.v === THEMES.ghost.atmosphere);
+    check('and recolours the built line layers',
+        fakeGlobe.layers.coastline.material.color.copied === true);
+
+    check('cycling advances through the set', tm.cycle() === 'tactical');
+    check('and wraps back to amber', tm.cycle() === 'amber');
+
+    tm.setTheme('nonsense');
+    check('an unknown theme is ignored, not applied', tm.getTheme() === 'amber');
+
+    /* Leave GLOBE_COLORS as we found it so later tests are not coloured. */
+    tm.dispose();
+    check('dispose restores the amber default', GLOBE_COLORS.network === origAmberNetwork);
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
