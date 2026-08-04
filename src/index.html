@@ -1111,20 +1111,16 @@
       pointer-events: none;
       font-family: 'Rajdhani', sans-serif;
     }
-    .globe-status-bar .gsb-plate {
-      display: flex; flex-direction: column; align-items: center; gap: 2px;
-      background: rgba(4, 10, 18, 0.78);
-      border: 1px solid rgba(255, 255, 255, 0.12);
-      border-radius: 12px; padding: 12px 30px;
-      backdrop-filter: blur(12px);
-      box-shadow: 0 8px 40px rgba(0, 0, 0, 0.6);
-    }
-    .globe-status-bar .gsb-primary {
-      font-size: 17px; font-weight: 500; color: #f2f7ff; letter-spacing: 0.4px;
-    }
-    .globe-status-bar .gsb-secondary {
-      font-size: 14px; color: rgba(255, 255, 255, 0.62);
-    }
+    /* THE CENTRE PLATE IS GONE. It was a rounded, bordered, shadowed slab
+       reading "JARVIS: <place> real-time data active" across the bottom of
+       the globe — the single heaviest piece of chrome on screen, and it
+       repeated what the dossier's own title already says. Removed outright
+       rather than restyled: nothing fills the space, so the globe simply
+       shows through where it used to sit.
+
+       The alert column on the right is kept. It carries live seismic and fire
+       events, which is information the dossier does not duplicate. */
+    .globe-status-bar .gsb-plate { display: none !important; }
     .globe-status-bar .gsb-right { display: flex; justify-content: flex-end; }
     .globe-status-bar .gsb-alerts {
       display: flex; flex-direction: column; align-items: flex-end; gap: 3px;
@@ -1142,69 +1138,96 @@
     .globe-status-bar .gsb-alert.kind-breaking .gsb-alert-label { color: #ff6b4a; }
 
     /* ---- dossier panel: right-side intel card ---- */
+    /* ------------------------------------------------------------------
+       THE DOSSIER IS FRAMELESS.
+
+       It was a 320px slab: solid panel, 1px border, 14px radius, a 50px
+       shadow. It read as a dialog parked on top of the globe rather than as
+       part of it, and the border drew a hard rectangle across the planet.
+
+       What replaced it follows the Material 3 / Maps information-sheet idea —
+       content sits on the background and earns contrast only where the eye
+       needs it. There is no container: no border, no panel fill, no shadow.
+       Each ELEMENT carries its own faint scrim instead, so text stays legible
+       over both a bright coastline and empty space while the globe keeps
+       showing through everything between.
+       ------------------------------------------------------------------ */
     .globe-dossier {
-      position: fixed; top: 80px; right: 24px; z-index: 1004;
-      width: 320px; max-height: calc(100vh - 160px);
-      background: rgba(4, 10, 22, 0.82);
-      border: 1px solid rgba(255, 255, 255, 0.1);
-      border-radius: 14px;
-      backdrop-filter: blur(16px);
-      box-shadow: 0 12px 50px rgba(0, 0, 0, 0.7);
+      position: fixed; top: 72px; right: 0; z-index: 1004;
+      width: 300px; max-height: calc(100vh - 150px);
+      /* No background, no border, no shadow. Deliberate. */
+      background: none; border: none; box-shadow: none;
+      padding: 0 22px 0 12px;
       font-family: 'Rajdhani', sans-serif;
-      color: #e4ebf5;
-      overflow: hidden;
-      transform: translateX(360px);
+      color: #e8eef7;
+      overflow-y: auto; overflow-x: hidden;
+      transform: translateX(24px);
       opacity: 0;
       transition: transform 420ms cubic-bezier(0.25, 0.46, 0.45, 0.94),
                   opacity 320ms ease;
       pointer-events: auto;
+      /* The panel fades out at its bottom edge rather than stopping at a
+         border, so scrolled content dissolves into the globe. */
+      -webkit-mask-image: linear-gradient(180deg, #000 0, #000 92%, transparent 100%);
+      mask-image: linear-gradient(180deg, #000 0, #000 92%, transparent 100%);
+      scrollbar-width: none;
     }
-    .globe-dossier.visible {
-      transform: none; opacity: 1;
-    }
+    .globe-dossier::-webkit-scrollbar { width: 0; }
+    .globe-dossier.visible { transform: none; opacity: 1; }
+
     .globe-dossier-header {
-      padding: 16px 18px 10px;
-      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      padding: 0 2px 14px;
+      /* A hairline instead of a rule — presence without a frame. */
+      border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+      margin-bottom: 14px;
     }
     .globe-dossier-header h3 {
-      margin: 0; font-size: 18px; font-weight: 600;
-      color: var(--globe-amber); letter-spacing: 0.6px;
+      margin: 0; font-size: 26px; font-weight: 600; line-height: 1.1;
+      color: #ffffff; letter-spacing: 0.4px;
       text-transform: uppercase;
+      /* The glow IS the legibility layer here — it replaces the panel fill
+         the title used to sit on. */
+      text-shadow: 0 2px 18px rgba(0, 0, 0, 0.95), 0 0 30px rgba(0, 0, 0, 0.7);
     }
     .globe-dossier-header .dossier-subtitle {
-      font-size: 12.5px; color: rgba(255, 255, 255, 0.5); margin-top: 2px;
+      font-size: 13px; color: rgba(255, 255, 255, 0.58); margin-top: 3px;
+      letter-spacing: 0.6px;
+      text-shadow: 0 1px 10px rgba(0, 0, 0, 0.9);
     }
-    /* Image carousel */
+
+    /* The image is a shape on the background, not a card in a container. */
     .dossier-images {
-      position: relative; width: 100%; height: 200px;
-      overflow: hidden; background: rgba(0, 0, 0, 0.3);
+      position: relative; width: 100%; height: 168px;
+      overflow: hidden; border-radius: 14px;
+      background: rgba(255, 255, 255, 0.03);
+      margin-bottom: 14px;
     }
     .dossier-images img {
-      position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+      position: absolute; inset: 0; width: 100%; height: 100%;
       object-fit: cover;
       opacity: 0; transition: opacity 600ms ease;
     }
     .dossier-images img.active { opacity: 1; }
     .dossier-images .img-attribution {
       position: absolute; bottom: 0; left: 0; right: 0;
-      padding: 4px 10px; font-size: 10.5px;
-      color: rgba(255, 255, 255, 0.7);
-      background: linear-gradient(transparent, rgba(0, 0, 0, 0.7));
-      text-align: right;
+      padding: 14px 10px 5px; font-size: 10px;
+      color: rgba(255, 255, 255, 0.72);
+      background: linear-gradient(transparent, rgba(0, 0, 0, 0.75));
+      text-align: right; letter-spacing: 0.2px;
     }
     .dossier-images .img-dots {
-      position: absolute; bottom: 8px; left: 50%; transform: translateX(-50%);
+      position: absolute; bottom: 7px; left: 12px;
       display: flex; gap: 5px;
     }
     .dossier-images .img-dot {
-      width: 6px; height: 6px; border-radius: 50%;
-      background: rgba(255, 255, 255, 0.35); transition: background 200ms;
+      width: 5px; height: 5px; border-radius: 50%;
+      background: rgba(255, 255, 255, 0.4); transition: background 200ms;
     }
-    .dossier-images .img-dot.active { background: var(--globe-amber); }
+    .dossier-images .img-dot.active { background: #ffffff; }
     .dossier-images .no-image {
       display: flex; align-items: center; justify-content: center;
       width: 100%; height: 100%;
-      color: rgba(255, 255, 255, 0.3); font-size: 14px;
+      color: rgba(255, 255, 255, 0.25); font-size: 12.5px; letter-spacing: 0.5px;
     }
     /* Data rows */
     /* Satellites: cool white, small. They are numerous and constantly moving,
@@ -1236,12 +1259,10 @@
     }
 
     .dossier-flights {
-      margin-top: 12px;
-      border-top: 1px solid rgba(255, 255, 255, 0.08);
-      padding-top: 10px;
-      max-height: 170px;
-      overflow-y: auto;
+      margin-top: 16px; padding: 0 2px;
+      max-height: 176px; overflow-y: auto; scrollbar-width: none;
     }
+    .dossier-flights::-webkit-scrollbar { width: 0; }
     .dossier-flights-head {
       font-family: 'Orbitron', sans-serif;
       font-size: 9px; letter-spacing: 2px; text-transform: uppercase;
@@ -1257,10 +1278,11 @@
     }
     .dossier-flight {
       display: flex; align-items: baseline; gap: 8px;
-      font-size: 11px; padding: 3px 0;
+      font-size: 11px; padding: 5px 0;
       color: rgba(255, 255, 255, 0.62);
       border-bottom: 1px solid rgba(255, 255, 255, 0.04);
     }
+    .dossier-flight:last-child { border-bottom: none; }
     .dossier-flight .df-call {
       font-family: 'Orbitron', sans-serif; font-size: 10px;
       color: rgba(150, 230, 255, 0.95); min-width: 68px;
@@ -1268,31 +1290,26 @@
     .dossier-flight .df-meta { margin-left: auto; white-space: nowrap; }
 
     .dossier-events {
-      margin-top: 14px;
-      border-top: 1px solid rgba(255, 255, 255, 0.08);
-      padding-top: 12px;
-      max-height: 260px;
-      overflow-y: auto;
+      margin-top: 16px; padding: 0 2px;
+      max-height: 260px; overflow-y: auto; scrollbar-width: none;
     }
+    .dossier-events::-webkit-scrollbar { width: 0; }
     .dossier-events-head {
       font-family: 'Orbitron', sans-serif;
       font-size: 9px; letter-spacing: 2px; text-transform: uppercase;
       color: rgba(255, 170, 245, 0.75);
       margin-bottom: 8px;
     }
+    /* No card, no border. The thumbnail's own rounding carries the shape and
+       hover is a wash rather than an outline. */
     .dossier-event {
-      display: flex; gap: 10px; align-items: center;
-      padding: 6px; margin-bottom: 6px;
-      border-radius: 8px;
-      background: rgba(214, 51, 176, 0.07);
-      border: 1px solid rgba(214, 51, 176, 0.16);
+      display: flex; gap: 11px; align-items: center;
+      padding: 7px 6px; margin: 0 -6px;
+      border-radius: 10px;
       text-decoration: none; color: inherit;
-      transition: background 160ms ease, border-color 160ms ease;
+      transition: background 160ms ease;
     }
-    .dossier-event:hover {
-      background: rgba(214, 51, 176, 0.14);
-      border-color: rgba(214, 51, 176, 0.4);
-    }
+    .dossier-event:hover { background: rgba(255, 255, 255, 0.05); }
     .dossier-event img {
       width: 56px; height: 42px; flex: 0 0 56px;
       object-fit: cover; border-radius: 5px;
@@ -1308,13 +1325,17 @@
       white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     }
 
+    /* Rows run edge to edge and are separated by space and a hairline, not
+       by a boxed container. */
     .dossier-data {
-      padding: 12px 18px 16px; display: flex; flex-direction: column; gap: 8px;
+      padding: 2px 2px 4px; display: flex; flex-direction: column;
     }
     .dossier-row {
       display: flex; align-items: center; gap: 10px;
-      font-size: 14px;
+      font-size: 14px; padding: 9px 0;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
     }
+    .dossier-row:last-child { border-bottom: none; }
     .dossier-row .dr-icon {
       width: 20px; text-align: center; font-size: 16px; flex-shrink: 0;
     }
@@ -1323,13 +1344,14 @@
       text-transform: uppercase; letter-spacing: 0.5px;
     }
     .dossier-row .dr-value {
-      color: #e4ebf5; font-weight: 500;
+      color: #f2f6fb; font-weight: 500; margin-left: auto;
+      text-shadow: 0 1px 8px rgba(0, 0, 0, 0.85);
     }
     .dossier-row .dr-value.good { color: #6beba5; }
     .dossier-row .dr-value.moderate { color: var(--globe-amber); }
     .dossier-row .dr-value.unhealthy { color: #ff6b4a; }
     .dossier-close {
-      position: absolute; top: 10px; right: 12px;
+      position: sticky; float: right; top: 0; margin: -2px -6px 0 0;
       background: none; border: none; color: rgba(255, 255, 255, 0.45);
       font-size: 18px; cursor: pointer; padding: 4px 8px; line-height: 1;
     }
