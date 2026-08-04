@@ -376,19 +376,25 @@ export async function createGlobeMode({ scene, camera, renderer }) {
             ? Math.min(50000, Math.max(2000, place.spanKm * 500))
             : 15000;
         const companies = await google.searchCompanies('technology companies', {
-            pages: 1, lat: place.lat, lng: place.lng, radiusM: biasRadiusM
+            pages: 2, lat: place.lat, lng: place.lng, radiusM: biasRadiusM
         }).catch(() => []);
         clearCompanyMarkers();
-        const shown = rankLandmarks(companies, {
-            lat: place.lat, lng: place.lng, limit: 12,
-            minSeparationKm: Math.max(0.4, (place.spanKm || 20) / 30),
+        /* Every company as a dot, a spread-out subset named — same rule as the
+           explicit search. */
+        for (const c of companies) {
+            companyMarkers.push(markers.addMarker({
+                lat: c.lat, lng: c.lng, kind: 'company', labelless: true, dotColour: 0x2ce8a0
+            }));
+        }
+        const named = rankLandmarks(companies, {
+            lat: place.lat, lng: place.lng, limit: 14,
+            minSeparationKm: Math.max(0.35, (place.spanKm || 20) / 40),
             exclude: [{ lat: place.lat, lng: place.lng }]
         });
-        for (const c of shown) {
-            const m = markers.addMarker({ lat: c.lat, lng: c.lng, label: c.name.toUpperCase(), kind: 'company' });
-            companyMarkers.push(m);
+        for (const c of named) {
+            companyMarkers.push(markers.addMarker({ lat: c.lat, lng: c.lng, label: c.name.toUpperCase(), kind: 'company' }));
         }
-        codeOverlay.log(`companies@${place.name} -> ${companies.length} (${shown.length} drawn)`);
+        codeOverlay.log(`companies@${place.name} -> ${companies.length} drawn (${named.length} named)`);
         return companies.length;
     }
 
@@ -672,32 +678,44 @@ export async function createGlobeMode({ scene, camera, renderer }) {
         const biasRadiusM = Number.isFinite(place.spanKm)
             ? Math.min(50000, Math.max(2000, place.spanKm * 500))
             : 15000;
+        /* pages:3 is Google's HARD CEILING — Text Search returns at most 60
+           results for a query, three pages of twenty, and there is no
+           parameter that lifts it. "All" here means all that Google returns for
+           this query, which is the honest most a single search can give. */
         const [_, companies] = await Promise.all([
             globe.flyTo(place.lat, place.lng, { distance: flyDistance, ms: 2200 }),
             google.searchCompanies(query, {
-                pages: 2, lat: place.lat, lng: place.lng, radiusM: biasRadiusM
+                pages: 3, lat: place.lat, lng: place.lng, radiusM: biasRadiusM
             }).catch(() => [])
         ]);
 
         markers.addMarker({ lat: place.lat, lng: place.lng, label: labelFor(place.name, place.source), pin: true, boxed: true });
 
-        /* Thinned so the labels are readable; the pin is seeded as taken so a
-           company does not print on top of it. */
-        const shown = rankLandmarks(companies, {
-            lat: place.lat, lng: place.lng, limit: 12,
-            minSeparationKm: Math.max(0.4, (place.spanKm || 20) / 30),
+        /* EVERY company gets a dot — that is "show them all". Sixty leader-line
+           labels in one city would smear into an unreadable mass, so the dots
+           carry the full set and only a thinned, spread-out subset is labelled.
+           Zoom in and the LOD fade brings more labels within reach. */
+        for (const c of companies) {
+            markers.addMarker({
+                lat: c.lat, lng: c.lng, kind: 'company',
+                labelless: true, dotColour: 0x2ce8a0
+            });
+        }
+        const labelled = rankLandmarks(companies, {
+            lat: place.lat, lng: place.lng, limit: 14,
+            minSeparationKm: Math.max(0.35, (place.spanKm || 20) / 40),
             exclude: [{ lat: place.lat, lng: place.lng }]
         });
-        for (const c of shown) {
+        for (const c of labelled) {
             markers.addMarker({ lat: c.lat, lng: c.lng, label: c.name.toUpperCase(), kind: 'company' });
         }
 
         statusBar.setTarget(place.name, companies.length
-            ? `${companies.length} ${companyType || 'companies'} found${shown.length < companies.length ? `, ${shown.length} shown` : ''}.`
+            ? `${companies.length} ${companyType || 'companies'} on the map${labelled.length < companies.length ? `, ${labelled.length} named` : ''}.`
             : `No ${companyType || 'companies'} found here.`);
-        codeOverlay.log(`companies("${query}") -> ${companies.length} (${shown.length} drawn)`);
+        codeOverlay.log(`companies("${query}") -> ${companies.length} drawn (${labelled.length} named)`);
 
-        return { ok: true, place, companies, shown: shown.length };
+        return { ok: true, place, companies, shown: companies.length, named: labelled.length };
     }
 
     async function showRoute(fromQuery, toQuery) {

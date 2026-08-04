@@ -98,32 +98,39 @@ export function createMarkerLayer({ scene, camera, globeGroup }) {
      *
      * @param {{lat:number,lng:number,label:string,kind?:string,boxed?:boolean}} spec
      */
-    function addMarker({ lat, lng, label, kind = 'wire', boxed = false, pin = false }) {
+    function addMarker({ lat, lng, label, kind = 'wire', boxed = false, pin = false, labelless = false, dotColour = 0xffffff }) {
         const anchor = latLngToVector3(lat, lng, GLOBE_RADIUS);
         const out = anchor.clone().normalize();
         const labelPos = anchor.clone().addScaledVector(out, GLOBE_RADIUS * LABEL_LIFT);
 
-        /* Leader line, anchor -> label. */
-        const lineGeom = new THREE.BufferGeometry().setFromPoints([anchor, labelPos]);
-        const line = new THREE.Line(lineGeom, new THREE.LineBasicMaterial({
-            color: 0xffffff, transparent: true, opacity: 0.45, depthWrite: false
-        }));
-        group.add(line);
+        /* Leader line and label are skipped for a `labelless` marker — that is
+           how "show ALL the companies" draws sixty dots without sixty labels
+           printing on top of one another. The dot is coloured so the layer
+           still reads as one set. */
+        let line = null, el = null, labelObject = null;
+        if (!labelless) {
+            const lineGeom = new THREE.BufferGeometry().setFromPoints([anchor, labelPos]);
+            line = new THREE.Line(lineGeom, new THREE.LineBasicMaterial({
+                color: 0xffffff, transparent: true, opacity: 0.45, depthWrite: false
+            }));
+            group.add(line);
+        }
 
-        /* The dot that sits exactly on the surface. */
         const dot = new THREE.Mesh(
-            new THREE.SphereGeometry(GLOBE_RADIUS * 0.008, 10, 10),
-            new THREE.MeshBasicMaterial({ color: 0xffffff })
+            new THREE.SphereGeometry(GLOBE_RADIUS * (labelless ? 0.006 : 0.008), 8, 8),
+            new THREE.MeshBasicMaterial({ color: dotColour, transparent: true, opacity: labelless ? 0.85 : 1 })
         );
         dot.position.copy(anchor);
         group.add(dot);
 
-        const el = document.createElement('div');
-        el.className = `globe-label${boxed ? ' boxed' : ''} kind-${kind}`;
-        el.textContent = label;
-        const labelObject = new CSS2DObject(el);
-        labelObject.position.copy(labelPos);
-        group.add(labelObject);
+        if (!labelless) {
+            el = document.createElement('div');
+            el.className = `globe-label${boxed ? ' boxed' : ''} kind-${kind}`;
+            el.textContent = label;
+            labelObject = new CSS2DObject(el);
+            labelObject.position.copy(labelPos);
+            group.add(labelObject);
+        }
 
         let pinSprite = null;
         if (pin) {
@@ -159,11 +166,13 @@ export function createMarkerLayer({ scene, camera, globeGroup }) {
 
     /** Tear one marker down — the scene objects, geometry and DOM label. */
     function disposeMarker(m) {
-        group.remove(m.line, m.dot, m.labelObject);
-        if (m.pinSprite) group.remove(m.pinSprite);
-        m.line.geometry.dispose();
+        if (m.line) { group.remove(m.line); m.line.geometry.dispose(); }
+        if (m.labelObject) group.remove(m.labelObject);
+        if (m.el) m.el.remove();
+        group.remove(m.dot);
         m.dot.geometry.dispose();
-        m.el.remove();
+        m.dot.material.dispose?.();
+        if (m.pinSprite) group.remove(m.pinSprite);
     }
 
     function clear() {
@@ -219,10 +228,12 @@ export function createMarkerLayer({ scene, camera, globeGroup }) {
             const visible = facing;
             /* Far-side occlusion AND distance both gate the label; either one
                reaching zero hides it. */
-            m.el.style.opacity = visible ? String(age * 0.95 * lodLabel) : '0';
+            if (m.el) {
+                m.el.style.opacity = visible ? String(age * 0.95 * lodLabel) : '0';
+                m.el.style.transform = `translate(-50%, -50%) scale(${0.86 + age * 0.14})`;
+            }
+            if (m.line) m.line.visible = visible;
             m.dot.scale.setScalar(lodDot);
-            m.el.style.transform = `translate(-50%, -50%) scale(${0.86 + age * 0.14})`;
-            m.line.visible = visible;
             m.dot.visible = visible;
             if (m.pinSprite) m.pinSprite.visible = visible;
         }

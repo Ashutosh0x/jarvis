@@ -7518,7 +7518,7 @@ class Jarvis {
             const n = r.companies.length;
             if (!n) { this.speak(`No ${label} found in ${r.place.name}, Sir.`); return; }
             const lead = r.companies.slice(0, 3).map((c) => c.name).join(', ');
-            this.speak(`${n} ${label} near ${r.place.name}, Sir. ${r.shown} on the map. The nearest include ${lead}.`);
+            this.speak(`${n} ${label} in ${r.place.name}, Sir, all on the map. The nearest include ${lead}.`);
         } catch (e) {
             console.error('Globe companies error:', e);
             this.speak('The company search failed, Sir.');
