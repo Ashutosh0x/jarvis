@@ -32,6 +32,7 @@ import { geocode, buildPlaceIndex, findLocal } from '../services/geocode.js';
 import { createLandmarkService } from '../services/landmarks.js';
 import { createGoogleServices, describeDossier, cameraDistanceFor } from '../services/googleServices.js';
 import { createPlaceImages } from '../services/placeImages.js';
+import { createDossierPanel } from './dossierPanel.js';
 
 /* Files the code column scrolls through — real modules, not filler.
  *
@@ -92,6 +93,7 @@ const SOURCE_TAGS = {
     nominatim: 'OSM',
     wikipedia: 'WIKIPEDIA',
     google: 'GOOGLE',
+    luma: 'LUMA',
     caller: ''
 };
 
@@ -124,6 +126,7 @@ export async function createGlobeMode({ scene, camera, renderer }) {
     const codeOverlay = createCodeOverlay({
         mount, loadSource: loadText, files: CODE_SOURCES
     });
+    const dossierPanel = createDossierPanel({ mount });
 
     /* Places index: bundled, so a city lookup works with no network. */
     let placeIndex = [];
@@ -145,9 +148,11 @@ export async function createGlobeMode({ scene, camera, renderer }) {
             if (!active) return;
             /* Only the notable ones get a ripple: every M2.5 on Earth is a few
                hundred a day and the globe would be permanently boiling. */
-            for (const e of events.slice(0, 8)) {
-                if ((e.magnitude ?? 0) >= 4.5) {
+            for (const e of events.slice(0, 12)) {
+                if (e.kind === 'earthquake' && (e.magnitude ?? 0) >= 4.5) {
                     markers.addRipple({ lat: e.lat, lng: e.lng, maxScale: 0.4 + e.weight });
+                } else if (e.kind === 'wildfire') {
+                    markers.addRipple({ lat: e.lat, lng: e.lng, maxScale: 0.3 + e.weight, colour: 0xff6b2e });
                 }
             }
             const top = events[0];
@@ -175,12 +180,12 @@ export async function createGlobeMode({ scene, camera, renderer }) {
         }
 
         globe.setVisible(on);
-        /* Both are built and still fed — `statusBar.setTarget` and
-           `codeOverlay.log` remain the record of what the globe is doing, and
-           the modules are one line from returning — but neither is shown. The
-           view is the planet alone. */
-        statusBar.setVisible(false);
-        codeOverlay.setVisible(false);
+        /* The status bar and code overlay complete the Iron Man command-centre
+           aesthetic. The bar shows the target, weather/time dossier and seismic
+           alerts; the column scrolls real source code with live log entries. */
+        statusBar.setVisible(on);
+        codeOverlay.setVisible(on);
+        dossierPanel.setVisible(on);
         labelRenderer.domElement.style.display = on ? 'block' : 'none';
         document.body.classList.toggle('globe-mode', on);
 
@@ -337,9 +342,34 @@ export async function createGlobeMode({ scene, camera, renderer }) {
             codeOverlay.log(`placeImages(${place.name}) -> ${pictures.images.length} from ${[...new Set(pictures.images.map((i) => i.provider))].join(', ')}`);
         }
 
+        /* Events on this calendar that are near the target. Their radius
+           scales with the place: "events in Japan" should reach the whole
+           country, "events on this street" should not reach the next city. */
+        const eventRadiusKm = Number.isFinite(place.spanKm)
+            ? Math.max(25, Math.min(2000, place.spanKm))
+            : 100;
+        const nearbyEvents = feeds.near(place.lat, place.lng, eventRadiusKm)
+            .filter((e) => e.kind === 'event');
+        for (const e of nearbyEvents.slice(0, 6)) {
+            markers.addMarker({
+                lat: e.lat, lng: e.lng,
+                label: labelFor(e.name, 'luma'),
+                kind: 'event'
+            });
+        }
+
+        /* Show the dossier panel with images and ground-truth data. */
+        dossierPanel.show({
+            name: place.name,
+            country: place.country || '',
+            dossier: facts,
+            images: pictures.images,
+            events: nearbyEvents
+        });
+
         return {
             ok: true, place, nearby, source: place.source,
-            landmarks: ring.items, dossier: facts,
+            landmarks: ring.items, dossier: facts, events: nearbyEvents,
             /* Each carries its own attribution; anything rendering these MUST
                show it — see the header of placeImages.js. */
             images: pictures.images
@@ -366,6 +396,7 @@ export async function createGlobeMode({ scene, camera, renderer }) {
         globe.dispose();
         statusBar.dispose();
         codeOverlay.dispose();
+        dossierPanel.dispose();
         labelRenderer.domElement.remove();
     }
 

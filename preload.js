@@ -280,6 +280,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
     /* Google Maps Platform. Returns data, never the key that fetched it. */
     googleMaps: (method, params) => ipcRenderer.invoke('google-maps', method, params),
     googleMapsStatus: () => ipcRenderer.invoke('google-maps-status'),
+    /* Read-only: the Luma key can cancel events and read guest emails, so the
+       write half of that API is not reachable from here. */
+    lumaEvents: (method, params) => ipcRenderer.invoke('luma-events', method, params),
+    lumaEventsStatus: () => ipcRenderer.invoke('luma-events', 'status', {}),
     /* Kept as a named shortcut: the landmark ring is the hot path. */
     placesNearby: (opts) => ipcRenderer.invoke('google-maps', 'placesNearby', opts),
     foundryRebuild: (jobId) => ipcRenderer.invoke('foundry-rebuild', jobId),

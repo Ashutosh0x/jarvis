@@ -10,11 +10,14 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { normalise, editDistance, buildPlaceIndex, findLocal, isPrefixMatch } from '../geocode.js';
-import { parseQuakes, describeEvent, distanceKm } from '../dataFeeds.js';
+import { parseQuakes, describeEvent, distanceKm, createDataFeeds, firmsKey } from '../dataFeeds.js';
 import { solarParameters, subsolarPoint, sunDirection, solarAltitude, isDaylight } from '../solarPosition.js';
 import { parseWikiGeosearch, parseGooglePlaces, rankLandmarks, createLandmarkService } from '../landmarks.js';
 import { createGoogleServices, describeDossier, parseGeocode, parseGeocodeV4, spanKmFromViewport, cameraDistanceFor, describeRoute, localTime } from '../googleServices.js';
 import { createPlaceImages, sourcesFor, parseWikipediaSummary, parseWikimediaGeosearch, satelliteImage } from '../placeImages.js';
+import { createRequire } from 'node:module';
+const _req = createRequire(import.meta.url);
+const { normaliseList } = _req(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..', '..', 'lumaEvents.js'));
 
 let pass = 0, fail = 0;
 const check = (n, c) => { c ? pass++ : fail++; console.log(`${c ? 'PASS' : 'FAIL'}  ${n}`); };
@@ -701,6 +704,218 @@ check('bad coordinates yield no satellite image', satelliteImage(null, null) ===
         res.images.length === 0 && res.attributionRequired === false);
 }
 
+/* --------------------------------------------------------- feed honesty */
+
+/* FIRMS needs a MAP_KEY. Verified live: a keyless request returns
+   "Invalid MAP_KEY." — so a feed that claims to be configured without one is
+   lying, and polling it can never succeed. */
+{
+    let fetched = 0;
+    const noKey = createDataFeeds({
+        getSettings: () => ({}),
+        fetchImpl: async () => { fetched++; return { ok: true, text: async () => 'Invalid MAP_KEY.' }; }
+    });
+    const fire = noKey.status().find((f) => f.key === 'wildfires');
+    check('FIRMS reports itself unconfigured without a MAP_KEY', fire.configured === false);
+    check('and says where to get one', /MAP_KEY/i.test(fire.state) && /firms/i.test(fire.state));
+
+    await noKey.refreshFires?.();
+    check('and is never polled without one', fetched === 0);
+}
+
+/* The endpoint answers 200 with a plain-text complaint, so a 200 is not proof
+   of data — a parser that trusted the status code would store zero fires and
+   report "live". */
+{
+    const badKey = createDataFeeds({
+        getSettings: () => ({ firmsMapKey: 'wrong' }),
+        fetchImpl: async () => ({ ok: true, text: async () => 'Invalid MAP_KEY.' })
+    });
+    await badKey.refreshFires?.();
+    const fire = badKey.status().find((f) => f.key === 'wildfires');
+    check('a 200 carrying "Invalid MAP_KEY" is treated as a failure',
+        !/^live/.test(fire.state));
+    check('and the reason is carried, not flattened to "offline"',
+        /MAP_KEY/i.test(fire.state));
+}
+
+/* A real key must build the documented segment order. Omitting the key shifts
+   every segment along, which is exactly the bug this replaced. */
+{
+    let seen = null;
+    const good = createDataFeeds({
+        getSettings: () => ({ firmsMapKey: 'REALKEY' }),
+        fetchImpl: async (url) => {
+            seen = url;
+            return { ok: true, text: async () => 'latitude,longitude,bright_ti4,confidence,acq_date,acq_time\n1.5,2.5,330,high,2026-08-04,1200\n' };
+        }
+    });
+    await good.refreshFires?.();
+    check('the MAP_KEY is the FIRST path segment after /csv/',
+        /\/api\/area\/csv\/REALKEY\/VIIRS_SNPP_NRT\/world\/1$/.test(String(seen)));
+    const fire = good.status().find((f) => f.key === 'wildfires');
+    check('and a valid CSV goes live', /^live/.test(fire.state) && fire.count === 1);
+}
+
+/* OpenSky's anonymous quota is ~100/day. Polling every 30s is 2,880. */
+{
+    const feeds = createDataFeeds({ getSettings: () => ({}), fetchImpl: async () => ({ ok: false }) });
+    const flights = feeds.feeds.flights;
+    const perDay = 86400000 / flights.intervalMs;
+    check('the flight poll stays inside the anonymous daily budget', perDay <= 100);
+    check('and is not the 30-second interval that would be 2,880 a day',
+        flights.intervalMs >= 10 * 60 * 1000);
+}
+
+/* ------------------------------------------------------------ luma events */
+
+/* Shapes taken from the live OpenAPI document at
+   public-api.luma.com/openapi.json — `coordinate` is {latitude, longitude} or
+   null, documented as "Null for online events or when the address can't be
+   geocoded". */
+const LUMA_LIST = {
+    entries: [
+        {
+            event: {
+                api_id: 'evt-1', name: 'AI Builder Night',
+                start_at: '2026-08-10T18:00:00Z', end_at: '2026-08-10T21:00:00Z',
+                timezone: 'America/Los_Angeles',
+                coordinate: { latitude: 37.7749, longitude: -122.4194 },
+                geo_address_json: { address: '3180 18th St', city: 'San Francisco', region: 'CA', country: 'USA', full_address: '3180 18th St, San Francisco, CA' },
+                cover_url: 'https://images.lumacdn.com/event-covers/a/b.png',
+                url: 'https://lu.ma/ai-builder-night',
+                location_type: 'offline', visibility: 'public', spots_remaining: 12
+            }
+        },
+        /* Online event — no coordinate. Must survive the parse and be excluded
+           from the globe rather than pinned at (0,0). */
+        {
+            event: {
+                api_id: 'evt-2', name: 'Remote AMA',
+                start_at: '2026-08-11T15:00:00Z', coordinate: null,
+                geo_address_json: null, location_type: 'zoom', url: 'remote-ama'
+            }
+        },
+        { event: null }
+    ],
+    has_more: false, next_cursor: null
+};
+
+const lumaEvents = normaliseList(LUMA_LIST);
+check('luma entries parse', lumaEvents.length === 2);
+check('coordinates are read from `coordinate`, not transposed',
+    Math.abs(lumaEvents[0].lat - 37.7749) < 1e-9 && Math.abs(lumaEvents[0].lng + 122.4194) < 1e-9);
+check('the cover image survives', /lumacdn/.test(lumaEvents[0].coverUrl));
+check('city and country come from geo_address_json',
+    lumaEvents[0].city === 'San Francisco' && lumaEvents[0].country === 'USA');
+check('a relative url is absolutised to lu.ma',
+    lumaEvents[1].url === 'https://lu.ma/remote-ama');
+check('an online event keeps null coordinates rather than becoming (0,0)',
+    lumaEvents[1].lat === null && lumaEvents[1].lng === null);
+check('a null entry is dropped, not fatal', lumaEvents.every((e) => !!e.id));
+check('spots remaining is carried', lumaEvents[0].spotsRemaining === 12);
+check('an empty response parses to nothing', normaliseList({ entries: [] }).length === 0);
+check('a null response does not throw', normaliseList(null).length === 0);
+
+/* The ticker line must render in the EVENT's timezone, not the desk's. */
+{
+    const line = describeEvent(lumaEvents[0]);
+    check('the event ticker names the event and its city',
+        /AI Builder Night/.test(line) && /San Francisco/.test(line));
+    const tokyo = describeEvent({
+        kind: 'event', name: 'Tokyo Meetup', city: 'Tokyo',
+        startAt: '2026-08-10T09:00:00Z', timezone: 'Asia/Tokyo'
+    });
+    check('and the time is shown where the event is, not where the user is',
+        /18:00/.test(tokyo));
+}
+
+/* Feed honesty: without a key it must say so and never poll. */
+{
+    let called = 0;
+    const noKey = createDataFeeds({
+        getSettings: () => ({}),
+        fetchImpl: async () => ({ ok: false }),
+        lumaBridge: async () => { called++; return { ok: false, reason: 'no-key' }; }
+    });
+    await noKey.refreshEvents?.();
+    const ev = noKey.status().find((f) => f.key === 'events');
+    check('Luma reports itself unconfigured without a key', ev.configured === false);
+    check('and names the key it needs', /LUMA_API_KEY/.test(ev.state));
+}
+
+/* A calendar whose events are all online is a real state, not a failure. */
+{
+    const online = createDataFeeds({
+        getSettings: () => ({}),
+        fetchImpl: async () => ({ ok: false }),
+        lumaBridge: async () => ({ ok: true, data: { events: [lumaEvents[1]] } })
+    });
+    await online.refreshEvents?.();
+    const ev = online.status().find((f) => f.key === 'events');
+    check('an online-only calendar is live with zero markers, and says why',
+        /^live/.test(ev.state) && /coordinate/i.test(ev.state) && ev.count === 0);
+}
+
+/* Placeable events reach the globe and the proximity search. */
+{
+    const live = createDataFeeds({
+        getSettings: () => ({}),
+        fetchImpl: async () => ({ ok: false }),
+        lumaBridge: async () => ({ ok: true, data: { events: lumaEvents } })
+    });
+    await live.refreshEvents?.();
+    check('only events with coordinates become markers',
+        live.feeds.events.data.length === 1);
+    check('and they are found by proximity',
+        live.near(37.77, -122.42, 50).some((e) => e.kind === 'event'));
+    check('while a distant search does not return them',
+        !live.near(51.5, -0.12, 50).some((e) => e.kind === 'event'));
+}
+
+/* ------------------------------------------------ dossier field contract
+
+   The panel and the spoken briefing both read the dossier directly. They were
+   both written against a NESTED shape (`dossier.weather.temperature`,
+   `dossier.airQuality.index`) that the service has never produced — it returns
+   flat fields — so both silently rendered nothing. Absent data is a supported
+   state here, which is exactly why the mismatch was invisible.
+
+   These pin the contract from the producing side, so it cannot drift again
+   without a test failing. */
+{
+    const source = readFileSync(path.join(REPO, 'googleMaps.js'), 'utf8');
+    const panel = readFileSync(path.join(REPO, 'src', 'js', 'components', 'dossierPanel.js'), 'utf8');
+    const brief = readFileSync(path.join(REPO, 'src', 'js', 'jarvis.js'), 'utf8');
+
+    for (const field of ['elevationM', 'timeZoneId', 'utcOffsetSec', 'temperatureC', 'aqi']) {
+        check(`dossier() produces \`${field}\``, source.includes(`${field}:`));
+    }
+    check('the panel reads the flat temperature, not a nested one',
+        panel.includes('dossier.temperatureC') && !panel.includes('dossier.weather?.temperature'));
+    check('the panel reads the flat AQI',
+        panel.includes('dossier.aqi') && !panel.includes('dossier.airQuality?.index'));
+    check('the spoken briefing reads the flat fields too',
+        brief.includes('dossier.temperatureC') && !brief.includes('dossier.weather?.temperature'));
+}
+
+/* ------------------------------------------------------- event intent */
+
+/* "what events are happening in Tokyo" must extract Tokyo and mark the query
+   as event-focused; "show me Tokyo" must not. */
+{
+    const eventWords = /\b(?:events?|meetups?|conferences?|hackathons?)\b/i;
+    const at = /\b(?:in|at|near|around|on)\s+(?:the\s+)?([a-z][a-z .'-]{1,40}?)\s*[.?!]?$/i;
+    const parse = (cmd) => (eventWords.test(cmd) ? at.exec(cmd)?.[1]?.trim() || null : null);
+
+    check('"what events are happening in Tokyo" finds Tokyo', parse('what events are happening in Tokyo') === 'Tokyo');
+    check('"show me events in San Francisco" finds San Francisco',
+        parse('show me events in San Francisco') === 'San Francisco');
+    check('"any meetups in Berlin" finds Berlin', parse('any meetups in Berlin') === 'Berlin');
+    check('a plain place query is not event-focused', parse('show me Tokyo') === null);
+    check('and neither is an unrelated command', parse('what is the weather') === null);
+}
+
 /* ----------------------------------------------------------------- docs */
 
 /* The globe is the newest subsystem and the easiest to document once and let
@@ -726,8 +941,12 @@ check('bad coordinates yield no satellite image', satelliteImage(null, null) ===
     check('the README links the globe reference', readme.includes('docs/GLOBE.md'));
     check('and lists the maps key alongside the other provider keys',
         readme.includes('GOOGLE_MAPS_API_KEY'));
+    /* Line-ending agnostic on purpose. An editing pass that rewrote the file
+       as CRLF turned this assertion red for a reason that had nothing to do
+       with the claim being tested — the heading was there the whole time. The
+       repo is LF, which the diff enforces far better than a unit test can. */
     check('and the Contents entry resolves to a real heading',
-        readme.includes('- [Globe](#globe)') && /\n## Globe\n/.test(readme));
+        readme.includes('- [Globe](#globe)') && /^## Globe\s*$/m.test(readme));
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

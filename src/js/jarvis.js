@@ -1707,6 +1707,17 @@ class Jarvis {
            a fact lookup rather than a heuristic, which is why it can afford to
            be this permissive. Requires a confident hit (>= 0.8) so a fuzzy
            near-miss cannot hijack an unrelated command. */
+        /* Events at a place — "what events are happening in Tokyo".
+           Routed to GLOBE_SHOW with a flag rather than a separate intent: the
+           work is identical (fly there, mark it up) and only the spoken line
+           differs. A second intent would duplicate the whole pipeline. */
+        const eventsAt = /\b(?:events?|meetups?|conferences?|hackathons?)\b/i.test(cmd)
+            ? /\b(?:in|at|near|around|on)\s+(?:the\s+)?([a-z][a-z .'-]{1,40}?)\s*[.?!]?$/i.exec(cmdNoFraming)?.[1]?.trim()
+            : null;
+        if (eventsAt && window.jarvisGlobe) {
+            return { intent: 'GLOBE_SHOW', place: eventsAt, focus: 'events' };
+        }
+
         const bareShow = /^(?:jarvis[,\s]+)?(?:show|display|pull\s+up|bring\s+up|take\s+me\s+to|go\s+to|fly\s+to|zoom\s+(?:in\s+)?to)\s+(?:me\s+|my\s+|us\s+)?(?:jarvis[,\s]+)?(?:the\s+)?([a-z][a-z .'-]{1,40}?)(?:\s+(?:city|globe|map))?\s*[.?!]?$/i.exec(cmdNoFraming);
         if (bareShow && window.jarvisGlobe?.resolveLocal) {
             const candidate = bareShow[1].trim();
@@ -7233,7 +7244,7 @@ class Jarvis {
        claim this project keeps removing: it says how many events there are,
        or it says there are none.
        --------------------------------------------------------------------- */
-    async handleGlobeShow({ place }) {
+    async handleGlobeShow({ place, focus }) {
         const globe = window.jarvisGlobe;
         if (!globe) {
             this.speak('The globe view is not available in this build, Sir.');
@@ -7251,20 +7262,89 @@ class Jarvis {
                 return;
             }
 
-            const { place: found, nearby, source } = result;
+            const { place: found, nearby, source, dossier, images, events } = result;
             /* Say where the coordinates came from when they came off the
                network — the offline index is the normal path and worth
                distinguishing from a lookup that needed the internet. */
             if (source === 'nominatim') this.showStatus?.(`Globe: geocoded ${found.name} online`);
 
-            if (nearby.length) {
+            /* Build a briefing from what actually came back. Every fragment is
+               optional — a missing dossier or an empty feed should shorten the
+               sentence, not block it. */
+            const parts = [found.name];
+
+            /* Dossier: temperature, local time, air quality — the facts a
+               command-centre briefing opens with. */
+            if (dossier) {
+                /* FLAT field names. These read `dossier.weather.temperature`
+                   and `dossier.airQuality.index` before, while the service has
+                   always returned `temperatureC` and `aqi` at the top level —
+                   so every guard failed and the briefing silently dropped the
+                   weather, the time and the air quality it had just fetched. */
+                const temp = dossier.temperatureC;
+                const desc = dossier.condition;
+                const aqi = dossier.aqi;
+
+                if (Number.isFinite(dossier.utcOffsetSec)) {
+                    const d = new Date(Date.now() + dossier.utcOffsetSec * 1000);
+                    parts.push(`Local time ${String(d.getUTCHours()).padStart(2, '0')} ${String(d.getUTCMinutes()).padStart(2, '0')}`);
+                }
+                if (Number.isFinite(temp)) {
+                    parts.push(`${Math.round(temp)} degrees${desc ? `, ${String(desc).toLowerCase()}` : ''}`);
+                }
+                if (Number.isFinite(aqi)) {
+                    const quality = dossier.aqiCategory
+                        ? String(dossier.aqiCategory).replace(/ air quality$/i, '').toLowerCase()
+                        : (aqi <= 50 ? 'good' : aqi <= 100 ? 'moderate' : aqi <= 150 ? 'unhealthy for sensitive groups' : 'unhealthy');
+                    parts.push(`Air quality index ${aqi}, ${quality}`);
+                }
+                if (Number.isFinite(dossier.elevationM)) {
+                    parts.push(`Elevation ${Math.round(dossier.elevationM)} metres`);
+                }
+            }
+
+            if (focus === 'events') {
+                /* Asked about events; seismic activity is not the answer. */
+            } else if (nearby.length) {
                 const worst = nearby.reduce((a, b) => ((b.magnitude ?? 0) > (a.magnitude ?? 0) ? b : a));
-                this.speak(
-                    `${found.name}. ${nearby.length} seismic event${nearby.length === 1 ? '' : 's'} within nine hundred kilometres, the largest a magnitude ${(worst.magnitude ?? 0).toFixed(1)} near ${worst.place}.`
+                parts.push(
+                    `${nearby.length} seismic event${nearby.length === 1 ? '' : 's'} within nine hundred kilometres, the largest a magnitude ${(worst.magnitude ?? 0).toFixed(1)} near ${worst.place}`
                 );
             } else {
-                this.speak(`${found.name} is on screen, Sir. No significant seismic activity nearby.`);
+                parts.push('No significant seismic activity nearby');
             }
+
+            /* Events. When the user ASKED about events this leads the briefing
+               and the seismic line is dropped — "what events are in Tokyo"
+               answered with earthquake counts is answering a different
+               question.
+
+               "No events" is only said when the feed is actually working. An
+               unconfigured Luma calendar must not be reported as an empty
+               city, because that is a claim about the world made from a
+               missing API key. */
+            const eventFeed = globe.feeds?.status?.().find((f) => f.key === 'events');
+            if (focus === 'events') {
+                if (eventFeed && !eventFeed.configured) {
+                    this.speak(`${found.name} is on screen, Sir. I have no events calendar connected — Luma needs an API key before I can answer that.`);
+                    return;
+                }
+                if (events?.length) {
+                    const next = events[0];
+                    parts.push(`${events.length} event${events.length === 1 ? '' : 's'} nearby`);
+                    if (next?.name) parts.push(`the nearest is ${next.name}`);
+                } else {
+                    parts.push('No events on your calendar near there');
+                }
+            } else if (events?.length) {
+                parts.push(`${events.length} event${events.length === 1 ? '' : 's'} on your calendar nearby`);
+            }
+
+            if (images?.length) {
+                parts.push(`${images.length} photograph${images.length === 1 ? '' : 's'} acquired`);
+            }
+
+            this.speak(parts.join('. ') + '.');
         } catch (e) {
             console.error('Globe error:', e);
             this.speak('The globe failed to acquire that location, Sir.');

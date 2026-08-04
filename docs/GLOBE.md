@@ -270,17 +270,109 @@ There is no stock-photo substitute and no grey tile pretending to be a place.
 
 ## Live feeds
 
-**USGS earthquakes** ship on — public, no key, updated every few minutes. Events
-at magnitude 4.5 and above draw an expanding amber ripple; ripple size follows
-magnitude, because a M6 and a M2.5 rendered identically would make the display
-decorative.
+| Feed | Key | Interval | Ships on |
+| --- | --- | --- | --- |
+| USGS earthquakes | none | 5 min | ✅ |
+| OpenSky flights | none | 15 min | ✅ |
+| NASA FIRMS wildfires | free MAP_KEY | 30 min | needs key |
+| Luma events | Luma Plus | 10 min | needs key |
 
-NASA FIRMS and OpenSky are registered as `configured: false` with a stated
-reason rather than pretending to be off. A feed the user has not configured
-that silently does nothing is the failure mode this project keeps deleting.
+**USGS earthquakes** need nothing at all. Magnitude 4.5 and above draws an
+expanding amber ripple, sized by magnitude — a M6 and a M2.5 rendered
+identically would make the display decorative.
+
+**OpenSky** is genuinely keyless, but the quota is not generous: anonymous
+access is on the order of a hundred requests a day. The unbounded
+`states/all` response is also ~920 KB. Polling it every 30 seconds — as an
+earlier version did — is 2,880 requests and gigabytes a day, and gets
+rate-limited within the hour. Fifteen minutes is 96 requests a day and well
+inside the budget.
+
+**NASA FIRMS requires a MAP_KEY** and the path is positional:
+
+```
+/api/area/csv/{MAP_KEY}/{SOURCE}/{AREA}/{DAY_RANGE}
+```
+
+Omit the key and every segment shifts along — the source is read as the key,
+the area as the source — and all four parameters fail at once. Worse, FIRMS
+answers **HTTP 200** with a plain-text complaint, so a status-code check passes
+and the feed reports itself live with zero detections forever. The parser
+therefore inspects the body, not the status.
+
+**Luma events** are covered in their own section below.
+
+A feed with no credentials reports `configured: false` with the reason and
+**never polls**. Retrying a request that is structurally incapable of
+succeeding is how a dead feed comes to look like a flaky network.
 
 Offline is normal: a failed poll marks the feed stale and keeps the last good
 data. It does not throw and it does not clear the globe.
+
+---
+
+## Luma events
+
+Events from a Luma calendar appear as magenta markers, with cover image, time
+and venue in the dossier panel.
+
+```
+what events are happening in Tokyo
+show me events in San Francisco
+```
+
+### It is YOUR calendar, not the world's
+
+This is the part worth reading before expecting a global events layer.
+
+Luma's public API has **66 endpoints and not one of them searches**. Verified
+against the live OpenAPI document at `public-api.luma.com/openapi.json` — there
+is no `/search`, `/discover`, `/explore` or `/browse` path. Their documentation
+is explicit:
+
+> "API keys are scoped to a single calendar. Each calendar you want to manage
+> via the API needs its own key, and each key only grants access to the calendar
+> it was created on."
+
+So *"show me every AI meetup in Tokyo"* cannot be answered by this API at any
+price. What can be answered is *"show me my events, wherever in the world they
+are"*, and that is what this does. The feed is named **"Luma (my calendar)"**
+for that reason: a layer that shows one calendar while implying it shows
+everything is worse than no layer.
+
+Scraping the public Discover feed is not an alternative. Luma's Terms of Use:
+
+> "You must not access the Service by any means other than our publicly
+> supported interfaces."
+
+This is an industry pattern rather than a Luma quirk — Eventbrite removed its
+public event search in December 2019 and never replaced it. The catalogue *is*
+the product.
+
+### The key never crosses the bridge
+
+`LUMA_API_KEY` grants full write access to the calendar it belongs to: it can
+create events, cancel them, and read the guest list with every attendee's email
+address. It is read in the main process by `lumaEvents.js` and stays there.
+
+The IPC whitelist is **read-only** — `listEvents`, `getEvent`, `calendar`,
+`status`. The write half of the API is deliberately unreachable from the
+renderer, because a bug in a map layer must not be able to cancel an event.
+
+### Details worth knowing
+
+- Only events with a `coordinate` can be pinned. Luma documents that field as
+  null for online events and for addresses it could not geocode, so an
+  online-only calendar legitimately produces zero markers — and the feed says
+  `live (N events, none with coordinates)` rather than reporting a failure.
+- Times render in the **event's** timezone. An 18:00 event in Tokyo must not
+  read as 09:00 because the desk is in London.
+- "No events near there" is only ever said when the feed is actually working.
+  With no key the answer is that no calendar is connected — claiming a city has
+  no events, on the evidence of a missing API key, is a statement about the
+  world drawn from a configuration gap.
+- Rate limit is 200 requests/minute per calendar. This polls every 10 minutes,
+  caches for 10, and caps pagination at 5 pages.
 
 ---
 

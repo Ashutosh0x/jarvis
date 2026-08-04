@@ -42,6 +42,7 @@ files:
   - edgarGuard.js
   - googleCalendar.js
   - googleMaps.js
+  - lumaEvents.js
   - metricStore.js
   - mirrorService.js
   - spotifyService.js

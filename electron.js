@@ -1166,6 +1166,14 @@ ipcMain.handle('google-maps-status', async () => ({
     methods: googleMaps.methods
 }));
 
+/* Luma events. Same rule as the maps key, and it matters more here: a Luma
+   key can create and cancel events and read every guest's email address. The
+   module's whitelist is read-only for exactly that reason. */
+const lumaEvents = require('./lumaEvents');
+
+ipcMain.handle('luma-events', async (event, method, params = {}) =>
+    lumaEvents.invoke(String(method || ''), params || {}));
+
 ipcMain.handle('foundry-mesh', async (event, jobId) => {
     try {
         const { jobMesh } = await import('./src/js/services/foundry/foundryJobs.js');

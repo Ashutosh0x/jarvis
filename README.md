@@ -719,6 +719,7 @@ can read and why one is missing.
 | `DUNE_API_KEY` | Aggregate analytics: top holders, USD-priced flows | Those queries state the key is needed |
 | `ARKHAM_API_KEY` | Entity labels, spoken with attribution | Addresses stay addresses |
 | `GOOGLE_MAPS_API_KEY` | Globe: country/state/street geocoding, place photos, weather, air quality | Cities only, from the bundled gazetteer; Nominatim, Wikipedia and USGS still work |
+| `LUMA_API_KEY` | Globe: events from one Luma calendar (needs Luma Plus) | No events layer; every other globe feature is unaffected |
 
 Networks are **discovered, not assumed**: each candidate endpoint must return
 the chain ID it claims before it is used. On the free Alchemy tier this
@@ -1305,6 +1306,24 @@ with Street View always gated behind its free metadata check. Every image
 carries its attribution, and one whose attribution did not survive the parse is
 dropped rather than shown bare. If nothing has a picture, nothing is shown.
 
+### Live layers
+
+| Feed | Key needed | Ships on |
+| --- | --- | --- |
+| USGS earthquakes | none | ✅ |
+| OpenSky flights | none | ✅ |
+| NASA FIRMS wildfires | free MAP_KEY | needs key |
+| Luma events | Luma Plus | needs key |
+
+A feed with no credentials reports itself unconfigured **with the reason** and
+never polls. Retrying a request that cannot succeed is how a dead feed comes to
+look like a flaky network.
+
+Luma events deserve one caution: their API is **scoped to a single calendar**
+and has no search endpoint — 66 endpoints, none of them discovery. It shows
+*your* events wherever they are, not the world's, and the feed is named "Luma
+(my calendar)" so nothing implies otherwise.
+
 ### The key stays in the main process
 
 `GOOGLE_MAPS_API_KEY` is optional — without it the globe runs entirely on
@@ -1586,6 +1605,7 @@ GOOGLE_CLIENT_ID=     # Calendar and Meet
 GOOGLE_CLIENT_SECRET=
 
 GOOGLE_MAPS_API_KEY=  # globe: geocoding, places, weather, air quality
+LUMA_API_KEY=         # globe: events from ONE Luma calendar (Luma Plus)
 ```
 
 `GOOGLE_MAPS_API_KEY` is read only in the main process and never crosses the

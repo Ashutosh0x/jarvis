@@ -128,7 +128,10 @@ async function placesText({ query, limit = 5 } = {}) {
     return call('https://places.googleapis.com/v1/places:searchText', {
         method: 'POST',
         fieldMask: 'places.id,places.displayName,places.location,places.formattedAddress,places.types',
-        body: { textQuery: String(query || ''), maxResultCount: Math.min(20, Math.max(1, limit)) }
+        /* `pageSize`, not `maxResultCount`: the latter is deprecated on Text
+           Search as of 13 May 2024. Nearby Search still takes maxResultCount
+           and is deliberately left alone — the deprecation is Text Search only. */
+        body: { textQuery: String(query || ''), pageSize: Math.min(20, Math.max(1, limit)) }
     });
 }
 
@@ -239,7 +242,8 @@ async function placePhotos({ query, limit = 5 } = {}) {
     const res = await call('https://places.googleapis.com/v1/places:searchText', {
         method: 'POST',
         fieldMask: 'places.id,places.displayName,places.photos',
-        body: { textQuery: String(query || ''), maxResultCount: Math.min(10, Math.max(1, limit)) }
+        /* pageSize — maxResultCount is deprecated on Text Search. */
+        body: { textQuery: String(query || ''), pageSize: Math.min(10, Math.max(1, limit)) }
     });
     if (!res.ok) return res;
     const place = res.data?.places?.[0];
@@ -323,6 +327,91 @@ async function streetViewImage({ lat, lng, heading = 0, pitch = 0, fov = 90, siz
  */
 async function streetViewMeta({ lat, lng } = {}) {
     return call(`${LEGACY}/streetview/metadata?${q({ location: `${lat},${lng}`, key: key() })}`);
+}
+
+/**
+ * A Street View photograph, returned as a data URI.
+ *
+ * Same security pattern as staticMap: the image is fetched here and sent as
+ * base64 so the API key never reaches the renderer. Always preceded by a
+ * streetViewMeta call in placeImages.js — the metadata is free, this is not,
+ * so paying for a grey "no imagery" placeholder is the caller's responsibility
+ * to avoid, not this function's.
+ */
+async function streetViewImage({ lat, lng, heading = 0, pitch = 0, fov = 90, size = '640x400' } = {}) {
+    if (!key()) return { ok: false, reason: 'no-key' };
+    const url = `${LEGACY}/streetview?${q({
+        location: `${lat},${lng}`, size, heading, pitch, fov, key: key()
+    })}`;
+    try {
+        const res = await fetch(url, { signal: AbortSignal.timeout(TIMEOUT_MS) });
+        if (!res.ok) {
+            return { ok: false, reason: `http-${res.status}`, detail: (await res.text()).slice(0, 200) };
+        }
+        const buf = Buffer.from(await res.arrayBuffer());
+        return { ok: true, data: { dataUri: `data:image/jpeg;base64,${buf.toString('base64')}`, bytes: buf.length } };
+    } catch (error) {
+        return { ok: false, reason: error.name === 'TimeoutError' ? 'timeout' : 'network', detail: error.message };
+    }
+}
+
+/**
+ * Photo references for a place.
+ *
+ * Text-searches for the query and returns the photo array with attribution
+ * metadata. The media bytes are NOT fetched here — the caller picks which
+ * photo(s) to materialise and calls placePhotoMedia for each, so the bill is
+ * proportional to what is actually drawn.
+ */
+async function placePhotos({ query, limit = 5 } = {}) {
+    const res = await call('https://places.googleapis.com/v1/places:searchText', {
+        method: 'POST',
+        fieldMask: 'places.id,places.displayName,places.photos',
+        /* pageSize — maxResultCount is deprecated on Text Search. */
+        body: { textQuery: String(query || ''), pageSize: Math.min(10, Math.max(1, limit)) }
+    });
+    if (!res.ok) return res;
+    const place = res.data?.places?.[0];
+    return {
+        ok: true,
+        data: {
+            placeName: place?.displayName?.text || String(query),
+            photos: (place?.photos || []).map(p => ({
+                name: p.name,
+                widthPx: p.widthPx,
+                heightPx: p.heightPx,
+                attributions: p.authorAttributions || []
+            }))
+        }
+    };
+}
+
+/**
+ * A single place photo, returned as a data URI.
+ *
+ * The photo `name` comes from placePhotos above. The media endpoint either
+ * redirects (302) to the image bytes or, with skipHttpRedirect=true, returns a
+ * JSON object with a signed photoUri. We follow the redirect and return base64
+ * — same security pattern as every other image endpoint in this module.
+ */
+async function placePhotoMedia({ photoName, maxWidthPx = 1200 } = {}) {
+    if (!key()) return { ok: false, reason: 'no-key' };
+    if (!photoName) return { ok: false, reason: 'no-photo-name' };
+    const url = `https://places.googleapis.com/v1/${photoName}/media?maxWidthPx=${maxWidthPx}&key=${encodeURIComponent(key())}`;
+    try {
+        const res = await fetch(url, {
+            signal: AbortSignal.timeout(TIMEOUT_MS),
+            redirect: 'follow'
+        });
+        if (!res.ok) {
+            return { ok: false, reason: `http-${res.status}`, detail: (await res.text()).slice(0, 200) };
+        }
+        const buf = Buffer.from(await res.arrayBuffer());
+        const ct = res.headers.get('content-type') || 'image/jpeg';
+        return { ok: true, data: { dataUri: `data:${ct};base64,${buf.toString('base64')}`, bytes: buf.length } };
+    } catch (error) {
+        return { ok: false, reason: error.name === 'TimeoutError' ? 'timeout' : 'network', detail: error.message };
+    }
 }
 
 /**
