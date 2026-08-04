@@ -1982,6 +1982,9 @@ class Jarvis {
                 case 'GLOBE_CAMS':
                     await this.handleGlobeCams(intent);
                     break;
+                case 'GLOBE_COMPANIES':
+                    await this.handleGlobeCompanies(intent);
+                    break;
                 case 'GLOBE_TOGGLE':
                     await this.handleGlobeToggle(intent);
                     break;
@@ -7491,6 +7494,38 @@ class Jarvis {
        The count is read back from the viewer rather than promised in advance:
        coverage is London and Singapore only, so most places genuinely have
        none and saying so is the honest answer. */
+    /* Companies at a place, on the globe.
+
+       The spoken count is the number Google actually returned, and the reply
+       says how many were drawn versus found — it does not claim to have located
+       every company, because a Places search returns the top matches, not a
+       registry. */
+    async handleGlobeCompanies({ companyType, place }) {
+        const globe = window.jarvisGlobe;
+        if (!globe?.showCompanies) {
+            this.speak('The globe view is not available in this build, Sir.');
+            return;
+        }
+        this.haptics.click();
+        const label = companyType ? `${companyType} companies` : 'companies';
+        this.speak(`Searching for ${label} in ${place}, Sir.`);
+        if (!globe.isActive()) {
+            for (const m of window.visualizerModes?.meshes || []) if (m) m.visible = false;
+        }
+        try {
+            const r = await globe.showCompanies(companyType, place);
+            if (!r.ok) { this.speak(r.error || 'I could not run that search, Sir.'); this.haptics.warn(); return; }
+            const n = r.companies.length;
+            if (!n) { this.speak(`No ${label} found in ${r.place.name}, Sir.`); return; }
+            const lead = r.companies.slice(0, 3).map((c) => c.name).join(', ');
+            this.speak(`${n} ${label} near ${r.place.name}, Sir. ${r.shown} on the map. The nearest include ${lead}.`);
+        } catch (e) {
+            console.error('Globe companies error:', e);
+            this.speak('The company search failed, Sir.');
+            this.haptics.warn();
+        }
+    }
+
     async handleGlobeCams({ on }) {
         const globe = window.jarvisGlobe;
         if (!globe?.cams) {

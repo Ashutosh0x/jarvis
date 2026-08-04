@@ -134,6 +134,36 @@ export function parseGeocodeV4(json) {
     };
 }
 
+/* Legal-entity suffixes across the markets the globe is likely to visit, plus
+   the words companies put in their trading names. A place whose name carries
+   one of these is almost certainly a company; a hotel or a shopping complex is
+   not. Kept broad on purpose — Pvt Ltd (India), LLC/Inc (US), Ltd/PLC (UK),
+   GmbH/AG (Germany), Pte (Singapore), Oy (Finland), and so on. */
+const COMPANY_SUFFIX = /\b(?:pvt\.?\s*ltd|private\s+limited|ltd\.?|limited|llc|l\.l\.c|inc\.?|incorporated|corp\.?|corporation|co\.?|company|plc|gmbh|ag|s\.?a\.?|s\.?r\.?l|b\.?v|pte\.?\s*ltd|pte|oy|ab|as|sdn\.?\s*bhd|pty\.?\s*ltd|llp)\b/i;
+/* Words that name a tech/services company even without a legal suffix. */
+const COMPANY_WORD = /\b(technolog(?:y|ies)|systems?|solutions?|software|labs?|digital|infotech|consulting|networks?|robotics|analytics|cyber|semiconductors?|electronics)\b/i;
+/* Google place types that are companies rather than venues. */
+const COMPANY_TYPE = new Set(['corporate_office', 'coworking_space', 'business_center', 'manufacturer', 'software_company', 'consultant']);
+
+/**
+ * Does this result look like an actual company?
+ *
+ * Exported and pure — this is the filter the user asked for, and it is exactly
+ * the kind of rule worth pinning: too loose and hotels slip through, too tight
+ * and "Google" or "IBM" (no suffix in their Google name) are dropped. A known
+ * company TYPE is enough on its own; otherwise a legal suffix or a company word
+ * in the name carries it.
+ */
+export function looksLikeCompany(name, types = []) {
+    if ((types || []).some((t) => COMPANY_TYPE.has(t))) return true;
+    const n = String(name || '');
+    if (COMPANY_SUFFIX.test(n) || COMPANY_WORD.test(n)) return true;
+    /* Venues that a business search drags in — reject these outright even if a
+       stray word matched, so "Grand Hotel Technologies-adjacent" is not kept. */
+    if (/\b(hotel|resort|mall|shopping|complex|restaurant|cafe|hospital|school|college|temple|church|station|museum|park|stadium)\b/i.test(n)) return false;
+    return false;
+}
+
 /** Google's v3 geocode response -> the same shape. Kept for the v3 fallback. */
 export function parseGeocode(json) {
     const hit = json?.results?.[0];
@@ -248,7 +278,45 @@ export function createGoogleServices({
         };
     }
 
-    return { available, geocode, reverseGeocode, dossier, route, staticMap, findPlace };
+    /**
+     * Companies matching a query near a point, as globe markers.
+     *
+     * COORDINATE-DRIVEN, so it works at any place without a name baked in: the
+     * query ("technology companies") is biased to the target's coordinates, and
+     * `radiusM` scales with the place. That is the whole "companies everywhere"
+     * algorithm — no per-city list, no hardcoding.
+     *
+     * Filtered by `looksLikeCompany` to keep incorporated entities and drop the
+     * hotels, malls and civic buildings a business search picks up around them.
+     */
+    async function searchCompanies(query, { pages = 2, lat, lng, radiusM, strict = true } = {}) {
+        if (!bridge) return [];
+        const res = await bridge('placesCompanies', { query: String(query || 'companies'), pages, lat, lng, radiusM });
+        if (!res?.ok) return [];
+        const out = [];
+        const seen = new Set();
+        for (const p of res.data?.places || []) {
+            const plat = p?.location?.latitude, plng = p?.location?.longitude;
+            const name = p?.displayName?.text;
+            if (!Number.isFinite(plat) || !Number.isFinite(plng) || !name) continue;
+            const key = p.id || name.toLowerCase();
+            if (seen.has(key)) continue;      // Google can repeat across pages
+            seen.add(key);
+            const types = p.types || [];
+            if (strict && !looksLikeCompany(name, types)) continue;
+            out.push({
+                id: p.id || null,
+                name,
+                lat: plat, lng: plng,
+                address: p.formattedAddress || null,
+                website: p.websiteUri || null,
+                type: types[0] || null
+            });
+        }
+        return out;
+    }
+
+    return { available, geocode, reverseGeocode, dossier, route, staticMap, findPlace, searchCompanies };
 }
 
 export default {

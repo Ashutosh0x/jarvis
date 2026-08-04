@@ -29,7 +29,7 @@ import { createCodeOverlay } from './codeOverlay.js';
 import { createStatusBar } from './statusBar.js';
 import { createDataFeeds, describeEvent, distanceKm } from '../services/dataFeeds.js';
 import { geocode, buildPlaceIndex, findLocal } from '../services/geocode.js';
-import { createLandmarkService } from '../services/landmarks.js';
+import { createLandmarkService, rankLandmarks } from '../services/landmarks.js';
 import { createGoogleServices, describeDossier, cameraDistanceFor } from '../services/googleServices.js';
 import { createPlaceImages } from '../services/placeImages.js';
 import { createDossierPanel } from './dossierPanel.js';
@@ -253,6 +253,26 @@ export async function createGlobeMode({ scene, camera, renderer }) {
         layer: { setVisible: (on) => { feeds.feeds.events.visible = on; }, group: null }
     });
 
+    /* When the Companies layer is on, every navigation also draws the
+       companies for wherever the globe flew — that is the "companies at every
+       city, state and country" behaviour, off by default because each
+       navigation is then a billed Places search. */
+    let companiesOn = false;
+    layerManager.register({
+        id: 'companies', name: 'Companies', category: 'intel',
+        layer: { setVisible: (on) => { companiesOn = on; if (!on) clearCompanyMarkers(); } },
+        onToggle: async (on) => {
+            if (!google.available()) {
+                statusBar.pushAlert('Companies need a Google Maps key', 'alert');
+                return false;
+            }
+            companiesOn = on;
+            if (on && lastPlace) { await drawCompaniesFor(lastPlace); }
+            else clearCompanyMarkers();
+            return on;
+        }
+    });
+
     const themeManager = createThemeManager(globe, { codeOverlay });
 
     const landmarkService = createLandmarkService();
@@ -338,6 +358,40 @@ export async function createGlobeMode({ scene, camera, renderer }) {
      *
      * This is what "show me what's happening in San Francisco" reaches.
      */
+    /* The last place the globe locked onto, so toggling the Companies layer on
+       can populate it without a re-navigation. */
+    let lastPlace = null;
+    /* Company markers are tracked separately so they can be cleared without
+       wiping the landmark ring or the pin. */
+    let companyMarkers = [];
+
+    function clearCompanyMarkers() {
+        for (const m of companyMarkers) markers.remove?.(m);
+        companyMarkers = [];
+    }
+
+    async function drawCompaniesFor(place) {
+        if (!companiesOn || !google.available()) return 0;
+        const biasRadiusM = Number.isFinite(place.spanKm)
+            ? Math.min(50000, Math.max(2000, place.spanKm * 500))
+            : 15000;
+        const companies = await google.searchCompanies('technology companies', {
+            pages: 1, lat: place.lat, lng: place.lng, radiusM: biasRadiusM
+        }).catch(() => []);
+        clearCompanyMarkers();
+        const shown = rankLandmarks(companies, {
+            lat: place.lat, lng: place.lng, limit: 12,
+            minSeparationKm: Math.max(0.4, (place.spanKm || 20) / 30),
+            exclude: [{ lat: place.lat, lng: place.lng }]
+        });
+        for (const c of shown) {
+            const m = markers.addMarker({ lat: c.lat, lng: c.lng, label: c.name.toUpperCase(), kind: 'company' });
+            companyMarkers.push(m);
+        }
+        codeOverlay.log(`companies@${place.name} -> ${companies.length} (${shown.length} drawn)`);
+        return companies.length;
+    }
+
     async function showLocation(query, { landmarks = [], speak = null } = {}) {
         /* A COMMAND IS NOT A PLACE. If the whole utterance arrives here —
            "show me bengaluru" rather than "bengaluru" — the parser upstream
@@ -493,6 +547,11 @@ export async function createGlobeMode({ scene, camera, renderer }) {
             camViewer.hide();
         }
 
+        lastPlace = place;
+        /* If the Companies layer is on, draw them for this place too — this is
+           the "companies at every place" behaviour, coordinate-driven. */
+        if (companiesOn) { await drawCompaniesFor(place).catch(() => 0); }
+
         const pictures = await imagesPromise;
         if (pictures.images.length) {
             codeOverlay.log(`placeImages(${place.name}) -> ${pictures.images.length} from ${[...new Set(pictures.images.map((i) => i.provider))].join(', ')}`);
@@ -570,6 +629,77 @@ export async function createGlobeMode({ scene, camera, renderer }) {
      * `flightsAlongRoute` for why the open feed cannot supply them. Nothing
      * here implies these aircraft are travelling between the two named cities.
      */
+    /**
+     * Companies matching a query at a place — "software companies in Bengaluru".
+     *
+     * Fly to the place, then drop markers for the businesses Google returns.
+     * The results cluster in one city, so they are thinned exactly like the
+     * landmark ring: the nearest few, spread out, or forty labels print on top
+     * of one another. The full count is reported even though only a legible
+     * subset is drawn — "247 found, 12 shown" is honest; forty smeared pins are
+     * not.
+     */
+    async function showCompanies(companyType, placeQuery) {
+        if (!google.available()) {
+            statusBar.setTarget(null, 'Company search needs a Google Maps key.');
+            return { ok: false, error: 'company search needs a Google Maps key' };
+        }
+        let place = await geocode(placeQuery, { index: placeIndex });
+        if ((!place || place.score < 0.8)) {
+            const better = await google.geocode(placeQuery);
+            if (better) place = better;
+        }
+        if (!place) {
+            statusBar.setTarget(null, `No coordinates found for "${placeQuery}".`);
+            return { ok: false, error: `I could not find ${placeQuery}` };
+        }
+
+        if (!active) setActive(true);
+        markers.clear();
+        globe.clearArcs?.();
+        globe.setAutoRotate(false);
+        statusBar.setTarget(place.name, `Searching ${companyType || 'companies'}...`);
+
+        const flyDistance = Number.isFinite(place.spanKm)
+            ? cameraDistanceFor(place.spanKm, globe.radius)
+            : globe.radius * 1.9;
+        /* Coordinate-driven: the type is the query, the PLACE is a location
+           bias, not a string in the query. That is what lets the same call
+           work at any city, state or country with nothing hardcoded — and the
+           bias radius scales with the place, so a country search is not a
+           5 km circle around its centroid. */
+        const query = `${companyType || 'technology'} companies`.trim();
+        const biasRadiusM = Number.isFinite(place.spanKm)
+            ? Math.min(50000, Math.max(2000, place.spanKm * 500))
+            : 15000;
+        const [_, companies] = await Promise.all([
+            globe.flyTo(place.lat, place.lng, { distance: flyDistance, ms: 2200 }),
+            google.searchCompanies(query, {
+                pages: 2, lat: place.lat, lng: place.lng, radiusM: biasRadiusM
+            }).catch(() => [])
+        ]);
+
+        markers.addMarker({ lat: place.lat, lng: place.lng, label: labelFor(place.name, place.source), pin: true, boxed: true });
+
+        /* Thinned so the labels are readable; the pin is seeded as taken so a
+           company does not print on top of it. */
+        const shown = rankLandmarks(companies, {
+            lat: place.lat, lng: place.lng, limit: 12,
+            minSeparationKm: Math.max(0.4, (place.spanKm || 20) / 30),
+            exclude: [{ lat: place.lat, lng: place.lng }]
+        });
+        for (const c of shown) {
+            markers.addMarker({ lat: c.lat, lng: c.lng, label: c.name.toUpperCase(), kind: 'company' });
+        }
+
+        statusBar.setTarget(place.name, companies.length
+            ? `${companies.length} ${companyType || 'companies'} found${shown.length < companies.length ? `, ${shown.length} shown` : ''}.`
+            : `No ${companyType || 'companies'} found here.`);
+        codeOverlay.log(`companies("${query}") -> ${companies.length} (${shown.length} drawn)`);
+
+        return { ok: true, place, companies, shown: shown.length };
+    }
+
     async function showRoute(fromQuery, toQuery) {
         const resolve = async (q) => {
             let p = await geocode(q, { index: placeIndex });
@@ -706,7 +836,7 @@ export async function createGlobeMode({ scene, camera, renderer }) {
         setActive,
         toggle: () => setActive(!active),
         isActive: () => active,
-        update, showLocation, showRoute, dispose,
+        update, showLocation, showRoute, showCompanies, dispose,
         cams: camViewer,
         theme: themeManager,
         satellites: { toggle: setSatellites, service: satelliteService, layer: satelliteLayer },

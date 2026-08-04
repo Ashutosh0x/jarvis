@@ -1403,5 +1403,74 @@ check('a null response does not throw', normaliseList(null).length === 0);
     check('dispose restores the amber default', GLOBE_COLORS.network === origAmberNetwork);
 }
 
+/* ---------------------------------------------------- company search */
+
+/* The intent must extract a type and a place, and must NOT fire on an ordinary
+   place query. */
+{
+    const noun = /\b(?:companies|startups?|firms?|businesses)\b/i;
+    const verb = /\b(show|find|list|search|display)\b/i;
+    const ex = /\b(?:show|find|list|search|display)\b\s+(?:me\s+|all\s+|the\s+)*(.*?)\b(?:companies|startups?|firms?|businesses)\b\s+(?:in|at|near|around)\s+(?:the\s+)?([a-z][a-z .'-]{1,40}?)\s*[.?!]?$/i;
+    const parse = (c) => (noun.test(c) && verb.test(c)) ? ex.exec(c) : null;
+
+    check('"show me software companies in Bengaluru" extracts type and place',
+        (() => { const m = parse('show me software companies in Bengaluru'); return m && m[1].trim() === 'software' && m[2].trim() === 'Bengaluru'; })());
+    check('"find AI startups in San Francisco" too',
+        (() => { const m = parse('find AI startups in San Francisco'); return m && m[1].trim() === 'AI' && m[2].trim() === 'San Francisco'; })());
+    check('a bare "companies in Tokyo" has an empty type, not a failure',
+        (() => { const m = parse('show me companies in Tokyo'); return m && m[1].trim() === '' && m[2].trim() === 'Tokyo'; })());
+    check('an ordinary place query does not trigger a company search', parse('show me Tokyo') === null);
+
+    /* The renderer-side parse dedupes across pages and drops points with no
+       coordinate — Google repeats results across page tokens. */
+    const { createGoogleServices } = await import('../googleServices.js');
+    const svc = createGoogleServices({
+        bridge: async () => ({
+            ok: true,
+            data: {
+                places: [
+                    { id: 'a', displayName: { text: 'Acme' }, location: { latitude: 12.9, longitude: 77.6 }, websiteUri: 'https://acme.test' },
+                    { id: 'a', displayName: { text: 'Acme' }, location: { latitude: 12.9, longitude: 77.6 } },   // dup id
+                    { id: 'b', displayName: { text: 'NoCoords' } },                                             // no point
+                    { id: 'c', displayName: { text: 'Beta' }, location: { latitude: 13.0, longitude: 77.5 } }
+                ]
+            }
+        })
+    });
+    const companies = await svc.searchCompanies('software companies in Bengaluru', { strict: false });
+    check('duplicate companies collapse across pages', companies.length === 2);
+    check('a company with no coordinate is dropped', !companies.some((c) => c.name === 'NoCoords'));
+    check('the website is kept for the marker link',
+        companies.find((c) => c.name === 'Acme')?.website === 'https://acme.test');
+    check('with no bridge it returns nothing rather than throwing',
+        (await createGoogleServices({ bridge: null }).searchCompanies('x')).length === 0);
+
+    /* The corporate-suffix filter. It must keep real companies and drop the
+       hotels and malls a business search drags in — and fail SAFE, missing an
+       unsuffixed campus rather than showing a hotel as a company. */
+    const { looksLikeCompany } = await import('../googleServices.js');
+    check('a Pvt Ltd is kept', looksLikeCompany('Salesforce India Pvt Ltd', []));
+    check('an LLC is kept', looksLikeCompany('Acme Robotics LLC', []));
+    check('a corporate_office type is enough on its own', looksLikeCompany('IBM EGL D Block', ['corporate_office']));
+    check('a company word carries an unsuffixed name', looksLikeCompany('ASM Technologies', []));
+    check('a bare well-known name with the office type survives', looksLikeCompany('Google', ['corporate_office']));
+    check('a hotel is dropped', !looksLikeCompany('The Leela Palace Bengaluru', ['lodging']));
+    check('a shopping complex is dropped', !looksLikeCompany('Jayanagar Shopping Complex', []));
+    check('a bank building is dropped', !looksLikeCompany('Mysore Bank Building', []));
+
+    /* strict filtering is applied in searchCompanies. */
+    const filtered = createGoogleServices({
+        bridge: async () => ({ ok: true, data: { places: [
+            { id: '1', displayName: { text: 'Foo Technologies Pvt Ltd' }, location: { latitude: 1, longitude: 1 } },
+            { id: '2', displayName: { text: 'Grand Plaza Hotel' }, location: { latitude: 2, longitude: 2 }, types: ['lodging'] }
+        ] } })
+    });
+    const kept = await filtered.searchCompanies('technology companies', { lat: 1, lng: 1 });
+    check('searchCompanies keeps the company and drops the hotel',
+        kept.length === 1 && kept[0].name === 'Foo Technologies Pvt Ltd');
+    const loose = await filtered.searchCompanies('technology companies', { lat: 1, lng: 1, strict: false });
+    check('strict:false keeps everything for callers that want it', loose.length === 2);
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

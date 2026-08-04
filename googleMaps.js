@@ -135,6 +135,55 @@ async function placesText({ query, limit = 5 } = {}) {
     });
 }
 
+/**
+ * Businesses matching a query, paginated — "software companies in Bengaluru".
+ *
+ * WHY PAGINATE. A single Text Search page is 20 results; the fuller answer to
+ * "the companies here" is up to 60, reached with the `nextPageToken`. Google
+ * caps it at three pages regardless, so this is not an unbounded crawl — and it
+ * is NOT a registry. It is the top matches Google returns for a query near a
+ * place, which is an honest "show me companies here", not a claim to have found
+ * every one.
+ *
+ * `websiteUri` is on the field mask because a company marker that links to the
+ * company is worth more than one that does not — and the field is only billed
+ * when asked for, which is exactly when it is used.
+ */
+async function placesCompanies({ query, pages = 3, lat, lng, radiusM } = {}) {
+    const results = [];
+    let token = null;
+    const wanted = Math.min(3, Math.max(1, pages));
+    for (let i = 0; i < wanted; i++) {
+        const body = { textQuery: String(query || 'companies'), pageSize: 20 };
+        /* locationBias is what makes this coordinate-driven rather than
+           name-driven: "technology companies" biased to a point returns the
+           companies NEAR that point, for any place on Earth, with no city name
+           baked into the query and nothing hardcoded. The circle caps at 50 km,
+           Google's limit. */
+        if (Number.isFinite(lat) && Number.isFinite(lng)) {
+            body.locationBias = {
+                circle: {
+                    center: { latitude: lat, longitude: lng },
+                    radius: Math.min(50000, Math.max(500, Number(radiusM) || 15000))
+                }
+            };
+        }
+        if (token) body.pageToken = token;
+        const res = await call('https://places.googleapis.com/v1/places:searchText', {
+            method: 'POST',
+            fieldMask: 'places.id,places.displayName,places.location,places.formattedAddress,places.types,places.websiteUri,nextPageToken',
+            body
+        });
+        if (!res.ok) return results.length ? { ok: true, data: { places: results } } : res;
+        for (const p of res.data?.places || []) results.push(p);
+        token = res.data?.nextPageToken || null;
+        if (!token) break;
+        /* Google requires a short pause before a page token is valid. */
+        if (i < wanted - 1) await new Promise((r) => setTimeout(r, 1600));
+    }
+    return { ok: true, data: { places: results } };
+}
+
 /** Type-ahead completions. Cheap, and the only endpoint billed per session. */
 async function placesAutocomplete({ input, lat, lng } = {}) {
     const body = { input: String(input || '') };
@@ -483,7 +532,7 @@ const METHODS = {
     geocode, reverseGeocode,
     elevation, timezone, weather, airQuality, pollen,
     route, streetViewMeta, staticMap, dossier,
-    placePhotos, placePhotoMedia, streetViewImage
+    placePhotos, placePhotoMedia, streetViewImage, placesCompanies
 };
 
 async function invoke(method, params = {}) {

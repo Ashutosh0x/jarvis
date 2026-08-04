@@ -157,15 +157,27 @@ export function createMarkerLayer({ scene, camera, globeGroup }) {
         }
     }
 
+    /** Tear one marker down — the scene objects, geometry and DOM label. */
+    function disposeMarker(m) {
+        group.remove(m.line, m.dot, m.labelObject);
+        if (m.pinSprite) group.remove(m.pinSprite);
+        m.line.geometry.dispose();
+        m.dot.geometry.dispose();
+        m.el.remove();
+    }
+
     function clear() {
-        for (const m of markers) {
-            group.remove(m.line, m.dot, m.labelObject);
-            if (m.pinSprite) group.remove(m.pinSprite);
-            m.line.geometry.dispose();
-            m.dot.geometry.dispose();
-            m.el.remove();
-        }
+        for (const m of markers) disposeMarker(m);
         markers.length = 0;
+    }
+
+    /** Remove ONE marker without touching the rest — the company layer needs
+        to clear its own pins without wiping the landmark ring. */
+    function remove(marker) {
+        const i = markers.indexOf(marker);
+        if (i === -1) return;
+        disposeMarker(marker);
+        markers.splice(i, 1);
     }
 
     const camDir = new THREE.Vector3();
@@ -239,7 +251,7 @@ export function createMarkerLayer({ scene, camera, globeGroup }) {
         globeGroup.remove(group);
     }
 
-    return { addMarker, addRipple, clear, update, dispose, markers, group };
+    return { addMarker, addRipple, clear, remove, update, dispose, markers, group };
 }
 
 export default { createMarkerLayer };
