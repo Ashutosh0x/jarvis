@@ -42,7 +42,7 @@ const features = [
   {
     number: "07",
     title: "A globe that answers",
-    description: "Say \"show me Tokyo\" and the orb becomes a command centre — a dark sphere of glowing amber coastlines, a pin on the target, landmarks on leader lines, live earthquake ripples. Country, state, city, street or building all resolve, and the camera framing is derived from the measured extent of the place rather than a table of zoom levels. On arrival it reports what is actually true there: local time, weather, elevation, air quality, and real photographs with their attribution.",
+    description: "Say \"show me Tokyo\" and the orb becomes a command centre — a dark sphere of glowing amber coastlines, a pin on the target, live earthquake ripples, satellites propagated to where they actually are, and public webcams near the target. A switchboard (press L) turns each data layer on or off. On arrival it reports what is true there: local time, weather, elevation, air quality, and real photographs with their attribution.",
     visual: "globe",
   },
   {

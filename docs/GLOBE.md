@@ -268,12 +268,125 @@ There is no stock-photo substitute and no grey tile pretending to be a place.
 
 ---
 
+## Layers, and the switchboard
+
+Everything the globe draws is a **layer** in one registry (`globeLayers.js`),
+and every layer can be switched on or off from a glass panel — press **L**.
+
+The registry exists because the alternative did not scale. Each early feed —
+quakes, fires, flights, events — was wired into `globeMode` by hand: its own
+field, its own visibility check, its own line in the update loop and in
+teardown. That works at five and collapses at fifteen, and it left the user
+unable to turn any of them off. A layer now registers one object and gets
+polling, visibility, per-frame updates and disposal for free.
+
+Two properties are load-bearing:
+
+- **An off layer costs nothing.** Polling runs only while a layer is visible
+  and the per-frame update skips the rest — switching a layer off stops the
+  work, it does not merely hide the result. And feed visibility is *real*: a
+  hidden feed contributes nothing to the ticker, the ripples or proximity
+  search, not just to the drawing.
+- **A layer that refuses to switch on leaves the switch off.** Satellites load
+  their elements lazily and the load can fail; a panel showing "on" over an
+  empty sky would be a lie about what is drawn. The panel keeps no state of its
+  own and re-renders from the registry, so it cannot drift from reality.
+
+The poll guard is a `Set`, not a flag per layer — a fetch slower than its own
+interval is skipped rather than stacked, and the id clears in a `finally` so a
+thrown fetch cannot wedge a layer permanently off.
+
+---
+
+## Satellites
+
+Real objects, propagated to where they are **right now** — say *"show me the
+satellites"* or *"track the ISS"*, or switch the layer on in the panel.
+
+A TLE is not a position. It is a set of orbital elements valid at an epoch, and
+turning it into "where is the ISS now" means running **SGP4**, the model NORAD
+publishes the elements for (`satellite.js`, pinned to 6.0.2 — the 7.x line
+ships a WASM build whose top-level `await` breaks the app's IIFE bundle).
+Drawing a satellite at its epoch sub-point instead is wrong by thousands of
+kilometres within minutes: the ISS covers ~7.7 km every second.
+
+Verified against live CelesTrak data — the ISS resolves at ~423 km altitude and
+moves ~415 km of ground track per minute, which is what an orbit at that height
+does. Elements are cached two hours (CelesTrak's guidance); positions are
+propagated locally every frame from that one download. Altitude is exaggerated
+4× and the constant is named, because true-scale LEO sits 6% above the surface
+and reads as touching it — orbit *order* is preserved so LEO still sits below
+GPS. The whole set is one `InstancedMesh`; the ISS gets a larger marker and a
+92-minute ground track.
+
+---
+
+## Aurora
+
+The geomagnetic oval, drawn when a storm is actually underway — NOAA's
+planetary Kp index, keyless, polled every 15 minutes.
+
+**Nothing is drawn below Kp 4.** An oval painted during quiet conditions is
+decoration; below the threshold the layer reports the reading and draws no ring.
+When it does draw, the ring is centred on the **geomagnetic** pole (~80.6°N
+72.6°W, over northern Greenland), not the spin axis — a ring around the
+geographic pole sits symmetrically over Siberia and Canada, which is visibly
+wrong to anyone who has seen a forecast map. Its radius follows the standard
+equatorward-boundary rule: ~24° from the pole when quiet, ~2° further per Kp
+step. Storm alerts (Kp ≥ 5) fire once per level change, not once per poll.
+
+The solar-wind plasma feed named in most guides
+(`products/solar-wind/plasma-5-minute.json`) answers 404, so this ships on the
+Kp index alone rather than guessing at a replacement path.
+
+---
+
+## Cameras
+
+Live public webcams near the target, frameless under the globe — say *"show
+traffic cameras"*, or just fly somewhere and the nearest views appear.
+
+Three sources, all published for public viewing:
+
+| Source | Key | Coverage |
+| --- | --- | --- |
+| Transport for London JamCams | none | ~780 London road cameras |
+| Singapore LTA | none | expressway cameras |
+| Windy webcams | free key | ~70,000 opt-in webcams worldwide |
+
+**What this is not.** These are government congestion cameras pointed at roads
+and owner-submitted webcams — feeds their operators *chose* to publish. Nothing
+here scans for unsecured IP cameras or anything aimed at people or private
+property. When a place has no public camera the answer is "no cameras here"; it
+does not then go hunting private ones.
+
+**The renderer never touches a camera host.** Every frame is fetched in the
+main process and handed over as a data URI. A camera URL is an arbitrary remote
+origin chosen from a feed this app did not write; pointing an `<img>` at it from
+a page holding the user's session is precisely the exposure to avoid. Two guards
+enforce it, both tested: the host is checked on its **parsed hostname** (a
+substring test would wave `tfl.gov.uk.evil.com` through), and a URL must be one
+this process actually handed out — an allowed host is not enough.
+
+Windy is queried per-location rather than pre-listed: it has no global list and
+its image URLs are token-signed, expiring in 10 minutes, so caching them would
+serve dead links. Set `WINDY_WEBCAMS_API_KEY` to light up the world; without it
+the two government feeds still cover London and Singapore. It refreshes on a
+timer — these are stills on the operator's schedule, not a live stream, and the
+caption says so rather than implying a liveness the source lacks.
+
+---
+
 ## Live feeds
 
 | Feed | Key | Interval | Ships on |
 | --- | --- | --- | --- |
 | USGS earthquakes | none | 5 min | ✅ |
 | OpenSky flights | none | 15 min | ✅ |
+| Satellites (CelesTrak) | none | 2 h elements | ✅ |
+| Aurora / Kp (NOAA) | none | 15 min | ✅ |
+| Road cameras (TfL, LTA) | none | on demand | ✅ |
+| Windy webcams | free key | on demand | needs key |
 | NASA FIRMS wildfires | free MAP_KEY | 30 min | needs key |
 | Luma events | Luma Plus | 10 min | needs key |
 

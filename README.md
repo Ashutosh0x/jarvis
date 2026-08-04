@@ -737,6 +737,7 @@ can read and why one is missing.
 | `GOOGLE_MAPS_API_KEY` | Globe: country/state/street geocoding, place photos, weather, air quality | Cities only, from the bundled gazetteer; Nominatim, Wikipedia and USGS still work |
 | `LUMA_API_KEY` | Globe: events from one Luma calendar (needs Luma Plus) | No events layer; every other globe feature is unaffected |
 | `AVIATIONSTACK_API_KEY` | Globe: real flight routes with origin and destination | Live aircraft still shown from OpenSky, but a route query reports traffic over the corridor rather than named flights |
+| `WINDY_WEBCAMS_API_KEY` | Globe: ~70,000 opt-in public webcams worldwide | Camera layer still covers London and Singapore road cameras |
 
 Networks are **discovered, not assumed**: each candidate endpoint must return
 the chain ID it claims before it is used. On the free Alchemy tier this
@@ -1329,13 +1330,26 @@ dropped rather than shown bare. If nothing has a picture, nothing is shown.
 | --- | --- | --- |
 | USGS earthquakes | none | ✅ |
 | OpenSky flights | none | ✅ |
+| Satellites (CelesTrak SGP4) | none | ✅ |
+| Aurora / Kp (NOAA) | none | ✅ |
+| Road cameras (TfL, Singapore) | none | ✅ |
+| Windy webcams (worldwide) | free key | needs key |
 | NASA FIRMS wildfires | free MAP_KEY | needs key |
 | Luma events | Luma Plus | needs key |
 | Flight routes (AviationStack) | free tier | needs key |
 
+Every layer is toggleable from a glass switchboard — press **L**. A layer
+switched off stops its polling and contributes nothing downstream; one that
+fails to load shows the reason on its row rather than an empty, silent map.
 A feed with no credentials reports itself unconfigured **with the reason** and
-never polls. Retrying a request that cannot succeed is how a dead feed comes to
-look like a flaky network.
+never polls.
+
+Two of these are new and worth a line. **Satellites** are propagated with SGP4
+from live CelesTrak elements — the ISS is drawn where it actually is
+(~423 km, ~415 km/min), not at the sub-point of its element epoch. **Cameras**
+are public road cameras and opt-in Windy webcams, fetched entirely in the main
+process so no third-party camera URL ever reaches the renderer; nothing scans
+for private IP cameras.
 
 Luma events deserve one caution: their API is **scoped to a single calendar**
 and has no search endpoint — 66 endpoints, none of them discovery. It shows
@@ -1625,6 +1639,7 @@ GOOGLE_CLIENT_SECRET=
 GOOGLE_MAPS_API_KEY=  # globe: geocoding, places, weather, air quality
 LUMA_API_KEY=         # globe: events from ONE Luma calendar (Luma Plus)
 AVIATIONSTACK_API_KEY= # globe: real flight routes (free tier ~100-500/month)
+WINDY_WEBCAMS_API_KEY= # globe: ~70k opt-in webcams worldwide (free key)
 ```
 
 `GOOGLE_MAPS_API_KEY` is read only in the main process and never crosses the
