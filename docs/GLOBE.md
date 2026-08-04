@@ -302,6 +302,36 @@ therefore inspects the body, not the status.
 
 **Luma events** are covered in their own section below.
 
+### Aircraft, and what "flights from A to B" can honestly mean
+
+```
+what is flying over Tokyo
+show me flights from Bengaluru to Delhi
+```
+
+Flying to a city fetches aircraft **on demand** in a bounding box around it,
+rather than reading the 15-minute ambient poll. That is not a micro-optimisation:
+an airliner covers about 225 km in fifteen minutes, so a pin drawn from the last
+poll can be a quarter of the way to another country. The panel prints the
+snapshot age for the same reason — a position without a stated age claims a
+precision the feed cannot support.
+
+A route draws a **great-circle arc**, which is the path aircraft actually fly,
+and lists the aircraft over that corridor now.
+
+**It does not claim those aircraft are travelling between the two cities**, and
+it cannot. OpenSky's state vectors carry callsign, position, altitude, heading
+and speed — no origin, no destination. Its `flights/departure` endpoint does
+report an airport pair, but on anonymous access it is unusable for this:
+
+- a 24-hour window answers `403 "You cannot access historical flights"`
+- inside the ~2-hour window that IS allowed, `estArrivalAirport` was null for
+  **10 of 10** departures measured from Bengaluru — OpenSky only estimates the
+  arrival once the aircraft has landed
+
+So Jarvis says how many aircraft are over the corridor, and says out loud that
+it cannot confirm their destinations. Some of them are simply crossing.
+
 A feed with no credentials reports `configured: false` with the reason and
 **never polls**. Retrying a request that is structurally incapable of
 succeeding is how a dead feed comes to look like a flaky network.

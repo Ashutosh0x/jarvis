@@ -27,7 +27,7 @@ import { createGlobe, latLngToVector3 } from './globeRenderer.js';
 import { createMarkerLayer } from './globeMarkers.js';
 import { createCodeOverlay } from './codeOverlay.js';
 import { createStatusBar } from './statusBar.js';
-import { createDataFeeds, describeEvent } from '../services/dataFeeds.js';
+import { createDataFeeds, describeEvent, distanceKm } from '../services/dataFeeds.js';
 import { geocode, buildPlaceIndex, findLocal } from '../services/geocode.js';
 import { createLandmarkService } from '../services/landmarks.js';
 import { createGoogleServices, describeDossier, cameraDistanceFor } from '../services/googleServices.js';
@@ -236,6 +236,7 @@ export async function createGlobeMode({ scene, camera, renderer }) {
         codeOverlay.log(`geocode("${query}") -> ${place.lat.toFixed(3)}, ${place.lng.toFixed(3)} [${place.source}]`);
 
         markers.clear();
+        globe.clearArcs?.();
         globe.setAutoRotate(false);
         statusBar.setTarget(place.name, 'Acquiring target parameters...');
 
@@ -358,22 +359,112 @@ export async function createGlobeMode({ scene, camera, renderer }) {
             });
         }
 
+        /* Aircraft overhead, fetched NOW rather than read from the ambient
+           15-minute poll — see flightsNear(). Only drawn for city-sized
+           targets and smaller: at country scale the box would cover a
+           continent, and a hundred pins would bury the place itself. */
+        let flights = [];
+        const flightRadiusKm = Number.isFinite(place.spanKm)
+            ? Math.max(60, Math.min(250, place.spanKm))
+            : 150;
+        if (!Number.isFinite(place.spanKm) || place.spanKm <= 400) {
+            const air = await feeds.flightsNear(place.lat, place.lng, flightRadiusKm).catch(() => null);
+            if (air?.ok) {
+                flights = air.flights;
+                for (const f of flights.slice(0, 12)) {
+                    markers.addMarker({
+                        lat: f.lat, lng: f.lng,
+                        label: f.callsign || 'AIRCRAFT',
+                        kind: 'flight'
+                    });
+                }
+                if (flights.length) {
+                    codeOverlay.log(`flightsNear(${place.name}, ${flightRadiusKm}km) -> ${flights.length} aircraft`);
+                }
+            }
+        }
+
         /* Show the dossier panel with images and ground-truth data. */
         dossierPanel.show({
             name: place.name,
             country: place.country || '',
             dossier: facts,
             images: pictures.images,
-            events: nearbyEvents
+            events: nearbyEvents,
+            flights
         });
 
         return {
             ok: true, place, nearby, source: place.source,
-            landmarks: ring.items, dossier: facts, events: nearbyEvents,
+            landmarks: ring.items, dossier: facts, events: nearbyEvents, flights,
             /* Each carries its own attribution; anything rendering these MUST
                show it — see the header of placeImages.js. */
             images: pictures.images
         };
+    }
+
+    /**
+     * Plot a corridor between two places and mark what is flying over it.
+     *
+     * The arc is drawn as a GREAT CIRCLE, which is the path aircraft actually
+     * fly — a straight line on the sphere between Bengaluru and Tokyo would cut
+     * through the planet, and a straight line on a flat map would be the wrong
+     * route entirely.
+     *
+     * The aircraft are real and current. Their DESTINATIONS are not known: see
+     * `flightsAlongRoute` for why the open feed cannot supply them. Nothing
+     * here implies these aircraft are travelling between the two named cities.
+     */
+    async function showRoute(fromQuery, toQuery) {
+        const resolve = async (q) => {
+            let p = await geocode(q, { index: placeIndex });
+            if ((!p || p.score < 0.8) && google.available()) p = (await google.geocode(q)) || p;
+            return p;
+        };
+        const [from, to] = await Promise.all([resolve(fromQuery), resolve(toQuery)]);
+        if (!from) return { ok: false, error: `I could not find ${fromQuery} on the map` };
+        if (!to) return { ok: false, error: `I could not find ${toQuery} on the map` };
+
+        if (!active) setActive(true);
+        markers.clear();
+        globe.setAutoRotate(false);
+        statusBar.setTarget(`${from.name} → ${to.name}`, 'Plotting corridor...');
+
+        const arc = globe.addArc?.(from.lat, from.lng, to.lat, to.lng);
+        const separation = distanceKm(from.lat, from.lng, to.lat, to.lng);
+
+        /* Frame both ends: back off in proportion to how far apart they are,
+           or a long route leaves one end off-screen. */
+        const midLat = (from.lat + to.lat) / 2;
+        const midLng = Math.abs(from.lng - to.lng) > 180
+            ? ((from.lng + to.lng) / 2 + 180)
+            : (from.lng + to.lng) / 2;
+        await globe.flyTo(midLat, midLng, {
+            distance: cameraDistanceFor(separation * 1.6, globe.radius),
+            ms: 2200
+        });
+
+        markers.addMarker({ lat: from.lat, lng: from.lng, label: labelFor(from.name, from.source), pin: true, boxed: true });
+        markers.addMarker({ lat: to.lat, lng: to.lng, label: labelFor(to.name, to.source), pin: true, boxed: true });
+
+        const air = await feeds.flightsAlongRoute(from.lat, from.lng, to.lat, to.lng).catch(() => null);
+        const flights = air?.ok ? air.flights : [];
+        for (const f of flights.slice(0, 15)) {
+            markers.addMarker({ lat: f.lat, lng: f.lng, label: f.callsign || 'AIRCRAFT', kind: 'flight' });
+        }
+
+        statusBar.setTarget(
+            `${from.name} → ${to.name}`,
+            `${Math.round(separation)} km · ${flights.length} aircraft over the corridor`
+        );
+        if (flights.length) {
+            /* Stated on screen as well as spoken: the corridor is what is
+               measured, not the route each aircraft is flying. */
+            statusBar.pushAlert('Aircraft over the corridor — destinations not published by the open feed', 'alert');
+        }
+        codeOverlay.log(`showRoute(${from.name} -> ${to.name}) -> ${flights.length} aircraft, ${Math.round(separation)} km`);
+
+        return { ok: true, from, to, distanceKm: separation, flights, arc: !!arc };
     }
 
     /* Driven from the existing animate(); this module never starts a loop. */
@@ -404,7 +495,7 @@ export async function createGlobeMode({ scene, camera, renderer }) {
         setActive,
         toggle: () => setActive(!active),
         isActive: () => active,
-        update, showLocation, dispose,
+        update, showLocation, showRoute, dispose,
         globe, markers, statusBar, codeOverlay, feeds, landmarks: landmarkService,
         /* SYNCHRONOUS, and that is the whole point: the intent parser runs on
            every utterance and cannot await a geocode to decide whether "show

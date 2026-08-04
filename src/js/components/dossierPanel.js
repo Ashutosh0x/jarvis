@@ -50,6 +50,7 @@ export function createDossierPanel({ mount }) {
             <div class="img-dots"></div>
         </div>
         <div class="dossier-data"></div>
+        <div class="dossier-flights"></div>
         <div class="dossier-events"></div>`;
     mount.appendChild(root);
 
@@ -61,6 +62,7 @@ export function createDossierPanel({ mount }) {
     const dotsEl = root.querySelector('.img-dots');
     const dataEl = root.querySelector('.dossier-data');
     const eventsEl = root.querySelector('.dossier-events');
+    const flightsEl = root.querySelector('.dossier-flights');
 
     let images = [];
     let currentIndex = 0;
@@ -119,10 +121,10 @@ export function createDossierPanel({ mount }) {
      * @param {object} opts.dossier     from google.dossier()
      * @param {Array}  opts.images      from placeImages.forPlace()
      */
-    function show({ name, country, dossier, images: imgs = [], events: evts = [] }) {
+    function show({ name, country, dossier, images: imgs = [], events: evts = [], flights: flts = [] }) {
         /* If there is genuinely nothing to show, stay hidden. The status bar
            already displays the target name and any alerts. */
-        if (!dossier && imgs.length === 0 && evts.length === 0) return;
+        if (!dossier && imgs.length === 0 && evts.length === 0 && flts.length === 0) return;
 
         nameEl.textContent = name || '—';
         subtitleEl.textContent = country || '';
@@ -199,11 +201,71 @@ export function createDossierPanel({ mount }) {
         }
         dataEl.innerHTML = rows.join('');
 
-        /* --- events --- */
+        /* --- flights, then events --- */
+        renderFlights(flts);
         renderEvents(evts);
 
         /* Slide in */
         requestAnimationFrame(() => root.classList.add('visible'));
+    }
+
+    /**
+     * Aircraft currently overhead.
+     *
+     * The snapshot age is printed in the header and that is not decoration: an
+     * airliner covers about 15 km a minute, so a position without a stated age
+     * claims a precision the feed cannot support. OpenSky stamps each snapshot
+     * and this reports it.
+     */
+    function renderFlights(list) {
+        if (!flightsEl) return;
+        flightsEl.innerHTML = '';
+        const items = (list || []).filter((f) => f && Number.isFinite(f.lat));
+        if (!items.length) { flightsEl.style.display = 'none'; return; }
+        flightsEl.style.display = '';
+
+        const head = document.createElement('div');
+        head.className = 'dossier-flights-head';
+        const n = document.createElement('span');
+        n.textContent = items.length === 1 ? '1 aircraft overhead' : `${items.length} aircraft overhead`;
+        head.appendChild(n);
+        const age = items[0]?.snapshotAt
+            ? Math.max(0, Math.round((Date.now() - items[0].snapshotAt) / 1000))
+            : null;
+        if (age !== null) {
+            const a = document.createElement('span');
+            a.className = 'dossier-flights-age';
+            a.textContent = age < 90 ? `${age}s ago` : `${Math.round(age / 60)}m ago`;
+            head.appendChild(a);
+        }
+        flightsEl.appendChild(head);
+
+        for (const f of items.slice(0, 8)) {
+            const rowEl = document.createElement('div');
+            rowEl.className = 'dossier-flight';
+
+            const call = document.createElement('span');
+            call.className = 'df-call';
+            call.textContent = f.callsign || '—';
+            rowEl.appendChild(call);
+
+            const where = document.createElement('span');
+            where.textContent = f.country || '';
+            rowEl.appendChild(where);
+
+            const meta = document.createElement('span');
+            meta.className = 'df-meta';
+            const bits = [];
+            /* Altitude in thousands of feet is how aviation states it, but
+               this app is metric everywhere else; km keeps one convention. */
+            if (Number.isFinite(f.altitude)) bits.push(`${(f.altitude / 1000).toFixed(1)} km`);
+            if (Number.isFinite(f.velocity)) bits.push(`${f.velocity} km/h`);
+            if (Number.isFinite(f.distanceKm)) bits.push(`${f.distanceKm} km out`);
+            meta.textContent = bits.join(' · ');
+            rowEl.appendChild(meta);
+
+            flightsEl.appendChild(rowEl);
+        }
     }
 
     /**

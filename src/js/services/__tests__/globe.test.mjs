@@ -899,6 +899,89 @@ check('a null response does not throw', normaliseList(null).length === 0);
         brief.includes('dossier.temperatureC') && !brief.includes('dossier.weather?.temperature'));
 }
 
+/* ------------------------------------------------------ flight intents */
+
+/* A route must be recognised BEFORE the single-place flight query, because
+   "from X to Y" also contains "to Y" — matching that first silently drops the
+   origin and plots the wrong thing. */
+{
+    const flightWords = /\b(?:flights?|aircraft|planes?|airplanes?|flying)\b/i;
+    const routeRe = /\bfrom\s+([a-z][a-z .'-]{1,40}?)\s+(?:to|and|towards?)\s+([a-z][a-z .'-]{1,40}?)\s*[.?!]?$/i;
+    const overRe = /\b(?:in|at|near|over|around|above)\s+(?:the\s+)?([a-z][a-z .'-]{1,40}?)\s*[.?!]?$/i;
+    const parse = (cmd) => {
+        if (!flightWords.test(cmd)) return null;
+        const r = routeRe.exec(cmd);
+        if (r) return { route: [r[1].trim(), r[2].trim()] };
+        const o = overRe.exec(cmd);
+        return o ? { over: o[1].trim() } : null;
+    };
+
+    check('"show me flights from Bengaluru to Tokyo" is a route',
+        JSON.stringify(parse('show me flights from Bengaluru to Tokyo')?.route) === '["Bengaluru","Tokyo"]');
+    check('"flights from bengaluru to delhi" too',
+        JSON.stringify(parse('flights from bengaluru to delhi')?.route) === '["bengaluru","delhi"]');
+    check('the route is matched before the single-place pattern, so the origin survives',
+        parse('show me flights from Bengaluru to Tokyo')?.over === undefined);
+    check('"what is flying over Tokyo" is a single place',
+        parse('what is flying over Tokyo')?.over === 'Tokyo');
+    check('"show me aircraft near London" too',
+        parse('show me aircraft near London')?.over === 'London');
+    check('a non-flight command matches neither', parse('show me Tokyo') === null);
+}
+
+/* The corridor query is a bounding box, and longitude must narrow towards the
+   poles or a high-latitude route sweeps in half a continent. */
+{
+    let seen = null;
+    const feeds = createDataFeeds({
+        getSettings: () => ({}),
+        lumaBridge: null,
+        fetchImpl: async (url) => {
+            seen = String(url);
+            return { ok: true, json: async () => ({ time: 1785820000, states: [] }) };
+        }
+    });
+    await feeds.flightsAlongRoute(12.97, 77.59, 28.70, 77.10);
+    const p = Object.fromEntries(new URL(seen).searchParams);
+    check('the corridor query is a bounding box', ['lamin', 'lomin', 'lamax', 'lomax'].every((k) => k in p));
+    check('and it spans both endpoints',
+        Number(p.lamin) < 12.97 && Number(p.lamax) > 28.70);
+
+    /* Same 120 km pad, once near the equator and once far north. */
+    await feeds.flightsAlongRoute(0, 0, 1, 0);
+    const eq = Number(Object.fromEntries(new URL(seen).searchParams).lomax);
+    await feeds.flightsAlongRoute(70, 0, 71, 0);
+    const arctic = Number(Object.fromEntries(new URL(seen).searchParams).lomax);
+    check('longitude padding widens towards the poles', arctic > eq * 2);
+
+    const bad = await feeds.flightsAlongRoute(NaN, 0, 1, 2);
+    check('bad coordinates are refused rather than fetched',
+        bad.ok === false && bad.flights.length === 0);
+}
+
+/* Aircraft positions age. A snapshot with no stated time would let the UI
+   imply a precision an airliner destroys in a minute. */
+{
+    const feeds = createDataFeeds({
+        getSettings: () => ({}), lumaBridge: null,
+        fetchImpl: async () => ({
+            ok: true,
+            json: async () => ({
+                time: 1785820000,
+                states: [['abc', 'TEST123 ', 'UK', 1785820000, 1785820000, 77.6, 12.9, 10000, false, 250, 90, 0, null, 10000, '1000', false, 0]]
+            })
+        })
+    });
+    const r = await feeds.flightsNear(12.97, 77.59, 200);
+    check('a bounded flight query returns aircraft', r.ok && r.flights.length === 1);
+    check('the snapshot time is reported, not assumed to be now',
+        r.at === 1785820000 * 1000);
+    check('and every aircraft carries it so the UI can age the position',
+        r.flights[0].snapshotAt === 1785820000 * 1000);
+    check('distance from the query point is measured',
+        Number.isFinite(r.flights[0].distanceKm));
+}
+
 /* ------------------------------------------------------- event intent */
 
 /* "what events are happening in Tokyo" must extract Tokyo and mark the query

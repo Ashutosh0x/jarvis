@@ -1711,6 +1711,31 @@ class Jarvis {
            Routed to GLOBE_SHOW with a flag rather than a separate intent: the
            work is identical (fly there, mark it up) and only the spoken line
            differs. A second intent would duplicate the whole pipeline. */
+        /* A ROUTE — "show me flights from Bengaluru to Tokyo".
+           Checked BEFORE the single-place flight query, because "from X to Y"
+           also contains "to Y" and the single-place pattern would happily
+           match the destination alone and lose the origin. */
+        const route = /\b(?:flights?|aircraft|planes?|flying)\b/i.test(cmd)
+            ? /\bfrom\s+([a-z][a-z .'-]{1,40}?)\s+(?:to|and|towards?)\s+([a-z][a-z .'-]{1,40}?)\s*[.?!]?$/i.exec(cmdNoFraming)
+            : null;
+        if (route && window.jarvisGlobe) {
+            return {
+                intent: 'GLOBE_ROUTE',
+                from: route[1].trim(),
+                to: route[2].trim()
+            };
+        }
+
+        /* Aircraft over a place — "what's flying over Tokyo".
+           Same routing trick as events: one intent, a focus flag, and only the
+           spoken line differs. */
+        const flightsAt = /\b(?:flights?|aircraft|planes?|airplanes?|flying)\b/i.test(cmd)
+            ? /\b(?:in|at|near|over|around|above)\s+(?:the\s+)?([a-z][a-z .'-]{1,40}?)\s*[.?!]?$/i.exec(cmdNoFraming)?.[1]?.trim()
+            : null;
+        if (flightsAt && window.jarvisGlobe) {
+            return { intent: 'GLOBE_SHOW', place: flightsAt, focus: 'flights' };
+        }
+
         const eventsAt = /\b(?:events?|meetups?|conferences?|hackathons?)\b/i.test(cmd)
             ? /\b(?:in|at|near|around|on)\s+(?:the\s+)?([a-z][a-z .'-]{1,40}?)\s*[.?!]?$/i.exec(cmdNoFraming)?.[1]?.trim()
             : null;
@@ -1947,6 +1972,9 @@ class Jarvis {
                     break;
                 case 'GLOBE_SHOW':
                     await this.handleGlobeShow(intent);
+                    break;
+                case 'GLOBE_ROUTE':
+                    await this.handleGlobeRoute(intent);
                     break;
                 case 'GLOBE_TOGGLE':
                     await this.handleGlobeToggle(intent);
@@ -7348,6 +7376,50 @@ class Jarvis {
         } catch (e) {
             console.error('Globe error:', e);
             this.speak('The globe failed to acquire that location, Sir.');
+            this.haptics.warn();
+        }
+    }
+
+    /* A route between two places, with the aircraft currently over it.
+
+       THE WORDING IS DELIBERATE. OpenSky's state vectors carry no origin and
+       no destination, and its departure endpoint refuses historical windows on
+       anonymous access while reporting a null arrival airport for everything
+       still airborne. So Jarvis says what is true — how many aircraft are over
+       the corridor — and never claims they are flying from one named city to
+       the other, because the data cannot support that and some of them are
+       simply crossing. */
+    async handleGlobeRoute({ from, to }) {
+        const globe = window.jarvisGlobe;
+        if (!globe?.showRoute) {
+            this.speak('The globe view is not available in this build, Sir.');
+            return;
+        }
+        this.haptics.click();
+        this.speak(`Plotting ${from} to ${to}, Sir.`);
+        try {
+            const r = await globe.showRoute(from, to);
+            if (!r.ok) {
+                this.speak(r.error || `I could not plot that route, Sir.`);
+                this.haptics.warn();
+                return;
+            }
+            const parts = [`${r.from.name} to ${r.to.name}`, `${Math.round(r.distanceKm)} kilometres`];
+            if (r.flights.length) {
+                parts.push(`${r.flights.length} aircraft over the corridor right now`);
+                const lead = r.flights[0];
+                if (lead?.callsign) {
+                    parts.push(`the nearest to ${r.from.name} is ${lead.callsign}, ${lead.fromKm} kilometres out`);
+                }
+                /* Said out loud, once, because the visual cannot carry it. */
+                parts.push('I cannot confirm their destinations — the open feed does not publish them');
+            } else {
+                parts.push('No aircraft over that corridor at the moment');
+            }
+            this.speak(parts.join('. ') + '.');
+        } catch (e) {
+            console.error('Globe route error:', e);
+            this.speak('The globe failed to plot that route, Sir.');
             this.haptics.warn();
         }
     }

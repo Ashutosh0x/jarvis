@@ -277,6 +277,54 @@ export async function createGlobe({ scene, camera, domElement, loadGeoJson }) {
     controls.enabled = false;               // only while globe mode is on
     controls.target.set(0, 0, 0);
 
+    /* ---- route arcs ---- */
+    let arcs = [];
+
+    /**
+     * A great-circle arc between two points, lifted off the surface.
+     *
+     * SLERPED, not lerped. A straight line between two points on a sphere
+     * passes THROUGH it — Bengaluru to Tokyo would tunnel under China. Spherical
+     * interpolation follows the surface, which is also the path aircraft
+     * actually fly, so the drawn line means something rather than decorating.
+     *
+     * Lifted by a small arch so it clears the coastline vectors instead of
+     * z-fighting with them; the arch scales with separation, because a 200 km
+     * hop does not need the altitude a 7,000 km one does.
+     */
+    function addArc(lat1, lng1, lat2, lng2, { segments = 128, colour = 0x6fd3ff } = {}) {
+        const a = latLngToVector3(lat1, lng1, GLOBE_RADIUS).normalize();
+        const b = latLngToVector3(lat2, lng2, GLOBE_RADIUS).normalize();
+        /* Angle between the endpoints decides the arch height. */
+        const angle = a.angleTo(b);
+        const lift = GLOBE_RADIUS * (0.01 + 0.16 * (angle / Math.PI));
+        const pts = [];
+        for (let i = 0; i <= segments; i++) {
+            const t = i / segments;
+            const dir = a.clone().lerp(b, t).normalize();
+            /* sin gives zero rise at both ends and the peak in the middle. */
+            const r = GLOBE_RADIUS + 0.004 + lift * Math.sin(Math.PI * t);
+            pts.push(dir.multiplyScalar(r));
+        }
+        const geom = new THREE.BufferGeometry().setFromPoints(pts);
+        const mat = new THREE.LineBasicMaterial({
+            color: colour, transparent: true, opacity: 0.75, depthWrite: false
+        });
+        const line = new THREE.Line(geom, mat);
+        group.add(line);
+        arcs.push(line);
+        return line;
+    }
+
+    function clearArcs() {
+        for (const l of arcs) {
+            group.remove(l);
+            l.geometry.dispose();
+            l.material.dispose();
+        }
+        arcs = [];
+    }
+
     /* ---- fly-to ---- */
     let flight = null;
     const easeInOut = (t) => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2);
@@ -396,7 +444,7 @@ export async function createGlobe({ scene, camera, domElement, loadGeoJson }) {
 
     return {
         group, controls, layers, atmosphere,
-        update, setVisible, flyTo, dispose,
+        update, setVisible, flyTo, dispose, addArc, clearArcs,
         latLngToVector3,
         setAutoRotate: (on) => { autoRotate = on; },
         isVisible: () => group.visible,

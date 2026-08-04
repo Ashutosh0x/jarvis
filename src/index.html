@@ -1215,6 +1215,49 @@
       text-shadow: 0 0 10px rgba(214, 51, 176, 0.55), 0 1px 6px rgba(0, 0, 0, 0.9);
     }
 
+    /* Aircraft: cyan, the one hue not already spoken for — amber is the vector
+       network, orange is fire, magenta is an event. Smaller and dimmer than a
+       landmark label, because a dozen callsigns must not outshout the city
+       they are over. */
+    .globe-label.kind-flight {
+      color: rgba(150, 230, 255, 0.82);
+      font-size: 11px;
+      letter-spacing: 1px;
+      text-shadow: 0 0 8px rgba(56, 189, 248, 0.5), 0 1px 5px rgba(0, 0, 0, 0.9);
+    }
+
+    .dossier-flights {
+      margin-top: 12px;
+      border-top: 1px solid rgba(255, 255, 255, 0.08);
+      padding-top: 10px;
+      max-height: 170px;
+      overflow-y: auto;
+    }
+    .dossier-flights-head {
+      font-family: 'Orbitron', sans-serif;
+      font-size: 9px; letter-spacing: 2px; text-transform: uppercase;
+      color: rgba(150, 230, 255, 0.75);
+      margin-bottom: 6px;
+      display: flex; justify-content: space-between; gap: 8px;
+    }
+    /* The snapshot age. Aircraft move; a position with no stated age implies a
+       precision the feed does not have. */
+    .dossier-flights-age {
+      color: rgba(255, 255, 255, 0.35);
+      letter-spacing: 1px;
+    }
+    .dossier-flight {
+      display: flex; align-items: baseline; gap: 8px;
+      font-size: 11px; padding: 3px 0;
+      color: rgba(255, 255, 255, 0.62);
+      border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+    }
+    .dossier-flight .df-call {
+      font-family: 'Orbitron', sans-serif; font-size: 10px;
+      color: rgba(150, 230, 255, 0.95); min-width: 68px;
+    }
+    .dossier-flight .df-meta { margin-left: auto; white-space: nowrap; }
+
     .dossier-events {
       margin-top: 14px;
       border-top: 1px solid rgba(255, 255, 255, 0.08);

@@ -268,7 +268,8 @@ export function createDataFeeds({
     /* OpenSky Network anonymous public API.
        /api/states/all returns ALL flights worldwide — that's ~10,000 aircraft.
        We limit to top-200 by altitude to keep the globe usable. */
-    const OPENSKY_URL = 'https://opensky-network.org/api/states/all';
+    const OPENSKY_BASE = 'https://opensky-network.org/api/states/all';
+    const OPENSKY_URL = OPENSKY_BASE;
 
     function parseFlights(json) {
         const states = json?.states;
@@ -299,6 +300,114 @@ export function createDataFeeds({
         /* Keep top 200 by altitude for visual clarity */
         out.sort((a, b) => (b.altitude || 0) - (a.altitude || 0));
         return out.slice(0, 200);
+    }
+
+    /**
+     * Aircraft over ONE place, fetched now.
+     *
+     * THE AMBIENT POLL IS NOT GOOD ENOUGH FOR THIS. It runs every fifteen
+     * minutes, and an airliner at cruise covers about 225 km in that time — so
+     * a pin drawn from the last poll can be a quarter of the way to another
+     * country. Drawing that as an aircraft's position would be inventing
+     * precision the data does not have.
+     *
+     * A bounding-box query is the fix and it is also cheaper: `states/all` is
+     * ~920 KB, a box around one city is a few kilobytes. It is on-demand, so it
+     * costs a request only when someone actually asks about flights.
+     *
+     * Returns the fetch time alongside the aircraft so the caller can say how
+     * old the answer is rather than implying it is instantaneous.
+     */
+    async function flightsNear(lat, lng, radiusKm = 150) {
+        if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+            return { ok: false, reason: 'bad-coordinates', flights: [] };
+        }
+        /* Degrees of longitude narrow towards the poles; a fixed degree box
+           would be far too wide in Norway and too narrow at the equator. */
+        const dLat = radiusKm / 111.32;
+        const dLng = radiusKm / (111.32 * Math.max(0.15, Math.cos(lat * Math.PI / 180)));
+        const url = `${OPENSKY_BASE}?lamin=${(lat - dLat).toFixed(4)}&lomin=${(lng - dLng).toFixed(4)}`
+            + `&lamax=${(lat + dLat).toFixed(4)}&lomax=${(lng + dLng).toFixed(4)}`;
+        try {
+            const res = await fetchImpl(url, { signal: AbortSignal.timeout?.(15000) });
+            if (!res.ok) {
+                /* 429 is the anonymous quota, and it is a different problem
+                   from being offline — saying so lets the user wait rather
+                   than debug their network. */
+                return {
+                    ok: false,
+                    reason: res.status === 429 ? 'rate-limited' : `http-${res.status}`,
+                    flights: []
+                };
+            }
+            const json = await res.json();
+            /* OpenSky stamps the snapshot; every aircraft carries it so the UI
+               can state how old the position is. */
+            const snapshotAt = Number.isFinite(json?.time) ? json.time * 1000 : Date.now();
+            const flights = parseFlights(json)
+                .map((f) => ({ ...f, distanceKm: Math.round(distanceKm(lat, lng, f.lat, f.lng)), snapshotAt }))
+                .filter((f) => f.distanceKm <= radiusKm)
+                .sort((a, b) => a.distanceKm - b.distanceKm);
+            /* OpenSky stamps the snapshot; report it rather than "now". */
+            return { ok: true, flights, at: snapshotAt };
+        } catch (e) {
+            return { ok: false, reason: e.name === 'TimeoutError' ? 'timeout' : 'network', flights: [] };
+        }
+    }
+
+    /**
+     * Aircraft currently over the corridor between two places.
+     *
+     * WHAT THIS IS NOT: "flights from Bengaluru to Tokyo". OpenSky's state
+     * vectors carry callsign, position, altitude, heading and speed — they do
+     * NOT carry an origin or a destination. The flights/departure endpoint does
+     * report an airport pair, but it is unusable for this on anonymous access:
+     * a 24-hour window answers `403 "You cannot access historical flights"`,
+     * and inside the ~2 hour window that IS allowed, `estArrivalAirport` is
+     * null for every record — measured 0 of 10 — because OpenSky only
+     * estimates the arrival once the aircraft has landed.
+     *
+     * So the honest answer to "flights from A to B" is the aircraft that are
+     * over the corridor right now. That is a real, checkable fact. Claiming
+     * those aircraft are travelling from A to B would not be: some are
+     * crossing it, and the data cannot tell them apart.
+     */
+    async function flightsAlongRoute(fromLat, fromLng, toLat, toLng, padKm = 120) {
+        if (![fromLat, fromLng, toLat, toLng].every(Number.isFinite)) {
+            return { ok: false, reason: 'bad-coordinates', flights: [] };
+        }
+        const midLat = (fromLat + toLat) / 2;
+        const padLat = padKm / 111.32;
+        const padLng = padKm / (111.32 * Math.max(0.15, Math.cos(midLat * Math.PI / 180)));
+        const url = `${OPENSKY_BASE}?lamin=${(Math.min(fromLat, toLat) - padLat).toFixed(4)}`
+            + `&lomin=${(Math.min(fromLng, toLng) - padLng).toFixed(4)}`
+            + `&lamax=${(Math.max(fromLat, toLat) + padLat).toFixed(4)}`
+            + `&lomax=${(Math.max(fromLng, toLng) + padLng).toFixed(4)}`;
+        try {
+            const res = await fetchImpl(url, { signal: AbortSignal.timeout?.(20000) });
+            if (!res.ok) {
+                return {
+                    ok: false,
+                    reason: res.status === 429 ? 'rate-limited' : `http-${res.status}`,
+                    flights: []
+                };
+            }
+            const json = await res.json();
+            const snapshotAt = Number.isFinite(json?.time) ? json.time * 1000 : Date.now();
+            /* Sorted by how far along the corridor they are, so the list reads
+               from the origin outward rather than in OpenSky's arbitrary
+               order. */
+            const flights = parseFlights(json)
+                .map((f) => ({
+                    ...f, snapshotAt,
+                    fromKm: Math.round(distanceKm(fromLat, fromLng, f.lat, f.lng)),
+                    toKm: Math.round(distanceKm(toLat, toLng, f.lat, f.lng))
+                }))
+                .sort((a, b) => a.fromKm - b.fromKm);
+            return { ok: true, flights, at: snapshotAt };
+        } catch (e) {
+            return { ok: false, reason: e.name === 'TimeoutError' ? 'timeout' : 'network', flights: [] };
+        }
     }
 
     async function pollFlights() {
@@ -411,7 +520,7 @@ export function createDataFeeds({
 
     return {
         start, stop, near, status, feeds, all: allEvents,
-        refresh: pollQuakes, refreshFires: pollFires, refreshFlights: pollFlights,
+        refresh: pollQuakes, refreshFires: pollFires, refreshFlights: pollFlights, flightsNear, flightsAlongRoute,
         refreshEvents: pollLumaEvents
     };
 }
