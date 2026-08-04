@@ -122,7 +122,7 @@ export function createDataFeeds({
 } = {}) {
     const firmsKeyFor = () => firmsKey(getSettings);
     const feeds = {
-        earthquakes: { name: 'USGS earthquakes', configured: true, state: 'idle', last: null, data: [], intervalMs: 5 * 60 * 1000 },
+        earthquakes: { visible: true, name: 'USGS earthquakes', configured: true, state: 'idle', last: null, data: [], intervalMs: 5 * 60 * 1000 },
         /* NASA FIRMS NEEDS A MAP_KEY. Verified against the live endpoint: a
            keyless request returns "Invalid MAP_KEY." and nothing else. The URL
            shape is /api/area/csv/{MAP_KEY}/{SOURCE}/{AREA}/{DAY_RANGE}, so a
@@ -134,6 +134,7 @@ export function createDataFeeds({
            present this reports itself unconfigured and never polls, rather
            than retrying a request that cannot succeed. */
         wildfires: {
+            visible: true,
             name: 'NASA FIRMS VIIRS',
             configured: !!firmsKeyFor(),
             state: firmsKeyFor() ? 'idle' : 'needs a free MAP_KEY from firms.modaps.eosdis.nasa.gov',
@@ -149,6 +150,7 @@ export function createDataFeeds({
            and aircraft positions on a whole-globe view do not mean anything at
            finer resolution than that anyway. */
         flights: {
+            visible: true,
             name: 'OpenSky Network',
             configured: true, state: 'idle', last: null, data: [],
             intervalMs: 15 * 60 * 1000
@@ -158,6 +160,7 @@ export function createDataFeeds({
            name says so, because a layer that shows one calendar while implying
            it shows everything is worse than no layer. */
         events: {
+            visible: true,
             name: 'Luma (my calendar)',
             configured: false,
             state: 'needs LUMA_API_KEY (Luma Plus)',
@@ -429,8 +432,15 @@ export function createDataFeeds({
         /* Flights are deliberately excluded: there are hundreds at any moment
            and they would bury every quake, fire and event in the ticker. They
            are still reachable through `near()` and `feeds.flights.data`. */
-        return [...feeds.earthquakes.data, ...feeds.wildfires.data, ...feeds.events.data]
-            .sort((a, b) => (b.time || 0) - (a.time || 0));
+        /* A feed switched off in the layer panel contributes nothing — not to
+           the ticker, not to ripples, not to proximity. Hiding the drawing but
+           leaving the data in every downstream consumer would be a switch that
+           only half works. */
+        return [
+            ...(feeds.earthquakes.visible !== false ? feeds.earthquakes.data : []),
+            ...(feeds.wildfires.visible !== false ? feeds.wildfires.data : []),
+            ...(feeds.events.visible !== false ? feeds.events.data : [])
+        ].sort((a, b) => (b.time || 0) - (a.time || 0));
     }
 
     function start() {
@@ -461,7 +471,12 @@ export function createDataFeeds({
 
     /** Events within `radiusKm` of a point, newest first. All feed types merged. */
     function near(lat, lng, radiusKm = 800) {
-        const all = [...feeds.earthquakes.data, ...feeds.wildfires.data, ...feeds.flights.data, ...feeds.events.data];
+        const all = [
+            ...(feeds.earthquakes.visible !== false ? feeds.earthquakes.data : []),
+            ...(feeds.wildfires.visible !== false ? feeds.wildfires.data : []),
+            ...(feeds.flights.visible !== false ? feeds.flights.data : []),
+            ...(feeds.events.visible !== false ? feeds.events.data : [])
+        ];
         return all
             .map((e) => ({ ...e, distanceKm: Math.round(distanceKm(lat, lng, e.lat, e.lng)) }))
             .filter((e) => e.distanceKm <= radiusKm)

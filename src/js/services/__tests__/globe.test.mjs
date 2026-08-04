@@ -1131,5 +1131,72 @@ check('a null response does not throw', normaliseList(null).length === 0);
         readme.includes('- [Globe](#globe)') && /^## Globe\s*$/m.test(readme));
 }
 
+/* ------------------------------------------------------- layer manager */
+
+{
+    const { createLayerManager, CATEGORIES } = await import('../../components/globeLayers.js');
+
+    check('every category has a label, colour and order',
+        Object.values(CATEGORIES).every((c) => c.label && /^#/.test(c.colour) && Number.isFinite(c.order)));
+
+    let updates = 0, fetches = 0;
+    const mgr = createLayerManager({});
+    const fake = { update: () => { updates++; }, setVisible: () => { }, setData: () => { }, dispose: () => { } };
+
+    mgr.register({ id: 'a', name: 'Alpha', category: 'space', layer: fake, fetchFn: async () => { fetches++; return [1]; } });
+    check('a registered layer starts switched off', mgr.isActive('a') === false);
+    check('and is listed', mgr.getAll().some((l) => l.id === 'a'));
+
+    /* An off layer must cost nothing — not a poll, not an update. */
+    mgr.update(1);
+    check('an inactive layer is not updated', updates === 0);
+
+    await mgr.toggle('a', true);
+    check('toggling on switches it active', mgr.isActive('a') === true);
+    check('and fetches once', fetches === 1);
+    mgr.update(1);
+    check('an active layer IS updated', updates === 1);
+
+    await mgr.toggle('a', false);
+    mgr.update(1);
+    check('switching off stops the updates again', updates === 1);
+    check('the active count reflects reality', mgr.activeCount() === 0);
+
+    check('duplicate ids are refused', (() => {
+        try { mgr.register({ id: 'a', name: 'x', category: 'space' }); return false; } catch { return true; }
+    })());
+    check('an unknown category falls back rather than throwing',
+        mgr.register({ id: 'b', name: 'B', category: 'nonsense' }).category === 'intel');
+
+    /* A layer that refuses to switch on must not leave the switch showing on,
+       or the panel lies about what is drawn. */
+    const refuser = createLayerManager({});
+    refuser.register({ id: 'r', name: 'R', category: 'space', onToggle: async () => false });
+    await refuser.toggle('r', true);
+    check('a layer that declines stays switched off', refuser.isActive('r') === false);
+
+    /* A failing fetch is reported on the row, not swallowed. */
+    const failing = createLayerManager({});
+    failing.register({
+        id: 'f', name: 'F', category: 'cyber', layer: fake,
+        fetchFn: async () => { throw new Error('upstream down'); }
+    });
+    await failing.toggle('f', true);
+    check('a failed fetch surfaces its reason',
+        failing.getAll().find((l) => l.id === 'f')?.error === 'upstream down');
+}
+
+/* Feed visibility has to be REAL. Hiding the drawing but leaving the data in
+   every downstream consumer would be a switch that only half works. */
+{
+    const vf = createDataFeeds({ getSettings: () => ({}), lumaBridge: null, fetchImpl: async () => ({ ok: false }) });
+    vf.feeds.earthquakes.data = [{ kind: 'earthquake', lat: 1, lng: 1, time: 2 }];
+    check('a visible feed reaches the ticker', vf.all().length === 1);
+    check('and proximity', vf.near(1, 1, 500).length === 1);
+    vf.feeds.earthquakes.visible = false;
+    check('a hidden feed is absent from the ticker', vf.all().length === 0);
+    check('and from proximity too', vf.near(1, 1, 500).length === 0);
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

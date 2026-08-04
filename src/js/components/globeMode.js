@@ -36,6 +36,8 @@ import { createDossierPanel } from './dossierPanel.js';
 import { buildAirportIndex, primaryAirport } from '../services/airports.js';
 import { createSatelliteService } from '../services/satellites.js';
 import { createSatelliteLayer } from './layers/satelliteLayer.js';
+import { createLayerManager } from './globeLayers.js';
+import { createLayerPanel } from './layerPanel.js';
 
 /* Files the code column scrolls through — real modules, not filler.
  *
@@ -176,6 +178,39 @@ export async function createGlobeMode({ scene, camera, renderer }) {
         return on;
     }
 
+    /* Everything drawable, in one registry. The existing feeds are migrated
+       in below rather than left as bespoke fields — five hand-wired layers
+       works, fifteen does not, and none of them were switchable before. */
+    const layerManager = createLayerManager({ globe, statusBar, codeOverlay });
+    const layerPanel = createLayerPanel(layerManager);
+
+    layerManager.register({
+        id: 'satellites', name: 'Satellites', category: 'space',
+        layer: satelliteLayer,
+        /* Owns its own visibility: the elements load lazily and the load can
+           fail, in which case the switch must not move. */
+        onToggle: setSatellites
+    });
+    layerManager.register({
+        id: 'earthquakes', name: 'Earthquakes', category: 'seismic', visible: true,
+        layer: {
+            setVisible: (on) => { feeds.feeds.earthquakes.visible = on; },
+            group: null
+        }
+    });
+    layerManager.register({
+        id: 'wildfires', name: 'Wildfires', category: 'environment',
+        layer: { setVisible: (on) => { feeds.feeds.wildfires.visible = on; }, group: null }
+    });
+    layerManager.register({
+        id: 'flights', name: 'Aircraft', category: 'aviation',
+        layer: { setVisible: (on) => { feeds.feeds.flights.visible = on; }, group: null }
+    });
+    layerManager.register({
+        id: 'events', name: 'Luma events', category: 'intel',
+        layer: { setVisible: (on) => { feeds.feeds.events.visible = on; }, group: null }
+    });
+
     const landmarkService = createLandmarkService();
     const google = createGoogleServices();
     const placeImages = createPlaceImages();
@@ -217,7 +252,10 @@ export async function createGlobeMode({ scene, camera, renderer }) {
         }
 
         globe.setVisible(on);
-        if (!on) satelliteLayer.setVisible(false);
+        /* Layers follow the globe: hidden when it is, and restored to whatever
+           was switched on when it comes back. */
+        if (on) layerManager.restore(); else layerManager.hideAll();
+        if (!on) { satelliteLayer.setVisible(false); layerPanel.hide(); }
         /* The status bar and code overlay complete the Iron Man command-centre
            aesthetic. The bar shows the target, weather/time dossier and seismic
            alerts; the column scrolls real source code with live log entries. */
@@ -540,6 +578,7 @@ export async function createGlobeMode({ scene, camera, renderer }) {
         if (!active) return;
         globe.update(dt, audioEnergy);
         satelliteLayer.update(dt);
+        layerManager.update(dt);
         markers.update();
         labelRenderer.render(scene, camera);
     }
@@ -557,6 +596,8 @@ export async function createGlobeMode({ scene, camera, renderer }) {
         statusBar.dispose();
         codeOverlay.dispose();
         dossierPanel.dispose();
+        layerPanel.dispose();
+        layerManager.dispose();
         satelliteLayer.dispose();
         labelRenderer.domElement.remove();
     }
@@ -567,6 +608,8 @@ export async function createGlobeMode({ scene, camera, renderer }) {
         isActive: () => active,
         update, showLocation, showRoute, dispose,
         satellites: { toggle: setSatellites, service: satelliteService, layer: satelliteLayer },
+        layers: layerManager,
+        layerPanel,
         globe, markers, statusBar, codeOverlay, feeds, landmarks: landmarkService,
         /* SYNCHRONOUS, and that is the whole point: the intent parser runs on
            every utterance and cannot await a geocode to decide whether "show
