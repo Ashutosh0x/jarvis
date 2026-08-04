@@ -261,6 +261,30 @@ contextBridge.exposeInMainWorld('electronAPI', {
     writeClipboard: (text) => ipcRenderer.invoke('write-clipboard', text),
     windowControl: (action) => ipcRenderer.send('window-control', action),
     getOSInfo: () => ipcRenderer.invoke('get-os-info'),
+    /* Foundry — 3D modelling through Blender. The renderer never learns where
+       Blender is or what it is spawned with; it sends a sentence and receives
+       a result, the same shape as every other privileged operation here. */
+    foundryCreate: (request) => ipcRenderer.invoke('foundry-create', request),
+    foundryDoctor: () => ipcRenderer.invoke('foundry-doctor'),
+    /* The viewer reads finished jobs off disk. Listing and image bytes are
+       separate calls: a render is ~300 KB, so base64-ing every job into one
+       response would push tens of megabytes across the bridge to draw one. */
+    foundryJobs: (opts) => ipcRenderer.invoke('foundry-jobs', opts),
+    foundryImage: (jobId) => ipcRenderer.invoke('foundry-image', jobId),
+    /* The GLB the 3D viewer orbits, and a rebuild for jobs made before GLB
+       export became automatic — the saved spec is what makes that possible. */
+    foundryMesh: (jobId) => ipcRenderer.invoke('foundry-mesh', jobId),
+    /* Globe map data, read by the main process because fetch() cannot touch
+       file:// and the packaged window is loaded from disk. */
+    loadGeoAsset: (name) => ipcRenderer.invoke('globe-geo', name),
+    /* Google Maps Platform. Returns data, never the key that fetched it. */
+    googleMaps: (method, params) => ipcRenderer.invoke('google-maps', method, params),
+    googleMapsStatus: () => ipcRenderer.invoke('google-maps-status'),
+    /* Kept as a named shortcut: the landmark ring is the hot path. */
+    placesNearby: (opts) => ipcRenderer.invoke('google-maps', 'placesNearby', opts),
+    foundryRebuild: (jobId) => ipcRenderer.invoke('foundry-rebuild', jobId),
+    onFoundryStatus: createSafeListener('foundry-status'),
+    onFoundryJobComplete: createSafeListener('foundry-job-complete'),
     // Additional safe listeners
     onWebsiteOpened: createSafeListener('website-opened'),
     onWindowControlResult: createSafeListener('window-control-result')

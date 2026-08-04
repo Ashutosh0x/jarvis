@@ -80,14 +80,41 @@ document.addEventListener('mousemove', (e) => {
 // Animation loop - ✅ Direct render without bloom composer
 const clock = new THREE.Clock();
 
+/* DECLARED BEFORE animate(), and that ordering is load-bearing.
+
+   `animate()` is invoked immediately below its definition and reads this
+   binding. A `let` is in its temporal dead zone until its declaration is
+   evaluated, so declaring it after the call threw
+   "Cannot access 'globeMode' before initialization" on the very first frame —
+   and because requestAnimationFrame is the FIRST statement in the loop, the
+   frame re-scheduled itself and threw again forever. Nothing after that line
+   ever ran, including renderer.render(), so the ORB went dark too and the
+   symptom read as "the globe will not render". */
+let globeMode = null;
+
 function animate() {
     requestAnimationFrame(animate);
 
-    camera.position.x += (mouseX - camera.position.x) * 0.05;
-    camera.position.y += (-mouseY - camera.position.y) * 0.05;
-    camera.lookAt(scene.position);
+    /* The globe owns the camera while it is up.
 
-    uniforms.u_time.value = clock.getElapsedTime();
+       OrbitControls writes the camera position every frame; so does the
+       mouse-follow below. Both at once produces a camera that slides back
+       toward centre while you are dragging the globe, which feels like the
+       input is being ignored. Whoever owns the camera owns it exclusively. */
+    if (!globeMode?.ownsCamera()) {
+        camera.position.x += (mouseX - camera.position.x) * 0.05;
+        camera.position.y += (-mouseY - camera.position.y) * 0.05;
+        camera.lookAt(scene.position);
+    }
+
+    /* ONE getDelta() per frame, and everything else reads the property.
+
+       THREE.Clock.getElapsedTime() calls getDelta() internally, so calling
+       getElapsedTime() here and getDelta() further down returns a delta of
+       almost zero for the second caller — the globe's auto-rotation, which is
+       scaled by dt, would simply never move. */
+    const frameDelta = clock.getDelta();
+    uniforms.u_time.value = clock.elapsedTime;
 
     // ✅ FFT-driven deformation: when the mic analyser is live, blend real
     // frequency bands (bass drives the body, treble adds shimmer) with the
@@ -110,16 +137,59 @@ function animate() {
     uniforms.u_frequency.value = frequency;
 
     if (visualizerModes) {
-        visualizerModes.update(frequency, clock.getElapsedTime(), uniforms);
+        visualizerModes.update(frequency, clock.elapsedTime, uniforms);
         if (params.autoColor) {
             visualizerModes.setColorFromFrequency(frequency, uniforms);
         }
     }
 
+    /* Globe mode shares this loop rather than starting its own — one WebGL
+       context, one rAF, one camera. It no-ops when hidden. */
+    if (globeMode) globeMode.update(frameDelta, Math.min(1, frequency / 100));
+
     // ✅ Direct render - NO bloom composer = true transparency
     renderer.render(scene, camera);
 }
 animate();
+
+/* ---------------------------------------------------------------------------
+   GLOBE MODE (F3)
+
+   Loaded lazily and asynchronously: it pulls ~2.2 MB of GeoJSON and the
+   CSS2DRenderer, and a voice assistant that starts by listening should not
+   wait on a map it may never be asked to show. Until it resolves, F3 is a
+   no-op rather than an error. The binding itself is declared above animate(),
+   see the note there.
+   --------------------------------------------------------------------------- */
+import('./components/globeMode.js')
+    .then(({ createGlobeMode }) => createGlobeMode({ scene, camera, renderer }))
+    .then((mode) => {
+        globeMode = mode;
+        /* Exposed the way jarvisMirror and jarvisFoundry are, so the voice
+           router reaches it without importing this module. */
+        window.jarvisGlobe = mode;
+        window.dispatchEvent(new CustomEvent('jarvis-globe-ready'));
+        /* One warn-level line so it reaches the terminal through the main
+           process forwarder. Distinguishing "loaded, layers present" from
+           "never loaded" is the whole diagnosis when the globe looks empty,
+           and there is no other way to see it with DevTools shut. */
+        console.warn(`Globe ready — layers: ${mode.globe.loadedLayers().join(', ') || 'NONE'}`);
+    })
+    .catch((err) => console.error('Globe mode unavailable:', err?.stack || err));
+
+window.addEventListener('keydown', (e) => {
+    if (e.key !== 'F3') return;
+    e.preventDefault();
+    if (!globeMode) return;
+    const on = globeMode.toggle();
+    /* The orb and the globe are mutually exclusive: leaving the icosahedron
+       spinning inside the Earth is exactly as odd as it sounds.
+
+       `meshes` is the array VisualizerModes tracks — hiding only `mesh` would
+       leave whichever alternative shape (cube, torus, particles) the user had
+       selected still rendering inside the globe. */
+    for (const m of visualizerModes?.meshes || [mesh]) if (m) m.visible = !on;
+});
 
 // Resize handling
 window.addEventListener('resize', () => {

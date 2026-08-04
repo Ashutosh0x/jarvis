@@ -992,6 +992,161 @@
       }
       .mirror-cursor { animation-duration: 0.01ms !important; opacity: 0; }
     }
+
+    /* =====================================================================
+       GLOBE MODE (F3)
+
+       Palette sampled from the reference footage rather than invented: the
+       amber is the road network, the blue is the pin, and the code column is
+       a desaturated green that sits behind the globe without competing.
+
+       Every rule is scoped under .globe-mode on <body> or to a globe-* class,
+       so orb mode is untouched when the globe is hidden.
+       ===================================================================== */
+    :root {
+      --globe-amber: #ff9d2e;
+      --globe-amber-dim: rgba(255, 157, 46, 0.55);
+      --globe-blue: #2f9dff;
+      --code-green: rgba(80, 220, 130, 0.34);
+      --code-dim: rgba(80, 160, 110, 0.22);
+    }
+
+    /* NO BACKDROP. The app is a transparent overlay on the desktop and the
+       WebGL context already clears to alpha 0, so the globe floats on whatever
+       is behind the window — no black rectangle, no border, no padding.
+
+       A radial-gradient backdrop used to be painted here to make the globe read
+       as "space". It also drew the very box that was asked to go, and it was
+       the only thing in globe mode filling the window, so it is gone rather
+       than merely hidden. */
+
+    /* ---- CSS2D label layer ---- */
+    .globe-label-layer {
+      position: fixed; inset: 0; z-index: 1002;
+      pointer-events: none;          /* drags must reach the WebGL canvas */
+      display: none;
+      overflow: hidden;
+    }
+    .globe-label {
+      position: absolute;
+      font-family: 'Rajdhani', 'Barlow', sans-serif;
+      font-size: 15px; font-weight: 600; letter-spacing: 1.4px;
+      color: rgba(255, 255, 255, 0.92);
+      text-transform: uppercase; white-space: nowrap;
+      text-shadow: 0 1px 6px rgba(0, 0, 0, 0.9);
+      transition: opacity 220ms ease;
+      pointer-events: auto; cursor: default;
+      transform: translate(-50%, -50%);
+    }
+    /* Some labels in the reference sit on a dark plate, some are bare text —
+       the plate is for the ones that would otherwise fall on bright terrain. */
+    .globe-label.boxed {
+      background: rgba(6, 12, 20, 0.82);
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      border-radius: 4px; padding: 4px 10px;
+      backdrop-filter: blur(4px);
+    }
+
+    /* ---- code column ---- */
+    .code-overlay {
+      position: fixed; left: 0; top: 0; bottom: 0;
+      width: 38vw; max-width: 640px; z-index: 1005;
+      display: none; overflow: hidden;
+      pointer-events: none;
+      /* Fades out toward the globe so the column never hard-edges into it. */
+      -webkit-mask-image: linear-gradient(90deg, #000 0%, #000 62%, transparent 100%);
+      mask-image: linear-gradient(90deg, #000 0%, #000 62%, transparent 100%);
+    }
+    .code-overlay .code-scroll { padding: 26px 0 26px 14px; pointer-events: auto; }
+    .code-overlay .code-pre {
+      margin: 0;
+      font-family: 'JetBrains Mono', Consolas, 'Courier New', monospace;
+      font-size: 12px; line-height: 1.45;
+      color: var(--code-green);
+      white-space: pre; tab-size: 2;
+    }
+    .code-overlay .code-line { display: block; }
+    .code-overlay .ln {
+      display: inline-block; width: 3.4em; margin-right: 10px;
+      text-align: right; color: rgba(90, 130, 105, 0.4); font-size: 11px;
+    }
+    .code-overlay .c-com { color: var(--code-dim); font-style: italic; }
+    .code-overlay .c-kw { color: rgba(90, 190, 255, 0.4); }
+    .code-overlay .c-str { color: rgba(220, 170, 90, 0.38); }
+    .code-overlay .c-num { color: rgba(200, 130, 220, 0.38); }
+    /* A live line — Jarvis actually doing something — is the one thing in the
+       column worth looking at, so it is the one thing at full opacity. */
+    .code-overlay .code-line.live {
+      color: rgba(120, 255, 170, 0.85);
+      background: rgba(40, 200, 120, 0.07);
+    }
+    .code-overlay .code-line.live .ln { color: rgba(120, 255, 170, 0.5); }
+
+    /* ---- globe mode is the globe, and nothing else ----------------------
+       Asked for directly: no code column, no boxes, just the planet. The orb
+       mode HUD is untouched — every selector here is scoped under
+       body.globe-mode, so leaving the globe brings all of it straight back.
+
+       The command input is the one thing deliberately kept: it is how you say
+       "show me San Francisco" in the first place, and hiding it would leave a
+       globe with no way to steer it. */
+    body.globe-mode #status-hud,
+    body.globe-mode #diagnostics-hud,
+    body.globe-mode #ptt-indicator,
+    body.globe-mode #jarvis-display,
+    body.globe-mode #voice-transcript,
+    body.globe-mode #sources-container,
+    body.globe-mode #media-output-container,
+    body.globe-mode #camera-container,
+    body.globe-mode .globe-status-bar,
+    body.globe-mode .code-overlay {
+      display: none !important;
+    }
+
+    /* ---- bottom status bar ---- */
+    .globe-status-bar {
+      position: fixed; left: 0; right: 0; bottom: 0; z-index: 1003;
+      display: none;
+      grid-template-columns: 1fr auto 1fr;
+      align-items: end; gap: 20px;
+      padding: 0 26px 22px;
+      pointer-events: none;
+      font-family: 'Rajdhani', sans-serif;
+    }
+    .globe-status-bar .gsb-plate {
+      display: flex; flex-direction: column; align-items: center; gap: 2px;
+      background: rgba(4, 10, 18, 0.78);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 12px; padding: 12px 30px;
+      backdrop-filter: blur(12px);
+      box-shadow: 0 8px 40px rgba(0, 0, 0, 0.6);
+    }
+    .globe-status-bar .gsb-primary {
+      font-size: 17px; font-weight: 500; color: #f2f7ff; letter-spacing: 0.4px;
+    }
+    .globe-status-bar .gsb-secondary {
+      font-size: 14px; color: rgba(255, 255, 255, 0.62);
+    }
+    .globe-status-bar .gsb-right { display: flex; justify-content: flex-end; }
+    .globe-status-bar .gsb-alerts {
+      display: flex; flex-direction: column; align-items: flex-end; gap: 3px;
+      text-align: right; max-width: 30vw;
+    }
+    .globe-status-bar .gsb-alert {
+      font-size: 13.5px; color: rgba(255, 255, 255, 0.82);
+      text-shadow: 0 1px 5px rgba(0, 0, 0, 0.9);
+      opacity: 0; transform: translateX(14px);
+      transition: opacity 320ms ease, transform 320ms ease;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%;
+    }
+    .globe-status-bar .gsb-alert.in { opacity: 1; transform: none; }
+    .globe-status-bar .gsb-alert-label { color: var(--globe-amber); font-weight: 600; }
+    .globe-status-bar .gsb-alert.kind-breaking .gsb-alert-label { color: #ff6b4a; }
+
+    @media (prefers-reduced-motion: reduce) {
+      .globe-status-bar .gsb-alert { transition: none; }
+      .globe-label { transition: none; }
+    }
   </style>
 </head>
 
@@ -1198,6 +1353,7 @@
   <script type="module" src="./js/scripts.js"></script>
   <script type="module" src="./js/companionUi.js"></script>
   <script type="module" src="./js/components/mirrorPanel.js"></script>
+  <script type="module" src="./js/components/foundryPanel.js"></script>
 </body>
 
 </html>

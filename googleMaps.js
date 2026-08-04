@@ -1,0 +1,406 @@
+/* =========================================================================
+   GOOGLE MAPS PLATFORM — every endpoint this app actually has a use for.
+
+   MAIN PROCESS ONLY. GOOGLE_MAPS_API_KEY is read here and never leaves; the
+   renderer calls through the `google-maps` IPC channel and receives results,
+   not credentials. That is the same rule the credential vault enforces for
+   every other secret in this app, and it matters more here than usual because
+   the renderer displays third-party content.
+
+   WHAT IS AND IS NOT HERE
+   Sixteen Maps Platform endpoints were probed against the live key and all
+   sixteen answered. This module implements the twelve that serve a command
+   centre — turning a name into a place, a place into coordinates, and
+   coordinates into what is true there right now.
+
+   Left out deliberately, because a wrapper nobody calls is dead code that
+   still has to be maintained and still bills when someone finds it:
+     - Address Validation, Geolocation, Roads/snapToRoads — postal and fleet
+       problems. The globe has no addresses to validate and no GPS trace to
+       snap. (Geolocation also answered from Bengaluru on this machine, i.e.
+       IP geolocation, which is not where the user is.)
+     - Solar buildingInsights — per-rooftop panel economics, a different app.
+     - Map Tiles / Photorealistic 3D — the globe is a deliberate amber vector
+       look; photoreal tiles would replace the design, not extend it, and they
+       are the most expensive SKU on the list.
+
+   EVERY CALL IS OPTIONAL AND EVERY FAILURE IS REPORTED. No key is a normal
+   state: callers fall back to the keyless paths that already exist. When
+   Google refuses, its own reason is passed through verbatim — a disabled API
+   and an unreachable network are different problems and must not both read as
+   "offline".
+
+   BILLING IS REAL. Each helper is one request. Nothing here polls, retries in
+   a loop, or runs on a timer; calls happen when the user asks for a place.
+   ========================================================================= */
+
+const TIMEOUT_MS = 8000;
+
+const key = () => process.env.GOOGLE_MAPS_API_KEY || '';
+
+/** Is Google configured at all? Callers branch on this rather than guessing. */
+function isConfigured() {
+    return !!key();
+}
+
+/**
+ * One request, one shape of answer.
+ *
+ * Returns `{ ok, data }` or `{ ok: false, reason, detail }`. It never throws:
+ * a map layer that explodes takes the globe down with it, and "no weather" is
+ * not a reason to lose the planet.
+ */
+async function call(url, { method = 'GET', body = null, fieldMask = null } = {}) {
+    if (!key()) return { ok: false, reason: 'no-key' };
+    const headers = { 'X-Goog-Api-Key': key() };
+    if (body) headers['Content-Type'] = 'application/json';
+    if (fieldMask) headers['X-Goog-FieldMask'] = fieldMask;
+
+    try {
+        const res = await fetch(url, {
+            method, headers,
+            body: body ? JSON.stringify(body) : undefined,
+            signal: AbortSignal.timeout(TIMEOUT_MS)
+        });
+        const text = await res.text();
+        let json = null;
+        try { json = JSON.parse(text); } catch { /* non-JSON handled below */ }
+
+        if (!res.ok) {
+            /* Google says why — bad key, API not enabled, billing off, quota.
+               Guessing at this is how a disabled API gets reported as an
+               outage for a week. */
+            const reason = json?.error?.status || json?.status || `http-${res.status}`;
+            const detail = json?.error?.message || json?.error_message || text.slice(0, 300);
+            return { ok: false, reason, detail };
+        }
+        /* The legacy maps.googleapis.com endpoints return HTTP 200 with a
+           status field carrying the real outcome — ZERO_RESULTS is a 200. */
+        if (json?.status && json.status !== 'OK' && json.status !== 'ZERO_RESULTS') {
+            return { ok: false, reason: json.status, detail: json.error_message || '' };
+        }
+        return { ok: true, data: json ?? text };
+    } catch (error) {
+        return {
+            ok: false,
+            reason: error.name === 'TimeoutError' ? 'timeout' : 'network',
+            detail: error.message
+        };
+    }
+}
+
+const q = (o) => Object.entries(o)
+    .filter(([, v]) => v !== undefined && v !== null && v !== '')
+    .map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&');
+
+const LEGACY = 'https://maps.googleapis.com/maps/api';
+
+/* ---------------------------------------------------------------- places -- */
+
+/**
+ * Landmarks near a point.
+ *
+ * The field mask is REQUIRED by the API and is also the bill: every field
+ * asked for is charged whether or not it is drawn, so this asks for exactly
+ * what the globe puts on screen.
+ */
+async function placesNearby({ lat, lng, radiusM = 10000, limit = 20, types } = {}) {
+    return call('https://places.googleapis.com/v1/places:searchNearby', {
+        method: 'POST',
+        fieldMask: 'places.id,places.displayName,places.location,places.types',
+        body: {
+            locationRestriction: {
+                circle: {
+                    center: { latitude: lat, longitude: lng },
+                    /* Their circle caps at 50 km; clamp rather than be rejected. */
+                    radius: Math.min(50000, Math.max(1, radiusM))
+                }
+            },
+            includedTypes: types || ['tourist_attraction', 'museum', 'park', 'stadium'],
+            rankPreference: 'POPULARITY',
+            maxResultCount: Math.min(20, Math.max(1, limit))
+        }
+    });
+}
+
+/** Free-text place lookup — "the Golden Gate Bridge", not a city name. */
+async function placesText({ query, limit = 5 } = {}) {
+    return call('https://places.googleapis.com/v1/places:searchText', {
+        method: 'POST',
+        fieldMask: 'places.id,places.displayName,places.location,places.formattedAddress,places.types',
+        body: { textQuery: String(query || ''), maxResultCount: Math.min(20, Math.max(1, limit)) }
+    });
+}
+
+/** Type-ahead completions. Cheap, and the only endpoint billed per session. */
+async function placesAutocomplete({ input, lat, lng } = {}) {
+    const body = { input: String(input || '') };
+    if (Number.isFinite(lat) && Number.isFinite(lng)) {
+        body.locationBias = { circle: { center: { latitude: lat, longitude: lng }, radius: 50000 } };
+    }
+    return call('https://places.googleapis.com/v1/places:autocomplete', { method: 'POST', body });
+}
+
+/* ------------------------------------------------------------- geocoding -- */
+
+/**
+ * Name to coordinates.
+ *
+ * This is the one that closes the gaps in the bundled gazetteer: Natural Earth
+ * 110m has "New Delhi" but not "Delhi", and no Trichardt at all. Google
+ * resolves both. It is a FALLBACK, not the default — the offline index still
+ * answers first, because a globe that needs the internet to find a city is a
+ * globe that does not work on a train.
+ */
+async function geocode({ address, region, language = 'en' } = {}) {
+    if (!key()) return { ok: false, reason: 'no-key' };
+    /* V4, which is generally available and is the reason this resolves a
+       country, a state, a city, a street and a building with one call. It also
+       returns `granularity` and a `viewport`, which is what lets the globe
+       frame Japan differently from a doorway without anyone hardcoding a zoom
+       level per place type.
+       `languageCode` matters: without it "Tokyo" comes back as 日本、東京都,
+       which is correct and unreadable as a map label here. */
+    const path = encodeURIComponent(String(address || ''));
+    const res = await call(`https://geocode.googleapis.com/v4/geocode/address/${path}?${q({
+        key: key(), languageCode: language, regionCode: region
+    })}`);
+    if (res.ok) return res;
+    /* V3 is still supported and stays as the fallback: a v4 outage or a quota
+       that was only ever uplifted on v3 should degrade, not fail. */
+    return call(`${LEGACY}/geocode/json?${q({ address, region, key: key() })}`);
+}
+
+/** Coordinates to a place name — what am I looking at? */
+async function reverseGeocode({ lat, lng, resultType = 'locality' } = {}) {
+    return call(`${LEGACY}/geocode/json?${q({ latlng: `${lat},${lng}`, result_type: resultType, key: key() })}`);
+}
+
+/* ----------------------------------------------------- what is true there -- */
+
+/** Metres above sea level. */
+async function elevation({ lat, lng } = {}) {
+    return call(`${LEGACY}/elevation/json?${q({ locations: `${lat},${lng}`, key: key() })}`);
+}
+
+/** IANA zone and offset — so the globe can say what time it is there. */
+async function timezone({ lat, lng, timestamp = Math.floor(Date.now() / 1000) } = {}) {
+    return call(`${LEGACY}/timezone/json?${q({ location: `${lat},${lng}`, timestamp, key: key() })}`);
+}
+
+/** Current conditions. */
+async function weather({ lat, lng } = {}) {
+    return call(`https://weather.googleapis.com/v1/currentConditions:lookup?${q({
+        key: key(), 'location.latitude': lat, 'location.longitude': lng
+    })}`);
+}
+
+/** Universal AQI plus the dominant pollutant. */
+async function airQuality({ lat, lng } = {}) {
+    return call(`https://airquality.googleapis.com/v1/currentConditions:lookup?key=${encodeURIComponent(key())}`, {
+        method: 'POST',
+        body: { location: { latitude: lat, longitude: lng } }
+    });
+}
+
+/** Grass/tree/weed indices for the day. */
+async function pollen({ lat, lng, days = 1 } = {}) {
+    return call(`https://pollen.googleapis.com/v1/forecast:lookup?${q({
+        key: key(), 'location.latitude': lat, 'location.longitude': lng, days
+    })}`);
+}
+
+/* ------------------------------------------------------------- movement --- */
+
+/** Distance and duration between two points. */
+async function route({ fromLat, fromLng, toLat, toLng, travelMode = 'DRIVE' } = {}) {
+    return call('https://routes.googleapis.com/directions/v2:computeRoutes', {
+        method: 'POST',
+        fieldMask: 'routes.duration,routes.distanceMeters,routes.polyline.encodedPolyline',
+        body: {
+            origin: { location: { latLng: { latitude: fromLat, longitude: fromLng } } },
+            destination: { location: { latLng: { latitude: toLat, longitude: toLng } } },
+            travelMode
+        }
+    });
+}
+
+/* ------------------------------------------------------------ photographs -- */
+
+/**
+ * Photo REFERENCES for a place — not the bytes.
+ *
+ * Two steps on purpose: references are cheap and reusable, the media fetch is
+ * the expensive half. `authorAttributions` is requested because Google's terms
+ * make displaying it mandatory, so a reference without it is unusable and must
+ * not be treated as a result.
+ */
+async function placePhotos({ query, limit = 5 } = {}) {
+    const res = await call('https://places.googleapis.com/v1/places:searchText', {
+        method: 'POST',
+        fieldMask: 'places.id,places.displayName,places.photos',
+        body: { textQuery: String(query || ''), maxResultCount: Math.min(10, Math.max(1, limit)) }
+    });
+    if (!res.ok) return res;
+    const place = res.data?.places?.[0];
+    return {
+        ok: true,
+        data: {
+            placeName: place?.displayName?.text || null,
+            photos: (place?.photos || []).slice(0, limit).map((p) => ({
+                name: p.name,
+                widthPx: p.widthPx,
+                heightPx: p.heightPx,
+                attributions: (p.authorAttributions || []).map((a) => ({
+                    displayName: a.displayName, uri: a.uri, photoUri: a.photoUri
+                }))
+            }))
+        }
+    };
+}
+
+/**
+ * The bytes for one photo reference, as a data URI.
+ *
+ * Base64 rather than handing the renderer a URL, because that URL carries the
+ * API key. Same reason staticMap does it.
+ */
+async function placePhotoMedia({ photoName, maxWidthPx = 1200 } = {}) {
+    if (!key()) return { ok: false, reason: 'no-key' };
+    /* The reference comes back from Google, but it is still a path segment
+       built into a URL — anything shaped unlike a photo reference is refused
+       rather than fetched. */
+    if (!/^places\/[\w-]+\/photos\/[\w-]+$/.test(String(photoName || ''))) {
+        return { ok: false, reason: 'bad-photo-reference' };
+    }
+    const width = Math.min(4800, Math.max(64, Number(maxWidthPx) || 1200));
+    try {
+        const res = await fetch(
+            `https://places.googleapis.com/v1/${photoName}/media?maxWidthPx=${width}&key=${encodeURIComponent(key())}`,
+            { redirect: 'follow', signal: AbortSignal.timeout(TIMEOUT_MS) }
+        );
+        if (!res.ok) return { ok: false, reason: `http-${res.status}`, detail: (await res.text()).slice(0, 200) };
+        const buf = Buffer.from(await res.arrayBuffer());
+        const type = res.headers.get('content-type') || 'image/jpeg';
+        return { ok: true, data: { dataUri: `data:${type};base64,${buf.toString('base64')}`, bytes: buf.length } };
+    } catch (error) {
+        return { ok: false, reason: error.name === 'TimeoutError' ? 'timeout' : 'network', detail: error.message };
+    }
+}
+
+/**
+ * A Street View still.
+ *
+ * CALLERS MUST CHECK `streetViewMeta` FIRST — metadata is free and says
+ * whether imagery exists at all, while this endpoint bills for a grey "no
+ * imagery" placeholder just as happily as for a photograph.
+ */
+async function streetViewImage({ lat, lng, heading = 0, pitch = 0, fov = 90, size = '640x400' } = {}) {
+    if (!key()) return { ok: false, reason: 'no-key' };
+    /* Their documented ceiling without the premium plan. */
+    const safeSize = /^\d{2,4}x\d{2,4}$/.test(size) ? size : '640x400';
+    try {
+        const res = await fetch(`${LEGACY}/streetview?${q({
+            location: `${lat},${lng}`, size: safeSize,
+            heading, pitch, fov: Math.min(120, Math.max(1, fov)), key: key()
+        })}`, { signal: AbortSignal.timeout(TIMEOUT_MS) });
+        if (!res.ok) return { ok: false, reason: `http-${res.status}` };
+        const buf = Buffer.from(await res.arrayBuffer());
+        return { ok: true, data: { dataUri: `data:image/jpeg;base64,${buf.toString('base64')}`, bytes: buf.length } };
+    } catch (error) {
+        return { ok: false, reason: error.name === 'TimeoutError' ? 'timeout' : 'network', detail: error.message };
+    }
+}
+
+/* ---------------------------------------------------------------- imagery -- */
+
+/**
+ * Is there Street View here, and how old is it?
+ *
+ * METADATA ONLY, and that is deliberate: the metadata endpoint is free while
+ * fetching the panorama is not, so this answers "is imagery available" without
+ * buying an image nobody asked to see.
+ */
+async function streetViewMeta({ lat, lng } = {}) {
+    return call(`${LEGACY}/streetview/metadata?${q({ location: `${lat},${lng}`, key: key() })}`);
+}
+
+/**
+ * A flat map thumbnail, returned as a data URI.
+ *
+ * Base64 rather than a URL because a URL would carry the API key into the
+ * renderer and into the DOM, which is the exact leak this module exists to
+ * prevent.
+ */
+async function staticMap({ lat, lng, zoom = 12, size = '480x320', mapType = 'roadmap' } = {}) {
+    if (!key()) return { ok: false, reason: 'no-key' };
+    const url = `${LEGACY}/staticmap?${q({
+        center: `${lat},${lng}`, zoom, size, maptype: mapType, scale: 2, key: key()
+    })}`;
+    try {
+        const res = await fetch(url, { signal: AbortSignal.timeout(TIMEOUT_MS) });
+        if (!res.ok) {
+            return { ok: false, reason: `http-${res.status}`, detail: (await res.text()).slice(0, 200) };
+        }
+        const buf = Buffer.from(await res.arrayBuffer());
+        return { ok: true, data: { dataUri: `data:image/png;base64,${buf.toString('base64')}`, bytes: buf.length } };
+    } catch (error) {
+        return { ok: false, reason: error.name === 'TimeoutError' ? 'timeout' : 'network', detail: error.message };
+    }
+}
+
+/* ------------------------------------------------------------------ misc -- */
+
+/**
+ * Everything true at one point, in one call from the renderer's side.
+ *
+ * Settled rather than awaited in series: five sequential round trips is five
+ * chances to stall the fly-to, and one dead endpoint must not withhold the
+ * four that answered. Partial truth is reported as partial, not as failure.
+ */
+async function dossier({ lat, lng } = {}) {
+    const [elev, tz, wx, aq, sv] = await Promise.allSettled([
+        elevation({ lat, lng }), timezone({ lat, lng }),
+        weather({ lat, lng }), airQuality({ lat, lng }), streetViewMeta({ lat, lng })
+    ]);
+    const val = (s) => (s.status === 'fulfilled' && s.value.ok ? s.value.data : null);
+    const why = (s) => (s.status === 'fulfilled' && !s.value.ok ? s.value.reason : null);
+    return {
+        ok: true,
+        data: {
+            elevationM: val(elev)?.results?.[0]?.elevation ?? null,
+            timeZoneId: val(tz)?.timeZoneId ?? null,
+            /* Seconds east of UTC, DST included — enough to render a clock. */
+            utcOffsetSec: val(tz) ? (val(tz).rawOffset ?? 0) + (val(tz).dstOffset ?? 0) : null,
+            temperatureC: val(wx)?.temperature?.degrees ?? null,
+            condition: val(wx)?.weatherCondition?.description?.text ?? null,
+            aqi: val(aq)?.indexes?.[0]?.aqi ?? null,
+            aqiCategory: val(aq)?.indexes?.[0]?.category ?? null,
+            streetViewDate: val(sv)?.date ?? null,
+            /* Which parts did not answer, and why. Absent data is stated, not
+               rendered as a zero. */
+            unavailable: Object.fromEntries(
+                [['elevation', why(elev)], ['timezone', why(tz)], ['weather', why(wx)],
+                ['airQuality', why(aq)], ['streetView', why(sv)]].filter(([, v]) => v)
+            )
+        }
+    };
+}
+
+/* The renderer may only reach these, by name. An unchecked method string from
+   the renderer is an open proxy to anything this module can call. */
+const METHODS = {
+    placesNearby, placesText, placesAutocomplete,
+    geocode, reverseGeocode,
+    elevation, timezone, weather, airQuality, pollen,
+    route, streetViewMeta, staticMap, dossier,
+    placePhotos, placePhotoMedia, streetViewImage
+};
+
+async function invoke(method, params = {}) {
+    const fn = METHODS[method];
+    if (!fn) return { ok: false, reason: 'unknown-method', detail: String(method).slice(0, 40) };
+    return fn(params || {});
+}
+
+module.exports = { invoke, isConfigured, methods: Object.keys(METHODS), ...METHODS };

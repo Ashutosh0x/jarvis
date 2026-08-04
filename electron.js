@@ -283,6 +283,22 @@ function createWindow() {
         mainWindow.loadFile(path.join(__dirname, 'dist/index.html'));
     }
 
+    /* Renderer errors, forwarded to the terminal.
+
+       DevTools cannot be left open here — it breaks the transparent window,
+       which is why the line above is commented out. Without this, a renderer
+       exception is completely invisible: the feature does nothing and there is
+       nowhere to look. Warnings and errors only, so ordinary logging does not
+       drown the process output. */
+    mainWindow.webContents.on('console-message', (event, level, message, line, sourceId) => {
+        if (level < 2) return;              // 0 verbose, 1 info, 2 warning, 3 error
+        const where = sourceId ? ` (${String(sourceId).split('/').pop()}:${line})` : '';
+        console.log(`[renderer:${level === 3 ? 'error' : 'warn'}] ${message}${where}`);
+    });
+    mainWindow.webContents.on('did-fail-load', (e, code, desc, url) => {
+        console.log(`[renderer] failed to load ${url}: ${desc} (${code})`);
+    });
+
     mainWindow.on('closed', () => {
         mainWindow = null;
     });
@@ -1013,6 +1029,173 @@ ipcMain.handle('reveal-in-folder', async (event, requestedPath) => {
         return { success: true, path: target };
     } catch (error) {
         return { success: false, error: error.message };
+    }
+});
+
+/* =========================
+   JARVIS FOUNDRY — 3D modelling through Blender
+
+   The Foundry modules are ES modules and this file is CommonJS, so they are
+   loaded with a dynamic import() and cached. Deliberately lazy: pulling them
+   in at startup would resolve the Blender path and probe Ollama on every
+   launch, including the launches where nobody asks for a 3D model.
+   ========================= */
+let foundryModule = null;
+async function loadFoundry() {
+    if (!foundryModule) {
+        foundryModule = await import('./src/js/services/foundry/foundryService.js');
+    }
+    return foundryModule;
+}
+
+ipcMain.handle('foundry-create', async (event, request = {}) => {
+    try {
+        const { createFromUtterance } = await loadFoundry();
+        const utterance = String(request.utterance || '').trim();
+        if (!utterance) return { ok: false, stage: 'validate', error: 'nothing to build' };
+
+        /* Progress is pushed to the window that asked, not broadcast. A render
+           runs for tens of seconds and the renderer shows it as it happens. */
+        const send = (line) => {
+            if (!event.sender.isDestroyed()) event.sender.send('foundry-status', line);
+        };
+
+        const result = await createFromUtterance(utterance, {
+            onStatus: send,
+            engine: request.engine || null,
+            exportFormat: request.exportFormat || null
+        });
+
+        /* Tell the viewer a job landed, so an open panel moves to it instead of
+           showing a stale render at the exact moment the user is watching. */
+        if (result?.jobId && !event.sender.isDestroyed()) {
+            event.sender.send('foundry-job-complete', { jobId: result.jobId, ok: result.ok === true });
+        }
+        return result;
+    } catch (error) {
+        return { ok: false, stage: 'ipc', error: error.message };
+    }
+});
+
+ipcMain.handle('foundry-jobs', async (event, opts = {}) => {
+    try {
+        const { listJobs, resolveJob } = await import('./src/js/services/foundry/foundryJobs.js');
+        if (opts?.which) {
+            const { jobs, job, reason } = await resolveJob(opts.which);
+            return { ok: true, jobs, selected: job?.jobId ?? null, reason };
+        }
+        return { ok: true, jobs: await listJobs(), selected: null, reason: null };
+    } catch (error) {
+        return { ok: false, jobs: [], error: error.message };
+    }
+});
+
+ipcMain.handle('foundry-image', async (event, jobId) => {
+    try {
+        const { jobImage } = await import('./src/js/services/foundry/foundryJobs.js');
+        return await jobImage(jobId);
+    } catch (error) {
+        return { ok: false, error: error.message };
+    }
+});
+
+/* Globe geo data.
+
+   The renderer CANNOT fetch these itself in the packaged app: the window is
+   loaded with loadFile(), so the page origin is file://, and Chromium blocks
+   fetch() on file:// outright. It works under `npm run dev` (http://localhost)
+   and fails in production — which is how the globe came up with no coastlines
+   at all and looked like nothing had rendered.
+
+   Reading them here through fs sidesteps the scheme entirely and keeps
+   webSecurity on, which disabling it to "fix" this would not. */
+ipcMain.handle('globe-geo', async (event, name) => {
+    try {
+        /* Whitelist by exact filename. The argument arrives from the renderer,
+           and a path joined from an unchecked string is an arbitrary file read. */
+        if (!/^[\w.-]+\.geojson$/.test(String(name || ''))) {
+            return { ok: false, error: 'not a permitted geo asset name' };
+        }
+        /* dist/geo in a build (vite copies publicDir there), static/geo when
+           running from source. Try both rather than guess which we are. */
+        const candidates = [
+            path.join(__dirname, 'dist', 'geo', name),
+            path.join(__dirname, 'static', 'geo', name)
+        ];
+        for (const file of candidates) {
+            try {
+                const text = await fs.readFile(file, 'utf8');
+                return { ok: true, data: JSON.parse(text), from: file };
+            } catch { /* try the next location */ }
+        }
+        return { ok: false, error: `geo asset not found: ${name}` };
+    } catch (error) {
+        return { ok: false, error: error.message };
+    }
+});
+
+/* Google Places (New) — landmark labels for the globe.
+   THE KEY NEVER CROSSES THE BRIDGE. The renderer asks for landmarks near a
+   point and gets names and coordinates back; GOOGLE_MAPS_API_KEY is read here
+   and stays here, which is the same rule the credential vault enforces for
+   every other secret. A renderer that could read the key could also leak it,
+   and this one renders third-party HTML.
+
+   Absent key is a normal state, not an error: the caller falls back to
+   Wikipedia geosearch, which needs no credentials at all. */
+/* Google Maps Platform. The key is read inside googleMaps.js and stays in this
+   process; the renderer sends a method name and parameters and gets data back.
+   Coordinates are validated HERE rather than trusted, because every one of
+   these methods turns them straight into a billed request. */
+const googleMaps = require('./googleMaps');
+
+ipcMain.handle('google-maps', async (event, method, params = {}) => {
+    const p = params || {};
+    for (const field of ['lat', 'lng', 'fromLat', 'fromLng', 'toLat', 'toLng']) {
+        if (p[field] !== undefined && !Number.isFinite(Number(p[field]))) {
+            return { ok: false, reason: 'bad-coordinates', detail: field };
+        }
+    }
+    return googleMaps.invoke(String(method || ''), p);
+});
+
+/* What is available, without revealing whether a key exists by trial and
+   error — the renderer decides which panels to offer from this. */
+ipcMain.handle('google-maps-status', async () => ({
+    configured: googleMaps.isConfigured(),
+    methods: googleMaps.methods
+}));
+
+ipcMain.handle('foundry-mesh', async (event, jobId) => {
+    try {
+        const { jobMesh } = await import('./src/js/services/foundry/foundryJobs.js');
+        return await jobMesh(jobId);
+    } catch (error) {
+        return { ok: false, error: error.message };
+    }
+});
+
+ipcMain.handle('foundry-rebuild', async (event, jobId) => {
+    try {
+        const { rebuildJob } = await import('./src/js/services/foundry/foundryJobs.js');
+        const result = await rebuildJob(jobId);
+        if (result?.jobId && !event.sender.isDestroyed()) {
+            event.sender.send('foundry-job-complete', { jobId: result.jobId, ok: result.ok === true });
+        }
+        return result;
+    } catch (error) {
+        return { ok: false, error: error.message };
+    }
+});
+
+ipcMain.handle('foundry-doctor', async () => {
+    try {
+        const { probeRuntime } = await loadFoundry();
+        const { locateBlender } = await import('./src/js/services/foundry/blenderRuntime.js');
+        const [runtime, blender] = await Promise.all([probeRuntime(), locateBlender()]);
+        return { ok: true, runtime, blender };
+    } catch (error) {
+        return { ok: false, error: error.message };
     }
 });
 

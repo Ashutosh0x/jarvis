@@ -41,6 +41,7 @@ files:
   - companionBridge.js
   - edgarGuard.js
   - googleCalendar.js
+  - googleMaps.js
   - metricStore.js
   - mirrorService.js
   - spotifyService.js

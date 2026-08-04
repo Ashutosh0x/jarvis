@@ -9,6 +9,7 @@ import { routePhoneCommand, targetsPhone, executePhoneTool } from './services/ph
 import { parseMirrorCommand } from './services/mirrorIntent.js';
 import HapticManager from './services/hapticManager.js';
 import { parseSystemCommand, SYSTEM_INTENTS } from './services/systemCommands.js';
+import { parseFoundryCommand, FOUNDRY_ACTIONS } from './services/foundry/foundryIntent.js';
 import ragService from './services/ragService.js';
 import { parseWebSearchQuery, summarizeForSpeech, formatForDisplay } from './services/webSearchIntent.js';
 import reflectionService from './services/reflectionService.js';
@@ -1655,6 +1656,97 @@ class Jarvis {
         const sysCmd = parseSystemCommand(cmd);
         if (sysCmd) return { intent: 'SYSTEM_COMMAND', ...sysCmd };
 
+        /* Foundry — build something in 3D.
+
+           PLACED AFTER the system commands and BEFORE the file operations,
+           and both sides of that matter. "create folder" is a file operation
+           and contains the verb this parser matches on; the parser requires a
+           3D noun as well, so it declines, but the ordering means it never has
+           to be relied on alone.
+
+           The parser is deterministic rather than semantic because building
+           spawns a process and writes files — `write` blast radius, per the
+           rule in capabilities.js. "how would I model a gear" is an embedding
+           neighbour of "model me a gear" and must not build anything. */
+        /* Globe — "show me what's happening in San Francisco".
+
+           PLACED BEFORE FOUNDRY because "show me ..." is a display verb that
+           foundryIntent also inspects; Foundry declines anything without a
+           noun it owns, but the ordering means that guard is never the only
+           thing standing between a map query and a 3D build.
+
+           Deliberately narrow: it needs an explicit globe/map/happening verb
+           AND a place, so "show me the model" and "what's happening with my
+           build" do not fly the camera to a city. */
+        /* STRIP THE TRAILING FRAMING BEFORE LOOKING FOR A PLACE.
+           The extraction pattern is anchored at the end, so the LAST
+           preposition wins — and in "show me bengaluru on map" that is "on",
+           which captured "map" as the place name. Nominatim then resolved
+           "map" to a Ministry of State Assets and the globe flew there.
+           Removing "on the map" / "on the globe" first leaves the sentence the
+           user actually meant; the keyword test still runs against the
+           ORIGINAL text, because that trailing phrase is the very signal that
+           this was a globe request. */
+        const framing = /\s+\b(?:on|in|over|at)\b\s+(?:the\s+)?(?:world\s+)?(?:globe|map|earth|world)\b\s*[.?!]?$/i;
+        const cmdNoFraming = cmd.replace(framing, '').trim();
+        const placePattern = /\b(?:on|to|at|over|in|into|towards?)\s+(?:the\s+)?([a-z][a-z .'-]{1,40}?)\s*[.?!]?$/i;
+        const globeCmd = /\b(?:show|take|fly|zoom|go|bring|point|look)\b/i.test(cmdNoFraming)
+            && /\b(globe|map|earth|world|happening|going on|situation|activity|news|live)\b/i.test(cmd)
+            ? placePattern.exec(cmdNoFraming)?.[1]?.trim()
+            : null;
+        if (globeCmd && window.jarvisGlobe) {
+            return { intent: 'GLOBE_SHOW', place: globeCmd };
+        }
+        /* "Show me San Francisco." No preposition, no globe keyword — the
+           phrasing people actually use, and the pattern above cannot match it
+           without also swallowing "show me the model".
+
+           So this branch does not guess from wording at all: it asks the
+           bundled gazetteer whether the trailing words name a city it knows.
+           A real place answers, "the model" and "my calendar" do not. That is
+           a fact lookup rather than a heuristic, which is why it can afford to
+           be this permissive. Requires a confident hit (>= 0.8) so a fuzzy
+           near-miss cannot hijack an unrelated command. */
+        const bareShow = /^(?:jarvis[,\s]+)?(?:show|display|pull\s+up|bring\s+up|take\s+me\s+to|go\s+to|fly\s+to|zoom\s+(?:in\s+)?to)\s+(?:me\s+|my\s+|us\s+)?(?:jarvis[,\s]+)?(?:the\s+)?([a-z][a-z .'-]{1,40}?)(?:\s+(?:city|globe|map))?\s*[.?!]?$/i.exec(cmdNoFraming);
+        if (bareShow && window.jarvisGlobe?.resolveLocal) {
+            const candidate = bareShow[1].trim();
+            /* WHEN THE USER SAID "ON MAP", THE GAZETTEER DOES NOT GET A VETO.
+               The offline index holds cities only, so gating on it rejected
+               "show me japan on map" and "show me karnataka on map" — a
+               country and a state are not populated places. But that trailing
+               "on map" is the user stating outright that this is a location,
+               which is better evidence than a 162 KB city list. The resolver
+               downstream handles every granularity; if nothing resolves it
+               says so, which is the honest failure.
+
+               Without that phrasing the gate still applies, because "show me
+               the model" must not become a map query. */
+            const saidMap = framing.test(cmd) || /\b(globe|map|earth|world)\b/i.test(cmd);
+            const hit = window.jarvisGlobe.resolveLocal(candidate);
+            if (saidMap || (hit && hit.score >= 0.8)) {
+                return { intent: 'GLOBE_SHOW', place: candidate };
+            }
+        }
+        /* Bare mode toggles. */
+        if (/^(?:jarvis[,\s]+)?(?:show|open|activate|enter)\s+(?:the\s+)?(?:globe|world map|command cent(?:er|re))\b/i.test(cmd)) {
+            return { intent: 'GLOBE_TOGGLE', on: true };
+        }
+        if (/^(?:jarvis[,\s]+)?(?:close|exit|hide|leave)\s+(?:the\s+)?(?:globe|world map|command cent(?:er|re))\b/i.test(cmd)) {
+            return { intent: 'GLOBE_TOGGLE', on: false };
+        }
+
+        const foundryCmd = parseFoundryCommand(cmd);
+        if (foundryCmd) {
+            const intentByAction = {
+                [FOUNDRY_ACTIONS.CREATE]: 'FOUNDRY_CREATE',
+                [FOUNDRY_ACTIONS.SHOW]: 'FOUNDRY_SHOW',
+                [FOUNDRY_ACTIONS.REFINE]: 'FOUNDRY_REFINE',
+                [FOUNDRY_ACTIONS.EXPORT]: 'FOUNDRY_EXPORT',
+                [FOUNDRY_ACTIONS.PRINT]: 'FOUNDRY_PRINT'
+            };
+            return { intent: intentByAction[foundryCmd.action], ...foundryCmd };
+        }
+
         // File Operation Commands
         if (cmd.includes('create folder') || cmd.includes('make folder')) {
             const folderName = cmd.match(/folder (?:named )?([^ ]+)/i)?.[1] || 'NewFolder';
@@ -1835,6 +1927,23 @@ class Jarvis {
                     break;
                 case 'SYSTEM_COMMAND':
                     await this.handleSystemCommand(intent);
+                    break;
+                case 'FOUNDRY_CREATE':
+                    await this.handleFoundryCreate(intent);
+                    break;
+                case 'FOUNDRY_SHOW':
+                    await this.handleFoundryShow(intent);
+                    break;
+                case 'GLOBE_SHOW':
+                    await this.handleGlobeShow(intent);
+                    break;
+                case 'GLOBE_TOGGLE':
+                    await this.handleGlobeToggle(intent);
+                    break;
+                case 'FOUNDRY_REFINE':
+                case 'FOUNDRY_EXPORT':
+                case 'FOUNDRY_PRINT':
+                    await this.handleFoundryUnbuilt(intent);
                     break;
                 case 'EXPORT_MEMORY':
                     await this.handleExportMemory();
@@ -7045,6 +7154,201 @@ class Jarvis {
      * either produced a resolution and a codec or it did not, and there is no
      * useful sentence in between.
      */
+    /* ---------------------------------------------------------------------
+       FOUNDRY — build it in Blender.
+
+       The spoken reply is assembled from what the pipeline actually returned:
+       the object names, the polygon count, the engine, and the device Blender
+       resolved at run time. None of it is phrased in advance, because every
+       one of those can differ from what was asked for — a Cycles request falls
+       back to CPU on a card without a usable compute backend, and saying "on
+       the GPU" then would be a claim this project does not get to make.
+       --------------------------------------------------------------------- */
+    async handleFoundryCreate({ subject, engine, wantsExport }) {
+        const api = window.electronAPI;
+        if (!api?.foundryCreate) {
+            this.speak('The Foundry is not available in this build, Sir.');
+            return;
+        }
+
+        this.haptics.click();
+        this.speak(`Working on ${subject}, Sir. This will take a moment.`);
+
+        /* Progress arrives from the main process as it happens. A render is
+           tens of seconds and silence for that long reads as a hang. */
+        const off = api.onFoundryStatus?.((line) => this.showStatus?.(`Foundry: ${line}`));
+
+        try {
+            const result = await api.foundryCreate({ utterance: subject, engine, exportFormat: wantsExport || null });
+
+            if (!result?.ok) {
+                /* Say which stage failed. "I couldn't do that" is the answer
+                   this project has removed everywhere else it appeared. */
+                const stage = {
+                    runtime: 'the local model is not reachable',
+                    locate: 'Blender is not installed',
+                    plan: 'I could not turn that into a buildable scene',
+                    refused: 'that cannot be built from the shapes I have',
+                    validate: 'the plan it produced was not valid',
+                    timeout: 'Blender ran too long and was stopped',
+                    result: 'Blender exited without producing anything'
+                }[result?.stage] || 'it failed';
+                this.speak(`I could not build that, Sir — ${stage}.`);
+                if (result?.error) this.showStatus?.(`Foundry: ${result.error}`);
+                if (result?.hint) this.showStatus?.(`Foundry: ${result.hint}`);
+                this.haptics.warn();
+                return;
+            }
+
+            const built = result.build || {};
+            const count = built.objects?.length ?? 0;
+            const printable = result.printability
+                ? (result.printability.watertight ? ' It is watertight, so it will slice.' : ' It is not watertight, so it will not slice cleanly yet.')
+                : '';
+
+            this.speak(
+                `Done, Sir. ${count} object${count === 1 ? '' : 's'}, ${built.polygons ?? 0} polygons, rendered with ${built.engine === 'CYCLES' ? 'Cycles' : 'EEVEE'} in ${result.seconds} seconds.${printable}`
+            );
+            this.showStatus?.(`Foundry: ${result.image}`);
+            /* Open the image rather than describe it. The output of this
+               feature is a picture; reading a file path aloud is not a result. */
+            if (result.image && api.revealInFolder) api.revealInFolder(result.image);
+
+            for (const w of built.warnings || []) this.showStatus?.(`Foundry warning: ${w}`);
+        } catch (e) {
+            console.error('Foundry error:', e);
+            this.speak('The Foundry failed, Sir.');
+            this.showStatus?.(`Foundry: ${e.message}`);
+            this.haptics.warn();
+        } finally {
+            off?.();
+        }
+    }
+
+    /* ---------------------------------------------------------------------
+       GLOBE — fly the command centre to a place and report what is there.
+
+       The spoken line is built from what the feeds ACTUALLY returned. "Real-
+       time data active" over an empty feed would be the exact species of
+       claim this project keeps removing: it says how many events there are,
+       or it says there are none.
+       --------------------------------------------------------------------- */
+    async handleGlobeShow({ place }) {
+        const globe = window.jarvisGlobe;
+        if (!globe) {
+            this.speak('The globe view is not available in this build, Sir.');
+            return;
+        }
+
+        this.haptics.click();
+        this.speak(`Bringing up ${place}, Sir.`);
+
+        try {
+            const result = await globe.showLocation(place);
+            if (!result.ok) {
+                this.speak(`I could not place ${place} on the map, Sir.`);
+                this.haptics.warn();
+                return;
+            }
+
+            const { place: found, nearby, source } = result;
+            /* Say where the coordinates came from when they came off the
+               network — the offline index is the normal path and worth
+               distinguishing from a lookup that needed the internet. */
+            if (source === 'nominatim') this.showStatus?.(`Globe: geocoded ${found.name} online`);
+
+            if (nearby.length) {
+                const worst = nearby.reduce((a, b) => ((b.magnitude ?? 0) > (a.magnitude ?? 0) ? b : a));
+                this.speak(
+                    `${found.name}. ${nearby.length} seismic event${nearby.length === 1 ? '' : 's'} within nine hundred kilometres, the largest a magnitude ${(worst.magnitude ?? 0).toFixed(1)} near ${worst.place}.`
+                );
+            } else {
+                this.speak(`${found.name} is on screen, Sir. No significant seismic activity nearby.`);
+            }
+        } catch (e) {
+            console.error('Globe error:', e);
+            this.speak('The globe failed to acquire that location, Sir.');
+            this.haptics.warn();
+        }
+    }
+
+    async handleGlobeToggle({ on }) {
+        const globe = window.jarvisGlobe;
+        if (!globe) {
+            this.speak('The globe view is not available in this build, Sir.');
+            return;
+        }
+        this.haptics.click();
+        globe.setActive(on);
+        /* Keep the orb and the globe mutually exclusive, exactly as F3 does. */
+        for (const m of window.visualizerModes?.meshes || []) if (m) m.visible = !on;
+        this.speak(on ? 'Command centre online, Sir.' : 'Returning to standby, Sir.');
+    }
+
+    /* Show what has already been built.
+
+       `read` effects: it opens a viewer and starts nothing. This is the intent
+       "show me the model" should always have had — from the interaction log of
+       3 Aug 2026 it was routed to CREATE and built a six-polygon cube, because
+       the noun "model" was read as the verb. */
+    async handleFoundryShow({ which }) {
+        if (!window.jarvisFoundry) {
+            this.speak('The Foundry viewer is not available in this build, Sir.');
+            return;
+        }
+
+        this.haptics.click();
+        const info = await window.jarvisFoundry.open(which || { position: 'newest' });
+
+        if (!info || !info.count) {
+            this.speak('Nothing has been built yet, Sir. Ask me to model something and I will show it to you.');
+            return;
+        }
+
+        const job = info.job;
+        /* Say what is on screen, including when it is a failure. Opening a
+           panel silently onto a failed job is the same as claiming success. */
+        if (!job) {
+            this.speak(`I have ${info.count} build${info.count === 1 ? '' : 's'}, Sir, but none of them could be displayed.`);
+            return;
+        }
+
+        if (info.reason) this.showStatus?.(`Foundry: ${info.reason}`);
+
+        if (job.state === 'failed') {
+            this.speak(`The most recent build, ${job.name}, failed at the ${job.stage} stage, Sir. It is on screen.`);
+            return;
+        }
+        if (job.state === 'incomplete') {
+            this.speak(`${job.name} never finished, Sir — there is no render to show.`);
+            return;
+        }
+
+        const printable = job.printability
+            ? (job.printability.watertight ? ' It is watertight.' : ' It is not watertight, so it will not slice cleanly.')
+            : '';
+        this.speak(
+            `Here is ${job.name}, Sir — ${job.objects.length} object${job.objects.length === 1 ? '' : 's'}, ${job.polygons ?? 0} polygons.${printable}`
+        );
+    }
+
+    /* Refine, export and print are recognised and not yet built.
+
+       Saying so is the whole point. A recognised command that gets a plausible
+       sentence instead of an action is the exact bug this codebase has fixed
+       repeatedly — the alarm in 606fa69, the recycle bin on 2 Aug. Recognising
+       it and admitting the gap is honest; describing it as though it happened
+       is not. */
+    async handleFoundryUnbuilt({ intent }) {
+        const what = {
+            FOUNDRY_REFINE: 'refining a model I have already built',
+            FOUNDRY_EXPORT: 'exporting an existing scene on its own',
+            FOUNDRY_PRINT: 'sending a model to a 3D printer'
+        }[intent];
+        this.speak(`I understood that, Sir, but ${what} is not wired up yet. I can build and render something new, and export it in the same step.`);
+        this.haptics.warn();
+    }
+
     async handleMirrorStart() {
         if (!window.jarvisMirror || !window.electronAPI?.mirror) {
             this.speak('Screen mirroring is not available in this build, Sir.');

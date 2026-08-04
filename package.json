@@ -1,6 +1,6 @@
 {
   "name": "@ashutosh0x/jarvis",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "A local-first desktop AI assistant: federated live web search with no API key, semantic capability routing, on-device vision and OCR, neural TTS, live Android screen mirroring with touch control, Spotify search and playback, multimodal feedback, and a self-healing supervisor. Ships as an Electron app and an importable search library.",
   "main": "electron.js",
   "scripts": {
@@ -24,7 +24,10 @@
     "favicons": "node scripts/make-favicons.mjs",
     "icons": "npm run icon && npm run favicons",
     "prepack": "npm run build",
-    "jarvis": "node bin/jarvis.mjs"
+    "jarvis": "node bin/jarvis.mjs",
+    "foundry": "node scripts/foundry.mjs",
+    "foundry:doctor": "node scripts/foundry.mjs doctor",
+    "foundry:install": "node scripts/foundry.mjs install"
   },
   "keywords": [
     "ai",
@@ -128,6 +131,7 @@
     "build/icon.png",
     "autostart.js",
     "googleCalendar.js",
+    "googleMaps.js",
     "electron.js",
     "preload.js",
     "webSearch.js",

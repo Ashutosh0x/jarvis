@@ -194,6 +194,35 @@ export const CAPABILITIES = Object.freeze([
         requires: ['armed'],
         confirmation: true,
         intent: 'COMPUTER_USE'
+    },
+    /* Foundry. `write` rather than `read`, so it is described here and reached
+       through foundryIntent's parser — building spawns a process, writes files
+       and can hold the GPU for minutes. The neighbours that must not build
+       anything ("how would I model a gear", "what is a 3D model") are why. */
+    {
+        name: 'model_3d',
+        description: 'Build a 3D model in Blender from a description, render it, and export it.',
+        examples: [
+            'create a 3d model of a gear and render it',
+            'model me a phone stand',
+            'make a 3d printable bracket with two holes',
+            'build a scene with a glass sphere on a plinth'
+        ],
+        effects: 'write',
+        freshness: FRESHNESS.STATIC,
+        requires: ['blender', 'ollama'],
+        confirmation: false,
+        intent: 'FOUNDRY_CREATE'
+    },
+    {
+        name: 'print_3d',
+        description: 'Slice a model and send it to a 3D printer, which spends filament.',
+        examples: ['3d print that', 'send it to the printer'],
+        effects: 'destructive',
+        freshness: FRESHNESS.STATIC,
+        requires: ['blender', 'printer'],
+        confirmation: true,
+        intent: 'FOUNDRY_PRINT'
     }
 ]);
 

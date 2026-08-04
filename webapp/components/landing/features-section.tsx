@@ -41,6 +41,12 @@ const features = [
   },
   {
     number: "07",
+    title: "A globe that answers",
+    description: "Say \"show me Tokyo\" and the orb becomes a command centre — a dark sphere of glowing amber coastlines, a pin on the target, landmarks on leader lines, live earthquake ripples. Country, state, city, street or building all resolve, and the camera framing is derived from the measured extent of the place rather than a table of zoom levels.",
+    visual: "globe",
+  },
+  {
+    number: "08",
     title: "Private by design",
     description: "No hosted model, no model API keys, no conversation data leaving your disk. Outbound traffic is limited to live-data lookups — a search, a quote, a block — each carrying only the subject of the question. Per-query cost is zero.",
     visual: "security",
@@ -290,6 +296,48 @@ function MirrorVisual() {
   );
 }
 
+function GlobeVisual() {
+  return (
+    <svg viewBox="0 0 200 160" className="w-full h-full">
+      {/* The sphere, drawn as the graticule rather than as a filled ball —
+          the real globe is vectors lit from within, not a rendered planet. */}
+      <circle cx="100" cy="80" r="52" fill="none" stroke="currentColor" strokeWidth="2" />
+      <circle cx="100" cy="80" r="52" fill="currentColor" opacity="0.06" />
+
+      {/* Meridians: ellipses narrowing towards the limb, which is what
+          longitude lines actually do on a sphere seen face-on. */}
+      {[52, 34, 16].map((rx, i) => (
+        <ellipse key={`m${i}`} cx="100" cy="80" rx={rx} ry="52" fill="none"
+          stroke="currentColor" strokeWidth="1" opacity="0.28" />
+      ))}
+      {/* Parallels */}
+      {[-34, -17, 0, 17, 34].map((dy, i) => {
+        const ry = Math.sqrt(Math.max(0, 52 * 52 - dy * dy));
+        return (
+          <line key={`p${i}`} x1={100 - ry} y1={80 + dy} x2={100 + ry} y2={80 + dy}
+            stroke="currentColor" strokeWidth="1" opacity="0.28" />
+        );
+      })}
+
+      {/* Concentric ripples at a live event */}
+      {[0, 1, 2].map((i) => (
+        <circle key={`r${i}`} cx="78" cy="62" r="3" fill="none"
+          stroke="currentColor" strokeWidth="1.5" opacity="0">
+          <animate attributeName="r" values="3;18" dur="3s" begin={`${i}s`} repeatCount="indefinite" />
+          <animate attributeName="opacity" values="0.7;0" dur="3s" begin={`${i}s`} repeatCount="indefinite" />
+        </circle>
+      ))}
+
+      {/* Pin on the target, with its leader line and label rule */}
+      <line x1="122" y1="52" x2="150" y2="34" stroke="currentColor" strokeWidth="1" opacity="0.5" />
+      <line x1="150" y1="34" x2="184" y2="34" stroke="currentColor" strokeWidth="1" opacity="0.5" />
+      <circle cx="122" cy="52" r="3.5" fill="currentColor">
+        <animate attributeName="opacity" values="1;0.4;1" dur="2s" repeatCount="indefinite" />
+      </circle>
+    </svg>
+  );
+}
+
 function AnimatedVisual({ type }: { type: string }) {
   switch (type) {
     case "deploy":
@@ -300,6 +348,8 @@ function AnimatedVisual({ type }: { type: string }) {
       return <CollabVisual />;
     case "mirror":
       return <MirrorVisual />;
+    case "globe":
+      return <GlobeVisual />;
     case "security":
       return <SecurityVisual />;
     default:

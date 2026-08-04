@@ -203,6 +203,7 @@ with touch and keyboard control.
 - [Evaluation](#evaluation)
 - [Android companion](#android-companion)
 - [Screen mirror](#screen-mirror)
+- [Globe](#globe)
 - [Routing](#routing)
 - [Music](#music)
 - [Installation](#installation)
@@ -717,6 +718,7 @@ can read and why one is missing.
 | `HELIUS_API_KEY` | Solana wallets, activity, stablecoin supply | No Solana |
 | `DUNE_API_KEY` | Aggregate analytics: top holders, USD-priced flows | Those queries state the key is needed |
 | `ARKHAM_API_KEY` | Entity labels, spoken with attribution | Addresses stay addresses |
+| `GOOGLE_MAPS_API_KEY` | Globe: country/state/street geocoding, place photos, weather, air quality | Cities only, from the bundled gazetteer; Nominatim, Wikipedia and USGS still work |
 
 Networks are **discovered, not assumed**: each candidate endpoint must return
 the chain ID it claims before it is used. On the free Alchemy tier this
@@ -1232,6 +1234,88 @@ control:
 
 ---
 
+## Globe
+
+Press **F3**, or ask for a place, and the orb becomes a command centre: a dark
+sphere with a glowing amber vector network, a blue pin on the target, labelled
+landmarks on leader lines, and live seismic ripples.
+
+```
+show me Japan on map
+show me Karnataka
+take me to Tokyo
+show me MG Road Bengaluru
+show me what's happening in San Francisco
+```
+
+Country, state, city, street and building all resolve. Full reference:
+**[docs/GLOBE.md](docs/GLOBE.md)**.
+
+### Vectors, not satellite imagery
+
+The plan called for 16 MB of NASA Blue Marble textures. Vectors won on all
+three axes: 2.2 MB of public-domain Natural Earth GeoJSON ships in the repo and
+works offline, lines stay sharp at city zoom where an 8K equirectangular is
+~2 km per pixel, and photoreal reads as Google Earth rather than as a command
+centre.
+
+The globe is a `Group` inside the **orb's existing scene**, driven from the
+existing render loop. One WebGL context, one camera, one `requestAnimationFrame`
+— a second renderer would double GPU buffers for a view only one of which is
+visible.
+
+### Finding a place
+
+Three tiers, cheapest first.
+
+| Tier | Covers | Cost |
+| --- | --- | --- |
+| Bundled gazetteer | ~1,250 cities, 162 KB, offline | free |
+| Google Geocoding v4 | country → state → city → street → building | billed |
+| Nominatim | keyless fallback | free |
+
+Matching is forgiving because speech-to-text is the real input — `sanfrancisco`
+and `san fransico` both resolve — but it is **bounded**. Without a length floor
+on prefix matching, `map` matched **Maputo** and `ku` matched **Kuwait City**,
+both at the exact confidence the intent parser acts on, so *"show me the map"*
+flew the camera to Mozambique. A prefix now needs four characters and half the
+name, and the fuzzy edit budget scales with query length.
+
+### Framing is measured, not tabulated
+
+There is no table mapping *country → zoom level*. Google's v4 response carries a
+`viewport`; the camera distance is derived from the extent it reports — Japan
+measures 3,331 km across, a street 2 km — through one continuous curve. The same
+measurement scales the landmark ring, because ten kilometres around Japan finds
+one suburb of Tokyo and calls it the country.
+
+### Ground truth, and photographs
+
+On arrival, five parallel lookups report what is actually true there:
+
+```
+Delhi: 19:23 local · 28.6°C, light rain · 237 m elevation
+       AQI 48 (Moderate) · street view 2012-11
+```
+
+A field that did not answer is **omitted**, never printed as a zero. Real
+photographs come from Wikipedia and Wikimedia Commons first — both keyless —
+falling back to Places and Street View only where free sources cannot answer,
+with Street View always gated behind its free metadata check. Every image
+carries its attribution, and one whose attribution did not survive the parse is
+dropped rather than shown bare. If nothing has a picture, nothing is shown.
+
+### The key stays in the main process
+
+`GOOGLE_MAPS_API_KEY` is optional — without it the globe runs entirely on
+keyless sources. When present it is read by `googleMaps.js` in the **main
+process** and never crosses the bridge; the renderer sends a whitelisted method
+name and receives data back. Enabling Google also obliges their logo on a
+non-Google map and forbids caching place content, both of which the
+implementation honours.
+
+---
+
 ## Routing
 
 Commands used to be matched by pattern, and every new ability meant another
@@ -1500,7 +1584,13 @@ HELIUS_API_KEY=       # Solana RPC, assets, activity
 
 GOOGLE_CLIENT_ID=     # Calendar and Meet
 GOOGLE_CLIENT_SECRET=
+
+GOOGLE_MAPS_API_KEY=  # globe: geocoding, places, weather, air quality
 ```
+
+`GOOGLE_MAPS_API_KEY` is read only in the main process and never crosses the
+IPC bridge — see [Globe](#globe). Without it the globe runs on the bundled
+gazetteer, Nominatim, Wikipedia and USGS, all keyless.
 
 ### Connecting Google Calendar
 
