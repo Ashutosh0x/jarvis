@@ -7405,6 +7405,25 @@ class Jarvis {
                 return;
             }
             const parts = [`${r.from.name} to ${r.to.name}`, `${Math.round(r.distanceKm)} kilometres`];
+
+            /* REAL flights first when a schedule provider answered. These have
+               a stated origin and destination, so they can be described as the
+               route itself rather than as traffic that happens to be over it. */
+            if (r.scheduled?.length) {
+                const s = r.scheduled;
+                parts.push(`${s.length} flight${s.length === 1 ? '' : 's'} on the ${r.fromAirport.iata} to ${r.toAirport.iata} route`);
+                const airlines = [...new Set(s.map((f) => f.airline).filter(Boolean))].slice(0, 3);
+                if (airlines.length) parts.push(`flown by ${airlines.join(', ')}`);
+                const airborne = s.filter((f) => f.isLive);
+                if (airborne.length) parts.push(`${airborne.length} airborne now`);
+                const delayed = s.filter((f) => (f.departureDelayMin ?? 0) > 15);
+                if (delayed.length) {
+                    parts.push(`${delayed.length} delayed by more than fifteen minutes`);
+                }
+                this.speak(parts.join('. ') + '.');
+                return;
+            }
+
             if (r.flights.length) {
                 parts.push(`${r.flights.length} aircraft over the corridor right now`);
                 const lead = r.flights[0];

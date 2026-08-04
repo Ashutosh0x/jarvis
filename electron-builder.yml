@@ -43,6 +43,7 @@ files:
   - googleCalendar.js
   - googleMaps.js
   - lumaEvents.js
+  - aviation.js
   - metricStore.js
   - mirrorService.js
   - spotifyService.js

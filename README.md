@@ -736,6 +736,7 @@ can read and why one is missing.
 | `ARKHAM_API_KEY` | Entity labels, spoken with attribution | Addresses stay addresses |
 | `GOOGLE_MAPS_API_KEY` | Globe: country/state/street geocoding, place photos, weather, air quality | Cities only, from the bundled gazetteer; Nominatim, Wikipedia and USGS still work |
 | `LUMA_API_KEY` | Globe: events from one Luma calendar (needs Luma Plus) | No events layer; every other globe feature is unaffected |
+| `AVIATIONSTACK_API_KEY` | Globe: real flight routes with origin and destination | Live aircraft still shown from OpenSky, but a route query reports traffic over the corridor rather than named flights |
 
 Networks are **discovered, not assumed**: each candidate endpoint must return
 the chain ID it claims before it is used. On the free Alchemy tier this
@@ -1330,6 +1331,7 @@ dropped rather than shown bare. If nothing has a picture, nothing is shown.
 | OpenSky flights | none | ✅ |
 | NASA FIRMS wildfires | free MAP_KEY | needs key |
 | Luma events | Luma Plus | needs key |
+| Flight routes (AviationStack) | free tier | needs key |
 
 A feed with no credentials reports itself unconfigured **with the reason** and
 never polls. Retrying a request that cannot succeed is how a dead feed comes to
@@ -1622,6 +1624,7 @@ GOOGLE_CLIENT_SECRET=
 
 GOOGLE_MAPS_API_KEY=  # globe: geocoding, places, weather, air quality
 LUMA_API_KEY=         # globe: events from ONE Luma calendar (Luma Plus)
+AVIATIONSTACK_API_KEY= # globe: real flight routes (free tier ~100-500/month)
 ```
 
 `GOOGLE_MAPS_API_KEY` is read only in the main process and never crosses the

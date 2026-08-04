@@ -33,6 +33,7 @@ import { createLandmarkService } from '../services/landmarks.js';
 import { createGoogleServices, describeDossier, cameraDistanceFor } from '../services/googleServices.js';
 import { createPlaceImages } from '../services/placeImages.js';
 import { createDossierPanel } from './dossierPanel.js';
+import { buildAirportIndex, primaryAirport } from '../services/airports.js';
 
 /* Files the code column scrolls through — real modules, not filler.
  *
@@ -138,6 +139,13 @@ export async function createGlobeMode({ scene, camera, renderer }) {
                nobody can see. */
             console.error('Globe: offline place index unavailable —', e.message);
         });
+
+    /* Airports, for turning a city into an IATA code by proximity. Bundled and
+       public domain — see airports.js for why this is not a name table. */
+    let airportIndex = [];
+    loadJson('airports_iata.json')
+        .then((j) => { airportIndex = buildAirportIndex(j); })
+        .catch((e) => console.error('Globe: airport index unavailable —', e.message));
 
     const landmarkService = createLandmarkService();
     const google = createGoogleServices();
@@ -447,6 +455,31 @@ export async function createGlobeMode({ scene, camera, renderer }) {
         markers.addMarker({ lat: from.lat, lng: from.lng, label: labelFor(from.name, from.source), pin: true, boxed: true });
         markers.addMarker({ lat: to.lat, lng: to.lng, label: labelFor(to.name, to.source), pin: true, boxed: true });
 
+        /* REAL ROUTE DATA FIRST, if a schedule provider is configured. This is
+           the only source that knows an aircraft's origin and destination; the
+           corridor below is a fallback that knows neither. Resolving the
+           airports from coordinates rather than a name table is what makes
+           "Delhi" find DEL and "Tokyo" find HND. */
+        let scheduled = [];
+        let fromAirport = null, toAirport = null;
+        if (window.electronAPI?.aviation && airportIndex.length) {
+            fromAirport = primaryAirport(airportIndex, from.lat, from.lng);
+            toAirport = primaryAirport(airportIndex, to.lat, to.lng);
+            if (fromAirport && toAirport) {
+                const r = await window.electronAPI
+                    .aviation('route', { from: fromAirport.iata, to: toAirport.iata })
+                    .catch(() => null);
+                if (r?.ok) {
+                    scheduled = r.data.flights || [];
+                    codeOverlay.log(`aviation.route(${fromAirport.iata} -> ${toAirport.iata}) -> ${scheduled.length} flights`);
+                } else if (r?.reason && r.reason !== 'no-key') {
+                    /* A quota that has run out is a different problem from a
+                       route with no flights, and the user should hear which. */
+                    statusBar.pushAlert(`Flight schedules unavailable — ${r.reason}`, 'alert');
+                }
+            }
+        }
+
         const air = await feeds.flightsAlongRoute(from.lat, from.lng, to.lat, to.lng).catch(() => null);
         const flights = air?.ok ? air.flights : [];
         for (const f of flights.slice(0, 15)) {
@@ -455,7 +488,9 @@ export async function createGlobeMode({ scene, camera, renderer }) {
 
         statusBar.setTarget(
             `${from.name} → ${to.name}`,
-            `${Math.round(separation)} km · ${flights.length} aircraft over the corridor`
+            scheduled.length
+                ? `${Math.round(separation)} km · ${scheduled.length} scheduled flight${scheduled.length === 1 ? '' : 's'}`
+                : `${Math.round(separation)} km · ${flights.length} aircraft over the corridor`
         );
         if (flights.length) {
             /* Stated on screen as well as spoken: the corridor is what is
@@ -464,7 +499,10 @@ export async function createGlobeMode({ scene, camera, renderer }) {
         }
         codeOverlay.log(`showRoute(${from.name} -> ${to.name}) -> ${flights.length} aircraft, ${Math.round(separation)} km`);
 
-        return { ok: true, from, to, distanceKm: separation, flights, arc: !!arc };
+        return {
+            ok: true, from, to, distanceKm: separation, flights, arc: !!arc,
+            scheduled, fromAirport, toAirport
+        };
     }
 
     /* Driven from the existing animate(); this module never starts a loop. */

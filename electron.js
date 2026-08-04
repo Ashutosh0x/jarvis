@@ -1113,7 +1113,11 @@ ipcMain.handle('globe-geo', async (event, name) => {
     try {
         /* Whitelist by exact filename. The argument arrives from the renderer,
            and a path joined from an unchecked string is an arbitrary file read. */
-        if (!/^[\w.-]+\.geojson$/.test(String(name || ''))) {
+        /* .json is permitted alongside .geojson because the bundled airport
+           index is plain JSON, not a FeatureCollection. The extension
+           whitelist is still what stops a path from the renderer becoming an
+           arbitrary file read — it is the traversal guard, not a type check. */
+        if (!/^[\w.-]+\.(geo)?json$/.test(String(name || '')) || String(name).includes('..')) {
             return { ok: false, error: 'not a permitted geo asset name' };
         }
         /* dist/geo in a build (vite copies publicDir there), static/geo when
@@ -1173,6 +1177,14 @@ const lumaEvents = require('./lumaEvents');
 
 ipcMain.handle('luma-events', async (event, method, params = {}) =>
     lumaEvents.invoke(String(method || ''), params || {}));
+
+/* Aviation. OpenSky is free and gives live positions but publishes no origin
+   or destination; a route query needs a schedule provider, and that provider
+   needs a key that stays in this process like every other. */
+const aviation = require('./aviation');
+
+ipcMain.handle('aviation', async (event, method, params = {}) =>
+    aviation.invoke(String(method || ''), params || {}));
 
 ipcMain.handle('foundry-mesh', async (event, jobId) => {
     try {

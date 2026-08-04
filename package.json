@@ -133,6 +133,7 @@
     "googleCalendar.js",
     "googleMaps.js",
     "lumaEvents.js",
+    "aviation.js",
     "electron.js",
     "preload.js",
     "webSearch.js",

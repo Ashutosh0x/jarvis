@@ -15,6 +15,7 @@ import { solarParameters, subsolarPoint, sunDirection, solarAltitude, isDaylight
 import { parseWikiGeosearch, parseGooglePlaces, rankLandmarks, createLandmarkService } from '../landmarks.js';
 import { createGoogleServices, describeDossier, parseGeocode, parseGeocodeV4, spanKmFromViewport, cameraDistanceFor, describeRoute, localTime } from '../googleServices.js';
 import { createPlaceImages, sourcesFor, parseWikipediaSummary, parseWikimediaGeosearch, satelliteImage } from '../placeImages.js';
+import { airportsNear, primaryAirport, buildAirportIndex } from '../airports.js';
 import { createRequire } from 'node:module';
 const _req = createRequire(import.meta.url);
 const { normaliseList } = _req(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..', '..', 'lumaEvents.js'));
@@ -980,6 +981,81 @@ check('a null response does not throw', normaliseList(null).length === 0);
         r.flights[0].snapshotAt === 1785820000 * 1000);
     check('distance from the query point is measured',
         Number.isFinite(r.flights[0].distanceKm));
+}
+
+/* ---------------------------------------------------------- airports */
+
+/* Resolution is BY COORDINATES, not by a city→IATA table. A table fails on the
+   real data: Delhi's airport is filed under "New Delhi" and Tokyo's second
+   under "Narita", so municipality matching found nothing for Delhi and one of
+   Tokyo's two. Proximity finds all of them with no special cases. */
+{
+    let airports = [];
+    try {
+        airports = buildAirportIndex(JSON.parse(
+            readFileSync(path.join(REPO, 'static', 'geo', 'airports_iata.json'), 'utf8')));
+    } catch { console.log('SKIP  airport dataset not present'); }
+
+    if (airports.length) {
+        check('the bundled airport index is usable', airports.length > 2000);
+        check('every entry has an IATA code and coordinates',
+            airports.every((a) => /^[A-Z]{3}$/.test(a.i) && Number.isFinite(a.y) && Number.isFinite(a.x)));
+
+        const cases = [['Bengaluru', 12.97, 77.59, 'BLR'], ['Delhi', 28.63, 77.22, 'DEL'],
+        ['Tokyo', 35.68, 139.65, 'HND'], ['London', 51.5, -0.12, 'LHR'],
+        ['San Francisco', 37.77, -122.42, 'SFO']];
+        for (const [name, lat, lng, want] of cases) {
+            check(`${name} resolves to ${want}`, primaryAirport(airports, lat, lng)?.iata === want);
+        }
+
+        /* A large airport outranks a closer medium one: Delhi has DXN 63 km
+           away, and nobody means DXN. */
+        const delhi = airportsNear(airports, 28.63, 77.22, { limit: 3 });
+        check('a large airport outranks a nearer medium one', delhi[0].iata === 'DEL' && delhi[0].large);
+        check('Tokyo offers both its airports',
+            airportsNear(airports, 35.68, 139.65, { maxKm: 100, limit: 3 })
+                .map((a) => a.iata).join(',').includes('NRT'));
+
+        /* Mid-ocean must return nothing rather than the nearest continent. */
+        check('a point with no airport nearby yields null',
+            primaryAirport(airports, 0, -140) === null);
+        check('bad coordinates yield nothing', airportsNear(airports, NaN, 0).length === 0);
+    }
+}
+
+/* -------------------------------------------------------- aviation API */
+
+/* The route provider is the only source that knows an origin and a
+   destination. Its errors arrive INSIDE a 200, so the body decides. */
+{
+    const { normaliseList, normaliseFlight } = _req(path.resolve(REPO, 'aviation.js'));
+
+    const SAMPLE = {
+        data: [{
+            flight_status: 'active',
+            departure: { iata: 'BLR', airport: 'Kempegowda Intl', scheduled: '2026-08-04T06:00:00+00:00', delay: 12 },
+            arrival: { iata: 'DEL', airport: 'Indira Gandhi Intl', scheduled: '2026-08-04T08:45:00+00:00', delay: null, terminal: '3', gate: '21' },
+            airline: { name: 'IndiGo' },
+            flight: { iata: '6E2314', number: '2314' },
+            live: { latitude: 20.1, longitude: 77.4, altitude: 11000, speed_horizontal: 840, direction: 15, is_ground: false }
+        }, { flight: null, departure: null }]
+    };
+
+    const f = normaliseList(SAMPLE);
+    check('a scheduled flight parses', f.length === 1 && f[0].number === '6E2314');
+    check('origin and destination are carried — the whole point',
+        f[0].from === 'BLR' && f[0].to === 'DEL');
+    check('the airline and status survive', f[0].airline === 'IndiGo' && f[0].status === 'active');
+    check('live position is read when airborne',
+        Math.abs(f[0].lat - 20.1) < 1e-9 && f[0].isLive === true);
+    check('a reported delay is kept', f[0].departureDelayMin === 12);
+    /* null delay is "not reported", not "on time" — they are different claims. */
+    check('an unreported delay stays null, not zero', f[0].arrivalDelayMin === null);
+    check('a malformed record is dropped rather than fatal', normaliseList({ data: [{}] }).length === 0);
+    check('an empty response parses to nothing', normaliseList({ data: [] }).length === 0);
+    check('a null response does not throw', normaliseList(null).length === 0);
+    check('a flight with no live block is not marked live',
+        normaliseFlight({ flight: { iata: 'X1' }, departure: { iata: 'AAA' }, live: null })?.isLive === false);
 }
 
 /* ------------------------------------------------------- event intent */

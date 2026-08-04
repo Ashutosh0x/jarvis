@@ -284,6 +284,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
        write half of that API is not reachable from here. */
     lumaEvents: (method, params) => ipcRenderer.invoke('luma-events', method, params),
     lumaEventsStatus: () => ipcRenderer.invoke('luma-events', 'status', {}),
+    /* Real flight routes — origin and destination, which OpenSky lacks. */
+    aviation: (method, params) => ipcRenderer.invoke('aviation', method, params),
+    aviationStatus: () => ipcRenderer.invoke('aviation', 'status', {}),
     /* Kept as a named shortcut: the landmark ring is the hot path. */
     placesNearby: (opts) => ipcRenderer.invoke('google-maps', 'placesNearby', opts),
     foundryRebuild: (jobId) => ipcRenderer.invoke('foundry-rebuild', jobId),
