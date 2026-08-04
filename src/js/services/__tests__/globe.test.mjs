@@ -1198,5 +1198,47 @@ check('a null response does not throw', normaliseList(null).length === 0);
     check('and from proximity too', vf.near(1, 1, 500).length === 0);
 }
 
+/* ------------------------------------------------------- space weather */
+
+{
+    const { latestKp, ovalRadiusDeg, describeKp, KP_VISIBLE, KP_STORM } =
+        await import('../../components/layers/spaceWeatherLayer.js');
+
+    /* NOAA's product feed shape, verified live — objects with `Kp`, oldest
+       first. The useful reading is the newest one that carries a number. */
+    const feed = [
+        { time_tag: '2026-07-28T00:00:00', Kp: 2.33 },
+        { time_tag: '2026-07-28T03:00:00', Kp: 1.33 },
+        { time_tag: '2026-07-28T06:00:00', Kp: 5.67 }
+    ];
+    check('the newest Kp is taken, not the first', latestKp(feed)?.kp === 5.67);
+    check('and its timestamp is parsed', Number.isFinite(latestKp(feed)?.at));
+    check('a row with no number is skipped',
+        latestKp([{ Kp: 4 }, { time_tag: 'x' }])?.kp === 4);
+    check('an empty feed yields null', latestKp([]) === null);
+    check('a non-array does not throw', latestKp(null) === null);
+
+    /* The oval sits at ~66 degrees magnetic latitude when quiet — 24 from the
+       pole — and moves equatorward as Kp climbs. A radius that did not grow
+       would make every storm look identical. */
+    check('the quiet oval hugs the pole', ovalRadiusDeg(0) === 24);
+    check('and a storm pushes it equatorward', ovalRadiusDeg(9) > ovalRadiusDeg(0));
+    check('growth is monotonic across the scale',
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9].every((k, i, a) => i === 0 || ovalRadiusDeg(k) > ovalRadiusDeg(a[i - 1])));
+    check('out-of-range Kp is clamped rather than extrapolated',
+        ovalRadiusDeg(99) === ovalRadiusDeg(9) && ovalRadiusDeg(-5) === ovalRadiusDeg(0));
+
+    /* NOAA's own G-scale wording, so the app does not invent its own. */
+    check('quiet conditions read as quiet', describeKp(2) === 'quiet');
+    check('Kp 5 is a G1 minor storm', /G1/.test(describeKp(5)));
+    check('Kp 9 is G5 extreme', /G5/.test(describeKp(9)));
+    check('an unknown reading says so', describeKp(NaN) === 'unknown');
+
+    /* Nothing is drawn while quiet — an oval painted at Kp 2 would be
+       decoration, not data. */
+    check('the draw threshold sits above quiet conditions', KP_VISIBLE >= 4);
+    check('and the storm threshold above that', KP_STORM > KP_VISIBLE - 1);
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

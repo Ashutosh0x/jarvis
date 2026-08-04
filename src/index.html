@@ -1020,6 +1020,29 @@
        the only thing in globe mode filling the window, so it is gone rather
        than merely hidden. */
 
+    /* ---- cinematic overlays ------------------------------------------
+       Both are pointer-events:none and sit BELOW the panels but above the
+       canvas, so they tint the globe without ever intercepting a drag. They
+       exist only while globe mode is on. */
+    .crt-scanlines {
+      position: fixed; inset: 0; z-index: 1002; pointer-events: none;
+      background: repeating-linear-gradient(
+        0deg,
+        rgba(0, 0, 0, 0.05) 0px, rgba(0, 0, 0, 0.05) 1px,
+        transparent 1px, transparent 3px
+      );
+      opacity: 0.45;
+      mix-blend-mode: multiply;
+    }
+    .vignette {
+      position: fixed; inset: 0; z-index: 1001; pointer-events: none;
+      background: radial-gradient(ellipse at center,
+        transparent 52%, rgba(0, 0, 0, 0.42) 82%, rgba(0, 0, 0, 0.7) 100%);
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .crt-scanlines { display: none; }
+    }
+
     /* ---- CSS2D label layer ---- */
     .globe-label-layer {
       position: fixed; inset: 0; z-index: 1002;
@@ -1257,6 +1280,23 @@
       letter-spacing: 1px;
       text-shadow: 0 0 8px rgba(56, 189, 248, 0.5), 0 1px 5px rgba(0, 0, 0, 0.9);
     }
+
+    /* Source links: text buttons on the background, no boxes. */
+    .dossier-links {
+      display: flex; flex-wrap: wrap; gap: 6px;
+      margin-top: 14px; padding: 0 2px;
+    }
+    .dossier-link {
+      background: rgba(255, 255, 255, 0.06);
+      border: none; border-radius: 999px;
+      padding: 5px 12px;
+      font-family: 'Rajdhani', sans-serif; font-size: 11.5px; font-weight: 600;
+      letter-spacing: 0.4px;
+      color: rgba(255, 255, 255, 0.72);
+      cursor: pointer;
+      transition: background 160ms ease, color 160ms ease;
+    }
+    .dossier-link:hover { background: rgba(255, 157, 46, 0.18); color: #fff; }
 
     .dossier-flights {
       margin-top: 16px; padding: 0 2px;

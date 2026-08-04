@@ -174,6 +174,24 @@ export function createMarkerLayer({ scene, camera, globeGroup }) {
     function update() {
         const now = performance.now();
 
+        /* LEVEL OF DETAIL.
+           A label that is legible when the camera is close is unreadable
+           clutter when the whole planet is in frame — at that distance a city
+           name is a few pixels of noise over a coastline. Labels fade out past
+           a threshold and the surface dots shrink with distance, so the same
+           markers read at every zoom instead of being tuned for one. */
+        const camDist = camera.position.length();
+        const LABEL_FADE_FROM = GLOBE_RADIUS * 3.2;
+        const LABEL_FADE_TO = GLOBE_RADIUS * 4.4;
+        const lodLabel = camDist <= LABEL_FADE_FROM
+            ? 1
+            : camDist >= LABEL_FADE_TO
+                ? 0
+                : 1 - (camDist - LABEL_FADE_FROM) / (LABEL_FADE_TO - LABEL_FADE_FROM);
+        /* Dots keep a near-constant apparent size rather than dwindling to
+           nothing, which is what makes a far-off pin still findable. */
+        const lodDot = Math.max(0.55, Math.min(1.9, camDist / (GLOBE_RADIUS * 2.4)));
+
         /* Hide anything on the far side. Without this the labels of the
            hemisphere facing away float over the globe and the scene reads as
            flat — it is the single cue that sells the sphere. */
@@ -187,7 +205,10 @@ export function createMarkerLayer({ scene, camera, globeGroup }) {
 
             const age = Math.min(1, (now - m.born) / 420);
             const visible = facing;
-            m.el.style.opacity = visible ? String(age * 0.95) : '0';
+            /* Far-side occlusion AND distance both gate the label; either one
+               reaching zero hides it. */
+            m.el.style.opacity = visible ? String(age * 0.95 * lodLabel) : '0';
+            m.dot.scale.setScalar(lodDot);
             m.el.style.transform = `translate(-50%, -50%) scale(${0.86 + age * 0.14})`;
             m.line.visible = visible;
             m.dot.visible = visible;

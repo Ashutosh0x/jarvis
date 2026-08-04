@@ -37,6 +37,7 @@ import { buildAirportIndex, primaryAirport } from '../services/airports.js';
 import { createSatelliteService } from '../services/satellites.js';
 import { createSatelliteLayer } from './layers/satelliteLayer.js';
 import { createLayerManager } from './globeLayers.js';
+import { createSpaceWeatherLayer, fetchKp } from './layers/spaceWeatherLayer.js';
 import { createLayerPanel } from './layerPanel.js';
 
 /* Files the code column scrolls through — real modules, not filler.
@@ -111,6 +112,14 @@ export function labelFor(name, source) {
 export async function createGlobeMode({ scene, camera, renderer }) {
     const mount = document.body;
 
+    /* Scanlines and vignette. Created once and attached/detached with the
+       mode rather than rebuilt each time — two elements that never change are
+       not worth reallocating. */
+    const scanlines = document.createElement('div');
+    scanlines.className = 'crt-scanlines';
+    const vignette = document.createElement('div');
+    vignette.className = 'vignette';
+
     /* CSS2DRenderer needs its own transparent, click-through layer above the
        WebGL canvas. pointer-events:none on the container and auto on the
        labels themselves, or the whole overlay would swallow the drag that is
@@ -184,6 +193,15 @@ export async function createGlobeMode({ scene, camera, renderer }) {
     const layerManager = createLayerManager({ globe, statusBar, codeOverlay });
     const layerPanel = createLayerPanel(layerManager);
 
+    const spaceWeather = createSpaceWeatherLayer(globe, { statusBar });
+    layerManager.register({
+        id: 'aurora', name: 'Aurora / Kp', category: 'space',
+        layer: spaceWeather,
+        fetchFn: fetchKp,
+        /* NOAA publishes the planetary index every three hours; polling faster
+           asks for a number that has not moved. */
+        pollMs: 15 * 60 * 1000
+    });
     layerManager.register({
         id: 'satellites', name: 'Satellites', category: 'space',
         layer: satelliteLayer,
@@ -268,6 +286,8 @@ export async function createGlobeMode({ scene, camera, renderer }) {
         dossierPanel.setVisible(on);
         labelRenderer.domElement.style.display = on ? 'block' : 'none';
         document.body.classList.toggle('globe-mode', on);
+        if (on) { mount.appendChild(vignette); mount.appendChild(scanlines); }
+        else { scanlines.remove(); vignette.remove(); }
 
         if (on) {
             /* The column is not drawn, so nothing scrolls it. */
@@ -616,6 +636,9 @@ export async function createGlobeMode({ scene, camera, renderer }) {
         statusBar.dispose();
         codeOverlay.dispose();
         dossierPanel.dispose();
+        scanlines.remove();
+        vignette.remove();
+        spaceWeather.dispose();
         layerPanel.dispose();
         layerManager.dispose();
         satelliteLayer.dispose();

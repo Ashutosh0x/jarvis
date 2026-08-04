@@ -50,6 +50,7 @@ export function createDossierPanel({ mount }) {
             <div class="img-dots"></div>
         </div>
         <div class="dossier-data"></div>
+        <div class="dossier-links"></div>
         <div class="dossier-flights"></div>
         <div class="dossier-events"></div>`;
     mount.appendChild(root);
@@ -63,6 +64,7 @@ export function createDossierPanel({ mount }) {
     const dataEl = root.querySelector('.dossier-data');
     const eventsEl = root.querySelector('.dossier-events');
     const flightsEl = root.querySelector('.dossier-flights');
+    const linksEl = root.querySelector('.dossier-links');
 
     let images = [];
     let currentIndex = 0;
@@ -204,9 +206,60 @@ export function createDossierPanel({ mount }) {
         /* --- flights, then events --- */
         renderFlights(flts);
         renderEvents(evts);
+        renderLinks({ name, dossier, flights: flts, events: evts });
 
         /* Slide in */
         requestAnimationFrame(() => root.classList.add('visible'));
+    }
+
+    /**
+     * Where to go for the primary source.
+     *
+     * ONLY LINKS THE PANEL CAN ACTUALLY JUSTIFY are shown. A row of dead
+     * buttons — a satellite link when no satellite is on screen, a flight link
+     * with no callsign to put in it — is chrome pretending to be a feature, so
+     * each is emitted only when its identifier exists.
+     *
+     * Opened through the main process, which validates the URL. The renderer
+     * never hands a raw string to the shell.
+     */
+    function renderLinks({ name, dossier, flights: flts, events: evts }) {
+        if (!linksEl) return;
+        linksEl.innerHTML = '';
+        const links = [];
+
+        const lead = (flts || [])[0];
+        if (lead?.callsign) {
+            links.push(['Flight', `https://www.flightaware.com/live/flight/${encodeURIComponent(String(lead.callsign).trim())}`]);
+        }
+        /* Quakes and fires are regional rather than per-point here, so these
+           go to the map view for the area rather than an event page that this
+           panel has no id for. */
+        if (dossier?.nearestQuakeUrl) links.push(['Quake', dossier.nearestQuakeUrl]);
+        if (name) {
+            links.push(['Wikipedia', `https://en.wikipedia.org/wiki/Special:Search?search=${encodeURIComponent(name)}`]);
+        }
+        if (dossier?.noradId) {
+            links.push(['Satellite', `https://www.n2yo.com/satellite/?s=${encodeURIComponent(dossier.noradId)}`]);
+        }
+        const ev = (evts || [])[0];
+        if (ev?.url) links.push(['Event', ev.url]);
+
+        if (!links.length) { linksEl.style.display = 'none'; return; }
+        linksEl.style.display = '';
+
+        for (const [label, url] of links) {
+            const a = document.createElement('button');
+            a.className = 'dossier-link';
+            a.type = 'button';
+            a.textContent = label;
+            a.setAttribute('aria-label', `Open ${label} source`);
+            a.addEventListener('click', () => {
+                /* Main validates; a failure there is logged there. */
+                window.electronAPI?.openWebsite?.(url);
+            });
+            linksEl.appendChild(a);
+        }
     }
 
     /**
