@@ -1976,6 +1976,9 @@ class Jarvis {
                 case 'GLOBE_ROUTE':
                     await this.handleGlobeRoute(intent);
                     break;
+                case 'GLOBE_SATELLITES':
+                    await this.handleGlobeSatellites(intent);
+                    break;
                 case 'GLOBE_TOGGLE':
                     await this.handleGlobeToggle(intent);
                     break;
@@ -7441,6 +7444,43 @@ class Jarvis {
             this.speak('The globe failed to plot that route, Sir.');
             this.haptics.warn();
         }
+    }
+
+    /* Satellites on the globe, and what is actually up there.
+
+       The count is read from the layer AFTER it loads rather than stated in
+       advance: the number of tracked objects in a CelesTrak group changes, and
+       a figure quoted from memory would be decoration. */
+    async handleGlobeSatellites({ on }) {
+        const globe = window.jarvisGlobe;
+        if (!globe?.satellites) {
+            this.speak('The globe view is not available in this build, Sir.');
+            return;
+        }
+        this.haptics.click();
+        if (!globe.isActive() && on) {
+            globe.setActive(true);
+            for (const m of window.visualizerModes?.meshes || []) if (m) m.visible = false;
+        }
+        if (!on) {
+            await globe.satellites.toggle(false);
+            this.speak('Orbital tracking off, Sir.');
+            return;
+        }
+
+        this.speak('Acquiring orbital elements, Sir.');
+        const ok = await globe.satellites.toggle(true);
+        if (!ok) {
+            this.speak('I could not reach the orbital element service, Sir.');
+            this.haptics.warn();
+            return;
+        }
+        const n = globe.satellites.layer.count();
+        this.speak(
+            n
+                ? `Tracking ${n} objects in orbit, Sir. Positions are propagated live from the current element set.`
+                : 'The element set came back empty, Sir.'
+        );
     }
 
     async handleGlobeToggle({ on }) {

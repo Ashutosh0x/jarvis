@@ -80,7 +80,7 @@
     "electron-updater": "^6.6.2",
     "pdf-to-img": "^6.2.0",
     "qrcode": "^1.5.4",
-    "satellite.js": "^7.1.0",
+    "satellite.js": "^6.0.2",
     "three": "^0.158.0",
     "ws": "^8.21.1"
   },

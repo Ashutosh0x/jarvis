@@ -34,6 +34,8 @@ import { createGoogleServices, describeDossier, cameraDistanceFor } from '../ser
 import { createPlaceImages } from '../services/placeImages.js';
 import { createDossierPanel } from './dossierPanel.js';
 import { buildAirportIndex, primaryAirport } from '../services/airports.js';
+import { createSatelliteService } from '../services/satellites.js';
+import { createSatelliteLayer } from './layers/satelliteLayer.js';
 
 /* Files the code column scrolls through — real modules, not filler.
  *
@@ -147,6 +149,33 @@ export async function createGlobeMode({ scene, camera, renderer }) {
         .then((j) => { airportIndex = buildAirportIndex(j); })
         .catch((e) => console.error('Globe: airport index unavailable —', e.message));
 
+    /* Satellites. The elements are fetched lazily — the first time the layer
+       is switched on — because most sessions never ask for them and CelesTrak
+       does not need pinging for a view nobody opened. */
+    const satelliteService = createSatelliteService();
+    const satelliteLayer = createSatelliteLayer(globe);
+    let satellitesLoaded = false;
+
+    async function setSatellites(on) {
+        if (on && !satellitesLoaded) {
+            statusBar.setTarget(null, 'Acquiring orbital elements...');
+            const r = await satelliteService.load('stations');
+            if (!r.ok) {
+                /* Keyless, so a failure here is a real network or upstream
+                   problem. Saying so beats an empty sky that looks identical
+                   to "no satellites". */
+                statusBar.pushAlert(`Orbital elements unavailable — ${r.reason}`, 'alert');
+                return false;
+            }
+            satelliteLayer.setData(r.sats);
+            satellitesLoaded = true;
+            statusBar.pushAlert(`${r.sats.length} tracked objects in view`, 'alert');
+            codeOverlay.log(`satellites.load('stations') -> ${r.sats.length} elements`);
+        }
+        satelliteLayer.setVisible(on);
+        return on;
+    }
+
     const landmarkService = createLandmarkService();
     const google = createGoogleServices();
     const placeImages = createPlaceImages();
@@ -188,6 +217,7 @@ export async function createGlobeMode({ scene, camera, renderer }) {
         }
 
         globe.setVisible(on);
+        if (!on) satelliteLayer.setVisible(false);
         /* The status bar and code overlay complete the Iron Man command-centre
            aesthetic. The bar shows the target, weather/time dossier and seismic
            alerts; the column scrolls real source code with live log entries. */
@@ -509,6 +539,7 @@ export async function createGlobeMode({ scene, camera, renderer }) {
     function update(dt, audioEnergy) {
         if (!active) return;
         globe.update(dt, audioEnergy);
+        satelliteLayer.update(dt);
         markers.update();
         labelRenderer.render(scene, camera);
     }
@@ -526,6 +557,7 @@ export async function createGlobeMode({ scene, camera, renderer }) {
         statusBar.dispose();
         codeOverlay.dispose();
         dossierPanel.dispose();
+        satelliteLayer.dispose();
         labelRenderer.domElement.remove();
     }
 
@@ -534,6 +566,7 @@ export async function createGlobeMode({ scene, camera, renderer }) {
         toggle: () => setActive(!active),
         isActive: () => active,
         update, showLocation, showRoute, dispose,
+        satellites: { toggle: setSatellites, service: satelliteService, layer: satelliteLayer },
         globe, markers, statusBar, codeOverlay, feeds, landmarks: landmarkService,
         /* SYNCHRONOUS, and that is the whole point: the intent parser runs on
            every utterance and cannot await a geocode to decide whether "show

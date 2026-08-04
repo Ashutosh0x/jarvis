@@ -1207,6 +1207,15 @@
       color: rgba(255, 255, 255, 0.3); font-size: 14px;
     }
     /* Data rows */
+    /* Satellites: cool white, small. They are numerous and constantly moving,
+       so anything warmer or larger competes with the amber network below. */
+    .globe-label.kind-satellite {
+      color: rgba(190, 235, 255, 0.9);
+      font-size: 10px;
+      letter-spacing: 1.5px;
+      text-shadow: 0 0 9px rgba(111, 211, 255, 0.6), 0 1px 5px rgba(0, 0, 0, 0.9);
+    }
+
     /* ---- events on the dossier, and their markers ----------------------
        Magenta, because amber is the vector network and orange is a wildfire.
        An event that reads as a fire is worse than no colour coding at all. */
