@@ -1,0 +1,430 @@
+{
+  "note": "Named companies to resolve to head-office coordinates. NAMES AND COUNTRY HINTS ONLY. No valuations, revenues or market caps are carried here: the source document they came from was OCR'd and its figures arrived corrupted ('$350.08-$375.08', '578 annualized settlement', '$1.048 net profit'), so any number taken from it would be fabricated data on a map. Coordinates are resolved live and validated against the country hint; nothing here is a coordinate until the resolver proves one.",
+  "hintPurpose": "The country hint is BOTH a search term and a verification target. Measured: a bare 'Citadel' is location-biased to the caller's own region and returned eight Bengaluru apartments; 'Joho Technology' with a Japan hint correctly refused a same-named firm in Auckland.",
+  "companies": [
+    {
+      "name": "Citadel Securities",
+      "country": "USA",
+      "category": "hft"
+    },
+    {
+      "name": "Jane Street Capital",
+      "country": "USA",
+      "category": "hft"
+    },
+    {
+      "name": "Jump Trading",
+      "country": "USA",
+      "category": "hft"
+    },
+    {
+      "name": "Hudson River Trading",
+      "country": "USA",
+      "category": "hft"
+    },
+    {
+      "name": "Virtu Financial",
+      "country": "USA",
+      "category": "hft"
+    },
+    {
+      "name": "DRW Trading",
+      "country": "USA",
+      "category": "hft"
+    },
+    {
+      "name": "Tower Research Capital",
+      "country": "USA",
+      "category": "hft"
+    },
+    {
+      "name": "Two Sigma Investments",
+      "country": "USA",
+      "category": "hft"
+    },
+    {
+      "name": "Susquehanna International Group",
+      "country": "USA",
+      "category": "hft"
+    },
+    {
+      "name": "Quantlab Financial",
+      "country": "USA",
+      "category": "hft"
+    },
+    {
+      "name": "Akuna Capital",
+      "country": "USA",
+      "category": "hft"
+    },
+    {
+      "name": "Wolverine Trading",
+      "country": "USA",
+      "category": "hft"
+    },
+    {
+      "name": "Chicago Trading Company",
+      "country": "USA",
+      "category": "hft"
+    },
+    {
+      "name": "Old Mission Capital",
+      "country": "USA",
+      "category": "hft"
+    },
+    {
+      "name": "Headlands Technologies",
+      "country": "USA",
+      "category": "hft"
+    },
+    {
+      "name": "Belvedere Trading",
+      "country": "USA",
+      "category": "hft"
+    },
+    {
+      "name": "Peak6 Investments",
+      "country": "USA",
+      "category": "hft"
+    },
+    {
+      "name": "GTS Securities",
+      "country": "USA",
+      "category": "hft"
+    },
+    {
+      "name": "Radix Trading",
+      "country": "USA",
+      "category": "hft"
+    },
+    {
+      "name": "Group One Trading",
+      "country": "USA",
+      "category": "hft"
+    },
+    {
+      "name": "Optiver",
+      "country": "Netherlands",
+      "category": "hft"
+    },
+    {
+      "name": "IMC Trading",
+      "country": "Netherlands",
+      "category": "hft"
+    },
+    {
+      "name": "Flow Traders",
+      "country": "Netherlands",
+      "category": "hft"
+    },
+    {
+      "name": "XTX Markets",
+      "country": "UK",
+      "category": "hft"
+    },
+    {
+      "name": "Qube Research and Technologies",
+      "country": "UK",
+      "category": "hft"
+    },
+    {
+      "name": "Maven Securities",
+      "country": "UK",
+      "category": "hft"
+    },
+    {
+      "name": "Visa",
+      "country": "USA",
+      "category": "payments"
+    },
+    {
+      "name": "Mastercard",
+      "country": "USA",
+      "category": "payments"
+    },
+    {
+      "name": "JPMorgan Chase",
+      "country": "USA",
+      "category": "bank"
+    },
+    {
+      "name": "Citigroup",
+      "country": "USA",
+      "category": "bank"
+    },
+    {
+      "name": "BlackRock",
+      "country": "USA",
+      "category": "asset-manager"
+    },
+    {
+      "name": "HSBC",
+      "country": "UK",
+      "category": "bank"
+    },
+    {
+      "name": "BNY Mellon",
+      "country": "USA",
+      "category": "bank"
+    },
+    {
+      "name": "Standard Chartered",
+      "country": "UK",
+      "category": "bank"
+    },
+    {
+      "name": "Stripe",
+      "country": "USA",
+      "category": "payments"
+    },
+    {
+      "name": "Coinbase",
+      "country": "USA",
+      "category": "crypto"
+    },
+    {
+      "name": "Circle Internet Financial",
+      "country": "USA",
+      "category": "crypto",
+      "query": "Circle Internet Group Boston"
+    },
+    {
+      "name": "Tether",
+      "country": "El Salvador",
+      "category": "crypto",
+      "query": "Tether Operations"
+    },
+    {
+      "name": "Bridge",
+      "country": "USA",
+      "category": "crypto"
+    },
+    {
+      "name": "Chainalysis",
+      "country": "USA",
+      "category": "regtech",
+      "query": "Chainalysis New York"
+    },
+    {
+      "name": "Ondo Finance",
+      "country": "USA",
+      "category": "rwa",
+      "query": "Ondo Finance New York"
+    },
+    {
+      "name": "Fireblocks",
+      "country": "USA",
+      "category": "custody"
+    },
+    {
+      "name": "Securitize",
+      "country": "USA",
+      "category": "rwa"
+    },
+    {
+      "name": "Sumsub",
+      "country": "UK",
+      "category": "regtech"
+    },
+    {
+      "name": "Notabene",
+      "country": "USA",
+      "category": "regtech"
+    },
+    {
+      "name": "Rain Financial",
+      "country": "Bahrain",
+      "category": "gcc",
+      "query": "Rain Bahrain"
+    },
+    {
+      "name": "Tarabut Gateway",
+      "country": "Bahrain",
+      "category": "gcc"
+    },
+    {
+      "name": "CoinMENA",
+      "country": "Bahrain",
+      "category": "gcc",
+      "query": "CoinMENA Bahrain"
+    },
+    {
+      "name": "Hong Kong Monetary Authority",
+      "country": "Hong Kong",
+      "category": "regulator"
+    },
+    {
+      "name": "Securities and Futures Commission",
+      "country": "Hong Kong",
+      "category": "regulator"
+    },
+    {
+      "name": "Hong Kong Exchanges and Clearing",
+      "country": "Hong Kong",
+      "category": "exchange"
+    },
+    {
+      "name": "Cyberport",
+      "country": "Hong Kong",
+      "category": "tech-park"
+    },
+    {
+      "name": "Bank of China Hong Kong",
+      "country": "Hong Kong",
+      "category": "bank"
+    },
+    {
+      "name": "ZA Bank",
+      "country": "Hong Kong",
+      "category": "bank"
+    },
+    {
+      "name": "Animoca Brands",
+      "country": "Hong Kong",
+      "category": "web3"
+    },
+    {
+      "name": "HashKey Group",
+      "country": "Hong Kong",
+      "category": "vatp"
+    },
+    {
+      "name": "OSL Group",
+      "country": "Hong Kong",
+      "category": "vatp"
+    },
+    {
+      "name": "First Digital",
+      "country": "Hong Kong",
+      "category": "crypto"
+    },
+    {
+      "name": "HKVAX",
+      "country": "Hong Kong",
+      "category": "vatp",
+      "query": "Hong Kong Virtual Asset Exchange"
+    },
+    {
+      "name": "OpenZeppelin",
+      "country": "USA",
+      "category": "auditor"
+    },
+    {
+      "name": "Trail of Bits",
+      "country": "USA",
+      "category": "auditor",
+      "query": "Trail of Bits New York"
+    },
+    {
+      "name": "CertiK",
+      "country": "USA",
+      "category": "auditor",
+      "query": "CertiK New York"
+    },
+    {
+      "name": "Halborn",
+      "country": "USA",
+      "category": "auditor",
+      "query": "Halborn Miami"
+    },
+    {
+      "name": "Quantstamp",
+      "country": "USA",
+      "category": "auditor"
+    },
+    {
+      "name": "ChainSecurity",
+      "country": "Switzerland",
+      "category": "auditor"
+    },
+    {
+      "name": "CoinFabrik",
+      "country": "Argentina",
+      "category": "auditor"
+    },
+    {
+      "name": "NCC Group",
+      "country": "UK",
+      "category": "auditor"
+    },
+    {
+      "name": "PeckShield",
+      "country": "China",
+      "category": "auditor"
+    },
+    {
+      "name": "Immunefi",
+      "country": "USA",
+      "category": "auditor"
+    },
+    {
+      "name": "HackerOne",
+      "country": "USA",
+      "category": "auditor",
+      "query": "HackerOne San Francisco"
+    },
+    {
+      "name": "Bugcrowd",
+      "country": "USA",
+      "category": "auditor"
+    },
+    {
+      "name": "Synack",
+      "country": "USA",
+      "category": "auditor",
+      "query": "Synack Redwood City"
+    },
+    {
+      "name": "Ankura Consulting",
+      "country": "USA",
+      "category": "auditor"
+    },
+    {
+      "name": "Deloitte",
+      "country": "UK",
+      "category": "auditor"
+    },
+    {
+      "name": "Ernst and Young",
+      "country": "UK",
+      "category": "auditor"
+    }
+  ],
+  "excluded": {
+    "note": "Deliberately NOT in the list, because pinning them would assert a place that does not exist.",
+    "entries": [
+      {
+        "name": "Drift Protocol",
+        "why": "a DAO / on-chain protocol, no head office"
+      },
+      {
+        "name": "Kelp DAO",
+        "why": "a DAO, no head office"
+      },
+      {
+        "name": "Allbridge",
+        "why": "an on-chain protocol, no head office"
+      },
+      {
+        "name": "Balance Coin",
+        "why": "a token, not a company"
+      },
+      {
+        "name": "BUIDL / USDC / USDT / FDUSD / HKDR / JPMD / VTAP",
+        "why": "products and tokens, not companies — their issuers are already listed"
+      },
+      {
+        "name": "Kinexys, HSBC Orion, Citi Token Services, Multi-Token Network",
+        "why": "divisions of banks already in the list; they share their parent's address"
+      },
+      {
+        "name": "Code4rena",
+        "why": "a competitive audit marketplace, not an office-holding firm"
+      },
+      {
+        "name": "Prescient Assurance",
+        "why": "kept out pending a country hint — too generic a name to resolve safely without one"
+      }
+    ]
+  }
+}

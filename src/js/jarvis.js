@@ -1460,6 +1460,37 @@ class Jarvis {
             return { intent: 'GLOBE_COMPANY_LIST', limit: n ? Number(n[1]) : 0 };
         }
 
+        /* ONE NAMED COMPANY — "show me Citadel on map", "show me about Joho
+           Technology on map in Japan", "where is Infosys headquarters".
+
+           LAST OF THE THREE COMPANY BRANCHES, deliberately. The two above both
+           require the plural word ("companies in Bengaluru", "top 40 companies")
+           and this one must not steal from either, so it runs only after both
+           have declined.
+
+           "on map" or "headquarters" is REQUIRED rather than optional. Without
+           it this pattern would swallow "show me Tokyo" — a place, which the
+           geocoder answers far better than a company search does — and every
+           other bare "show me X" in the app. The map-mode words are what make
+           the intent explicit enough to act on, and they are what the user
+           actually says. */
+        const oneCompany = /\b(?:show|find|locate|pin|display)\b\s+(?:me\s+)?(?:about\s+)?(.+?)\s+(?:on\s+(?:the\s+)?(?:map|globe)|headquarters?|head\s*office|hq)\b(?:\s+(?:in|at|near)\s+(?:the\s+)?([a-z][a-z .'-]{1,40}?))?\s*[.?!]?$/i.exec(cmd)
+            || /\bwhere\s+(?:is|are)\s+(.+?)\s*(?:'s)?\s+(?:headquarters?|head\s*office|hq)\b(?:\s+(?:in|at|near)\s+(?:the\s+)?([a-z][a-z .'-]{1,40}?))?\s*[.?!]?$/i.exec(cmd);
+        if (oneCompany && window.jarvisGlobe?.showCompany) {
+            const who = oneCompany[1].trim();
+            /* A place is not a company. "show me Japan on map" has to keep
+               reaching the geocoder, so anything the offline gazetteer already
+               knows as a place is left alone here. */
+            const asPlace = window.jarvisGlobe.resolveLocal?.(who);
+            if (!asPlace || asPlace.score < 0.8) {
+                return {
+                    intent: 'GLOBE_COMPANY_ONE',
+                    company: who,
+                    place: (oneCompany[2] || '').trim() || null
+                };
+            }
+        }
+
         // Keyboard/window control ("type ...", "press enter", "close notepad").
         // Checked before the system/network matchers so "close chrome" acts on
         // the window rather than being read as a process question.
@@ -2032,6 +2063,9 @@ class Jarvis {
                     break;
                 case 'GLOBE_COMPANY_LIST':
                     await this.handleGlobeCompanyList(intent);
+                    break;
+                case 'GLOBE_COMPANY_ONE':
+                    await this.handleGlobeCompanyOne(intent);
                     break;
                 case 'GLOBE_TOGGLE':
                     await this.handleGlobeToggle(intent);
@@ -7548,6 +7582,44 @@ class Jarvis {
        says how many were drawn versus found — it does not claim to have located
        every company, because a Places search returns the top matches, not a
        registry. */
+    /* One named company, pinned where Google says it is.
+
+       THE REPLY NAMES WHAT WAS FOUND, not what was asked for. "Citadel"
+       resolves to Citadel Federal Credit Union in Pennsylvania before it
+       resolves to the hedge fund, and a map that pins that under the name
+       "Citadel" is asserting something nobody checked. When the matched name
+       differs from the request, the difference is spoken. */
+    async handleGlobeCompanyOne({ company, place }) {
+        const globe = window.jarvisGlobe;
+        if (!globe?.showCompany) {
+            this.speak('The globe view is not available in this build, Sir.');
+            return;
+        }
+        this.haptics.click();
+        this.speak(`Locating ${company}${place ? ` in ${place}` : ''}, Sir.`);
+        if (!globe.isActive()) {
+            for (const m of window.visualizerModes?.meshes || []) if (m) m.visible = false;
+        }
+        try {
+            const r = await globe.showCompany(company, place);
+            if (!r.ok) {
+                /* No pin was drawn, so the reply must not imply one was. */
+                this.speak(r.error || `I could not confirm where ${company} is, Sir.`);
+                this.haptics.warn();
+                return;
+            }
+            const c = r.company;
+            const where = c.address || `${c.lat.toFixed(3)}, ${c.lng.toFixed(3)}`;
+            this.speak(r.note
+                ? `${r.note} Pinned on the globe, Sir.`
+                : `${c.matchedName || company} is at ${where}, Sir.`);
+            this.haptics.ok?.();
+        } catch (e) {
+            this.speak(`That company lookup failed, Sir.`);
+            this.haptics.warn();
+        }
+    }
+
     async handleGlobeCompanies({ companyType, place }) {
         const globe = window.jarvisGlobe;
         if (!globe?.showCompanies) {

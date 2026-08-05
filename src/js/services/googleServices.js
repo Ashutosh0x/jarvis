@@ -644,8 +644,19 @@ export function createGoogleServices({
             lat: hit.lat,
             lng: hit.lng,
             address: hit.address,
+            /* Carried so a pin made from this can open the same photograph card
+               as every other company marker. The candidate always had it; the
+               return shape was simply dropping it on the floor. */
+            placeId: hit.id || null,
             countryCode: hit.countryCode,
             country: country || null,
+            /* What else Google offered, so a caller can say "I found this one,
+               there were N others" instead of presenting one guess as the
+               answer. "Citadel" resolves to a credit union in Pennsylvania
+               before it resolves to the hedge fund. */
+            alternatives: candidates.filter((c) => c !== hit).slice(0, 4).map((c) => ({
+                matchedName: c.matchedName, address: c.address, countryCode: c.countryCode
+            })),
             /* True only when the result's own country came back equal to the
                one requested. A caller that wants to show only confirmed pins
                has the flag to do it with. */

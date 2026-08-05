@@ -384,6 +384,57 @@ routes('remind me about vines1vzrYbzLMRdu58ou5XTby4qAqVRLmqo36NKPTg', null);
         if (hadGlobe === undefined) delete window.jarvisGlobe; else window.jarvisGlobe = hadGlobe;
     }
 
+    /* --- ONE NAMED COMPANY ON THE GLOBE --------------------------------------
+       "show me Citadel on map" reached the PLACE geocoder and went looking for
+       a town called Citadel, because both company branches above require the
+       plural word "companies". This is the third branch, and the risk it
+       carries is theft: it matches a bare name, so it must lose to every
+       existing intent rather than swallow them. */
+    const hadGlobe2 = window.jarvisGlobe;
+    window.jarvisGlobe = {
+        showCompanies() {}, showCompany() {}, showCompanyList() {},
+        /* The real one resolves against the offline gazetteer; a place scoring
+           high here must stay with the geocoder. */
+        resolveLocal: (q) => (/^(tokyo|japan|bengaluru|san francisco|london)$/i.test(q)
+            ? { name: q, score: 1 } : null)
+    };
+    try {
+        check('one-company: "show me Citadel on map" fires',
+            intentOf('show me Citadel on map') === 'GLOBE_COMPANY_ONE',
+            String(intentOf('show me Citadel on map')));
+        check('one-company: the name reaches the handler',
+            parse('show me Citadel on map')?.company === 'citadel',
+            JSON.stringify(parse('show me Citadel on map')));
+        check('one-company: "show me about Joho Technology on map in Japan" carries name AND place',
+            parse('show me about Joho Technology on map in Japan')?.company === 'joho technology'
+            && parse('show me about Joho Technology on map in Japan')?.place === 'japan',
+            JSON.stringify(parse('show me about Joho Technology on map in Japan')));
+        check('one-company: "where is Infosys headquarters" fires',
+            intentOf('where is Infosys headquarters') === 'GLOBE_COMPANY_ONE',
+            String(intentOf('where is Infosys headquarters')));
+
+        /* The theft checks. Each of these worked before this branch existed and
+           has to keep working. */
+        check('one-company: does NOT steal a bare place',
+            intentOf('show me Tokyo on map') !== 'GLOBE_COMPANY_ONE',
+            String(intentOf('show me Tokyo on map')));
+        check('one-company: does NOT steal "companies in a place"',
+            intentOf('show me companies in Tokyo') === 'GLOBE_COMPANIES',
+            String(intentOf('show me companies in Tokyo')));
+        check('one-company: does NOT steal the top-companies list',
+            intentOf('show me the top 40 companies by market cap') === 'GLOBE_COMPANY_LIST',
+            String(intentOf('show me the top 40 companies by market cap')));
+        check('one-company: does NOT steal per-company SEC filings',
+            intentOf('sec filings of google') === 'COMPANY_FILINGS',
+            String(intentOf('sec filings of google')));
+        check('one-company: does NOT fire without a map/HQ word',
+            intentOf('show me Citadel') !== 'GLOBE_COMPANY_ONE',
+            String(intentOf('show me Citadel')));
+    } finally {
+        const hadGlobe = hadGlobe2;
+        if (hadGlobe === undefined) delete window.jarvisGlobe; else window.jarvisGlobe = hadGlobe;
+    }
+
     /* PREDICTION MARKETS — found by routing a live prompt, not by reading the
        regex. "what are the odds the fed cuts rates" reached the MODEL, which
        has no market data and answers with an invented probability. The old

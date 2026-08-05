@@ -74,9 +74,17 @@ const cachePath = (placeId) =>
 
 // ── what to fetch ───────────────────────────────────────────────────────────
 
-const hq = JSON.parse(fs.readFileSync(path.join(ROOT, 'data', 'companies-hq.json'), 'utf8'));
+/* `--named` points this at the hand-supplied list (HFT firms, blockchain and
+   RegTech names) instead of the market-cap ranking. Same cache directory, same
+   place-ID key, so the app cannot tell where a photo came from and does not
+   need to — a building is a building. */
+const NAMED = flag('named');
+const hq = NAMED
+    ? JSON.parse(fs.readFileSync(path.join(ROOT, 'data', 'named-companies.json'), 'utf8'))
+    : JSON.parse(fs.readFileSync(path.join(ROOT, 'data', 'companies-hq.json'), 'utf8'));
 const ranking = JSON.parse(fs.readFileSync(path.join(ROOT, 'data', 'companies-ranking.json'), 'utf8'));
 const rankOf = new Map(ranking.companies.filter((c) => c.ticker).map((c) => [c.ticker, c.rank ?? 1e9]));
+if (NAMED) for (const k of Object.keys(hq.results)) rankOf.set(k, rankOf.get(k) ?? 1);
 
 /* One entry per BUILDING, carrying the best rank of any company in it so
    `--top` means "the buildings the most valuable companies work in". */

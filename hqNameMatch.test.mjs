@@ -76,6 +76,23 @@ check('a shared legal-form suffix is not a match',
 check('a shared prefix of a different word is not a match',
     !ok('Veritone', 'Verizon Corporate Headquarters'));
 
+// ── the prefix half of the concatenation rule ───────────────────────────────
+// `joined.startsWith(t)` is the loosest test in the file: it exists so
+// "Foxconn" can match "Foxconn Industrial Internet", and it was handing 0.9 to
+// anything sharing a first word. "circleinternetfinancial".startsWith("circle")
+// put Circle Internet Financial's head office at Circle & Square on Boylston
+// Street; Trail of Bits landed at "Reliable Bits" in One World Trade Center.
+check('a different business sharing a first word is not a match',
+    !ok('Circle Internet Financial', 'Circle & Square'));
+check('  ... nor one sharing a last word', !ok('Trail of Bits', 'Reliable Bits'));
+check('the shortening the rule exists for still works',
+    ok('Foxconn Industrial Internet', 'Foxconn'));
+check('and concatenation the other way still works',
+    ok('Exxon Mobil', 'ExxonMobil Corporation'));
+check('a genuine shortening keeps matching',
+    ok('Jane Street Capital', 'Jane Street'));
+check('  ... and another', ok('Two Sigma Investments', 'Two Sigma'));
+
 // ── the behaviours the earlier fixes bought, still intact ───────────────────
 check('diacritics still fold', ok('América Móvil', 'America Movil'));
 check('concatenation still matches', ok('Exxon Mobil', 'ExxonMobil Corporation'));

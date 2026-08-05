@@ -298,9 +298,32 @@ function nameAgrees(requested, matched) {
         }
 
         /* CONCATENATION. "Exxon Mobil" is written "ExxonMobil" on the door,
-           and "Foxconn Industrial Internet" answers to "Foxconn". */
+           and "Foxconn Industrial Internet" answers to "Foxconn".
+
+           THE PREFIX HALF OF THIS RULE IS THE LOOSEST TEST IN THE FILE, and it
+           was handing out 0.9 to companies that merely began with the same
+           word. "circleinternetfinancial".startsWith("circle") is true, so
+           "Circle & Square" — a different business on Boylston Street —
+           validated as Circle Internet Financial's head office. "Reliable Bits"
+           took One World Trade Center for Trail of Bits the same way.
+
+           What separates Foxconn from Circle & Square is not the shared prefix,
+           which is identical in both; it is what ELSE the match is called.
+           "Foxconn" adds nothing the company does not have. "& Square" and
+           "Reliable" are distinctive words belonging to somebody else, and a
+           head office does not acquire a stranger's name. So the loose half of
+           the rule is allowed only when the match introduces no distinctive
+           token of its own — the same reasoning that stopped sector words
+           carrying a match on their own. */
         const joined = a.join('');
-        if (b.some((t) => t === joined || t.startsWith(joined) || joined.startsWith(t))) best = Math.max(best, 0.9);
+        const mine = new Set(a);
+        const strangers = b.filter((t) => !GENERIC.has(t) && !mine.has(t)
+            && !joined.includes(t) && !t.includes(joined));
+        if (b.some((t) => t === joined || t.startsWith(joined))) {
+            best = Math.max(best, 0.9);
+        } else if (b.some((t) => joined.startsWith(t)) && !strangers.length) {
+            best = Math.max(best, 0.9);
+        }
 
         /* The company's most distinctive single token appearing in the match is
            weak but real evidence — "Schneider" in "Schneider Electric France".
@@ -321,6 +344,31 @@ function nameAgrees(requested, matched) {
     }
 
     if (!variants.some((v) => v.length)) return { ok: false, score: 0, why: 'no-comparable-tokens' };
+
+    /* TWO NAMES THAT EACH CARRY A WORD THE OTHER LACKS ARE TWO NAMES.
+       "Trail of Bits" against "Reliable Bits" shares exactly `bits` — one of
+       two tokens — and lands on 0.50, which is the threshold, so it validated
+       One World Trade Center as Trail of Bits' office. The shared word is real;
+       so is `trail` missing from the match, and so is `reliable` missing from
+       the company. Neither name is a shortening of the other.
+
+       Applied ONLY to weak evidence. A strong rule firing — an exact match, an
+       acronym, a true concatenation — means the names are already known to be
+       the same thing said differently, and that must not be second-guessed:
+       "QRT" carries a token "Qube Research and Technologies" does not have, and
+       is nonetheless correct. */
+    if (best < 0.6) {
+        const mine = new Set(variants.flat());
+        const joined = variants.map((v) => v.join('')).filter(Boolean);
+        const strangers = b.filter((t) => !GENERIC.has(t) && !mine.has(t)
+            && !joined.some((j) => j.includes(t) || t.includes(j)));
+        const missing = [...mine].filter((t) => !GENERIC.has(t) && !b.includes(t)
+            && !b.some((x) => x.startsWith(t) || t.startsWith(x)));
+        if (strangers.length && missing.length) {
+            return { ok: false, score: Number(best.toFixed(2)), why: 'different-names' };
+        }
+    }
+
     const score = Number(best.toFixed(2));
     return { ok: score >= 0.5, score, why: score >= 0.5 ? null : 'name-mismatch' };
 }

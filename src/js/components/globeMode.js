@@ -896,6 +896,99 @@ export async function createGlobeMode({ scene, camera, renderer }) {
     }
 
     /**
+     * ONE named company, pinned at the coordinates Google actually returned.
+     *
+     * "show me Citadel on map", "show me Joho Technology on map in Japan".
+     *
+     * THIS IS A DIFFERENT QUESTION FROM THE OTHER TWO and needed its own path.
+     * `showCompanies` asks "what companies are HERE" and starts from a place;
+     * `showCompanyList` starts from a list someone already has. Neither can
+     * answer "where is this one company", and the router had no branch for it:
+     * both existing intents require the plural word "companies", so "show me
+     * Citadel on map" fell through to the PLACE geocoder and went looking for a
+     * town called Citadel.
+     *
+     * A PLACE HINT IS WORTH GIVING EVEN WHEN IT IS NOT A COUNTRY. Measured: a
+     * bare "Citadel" is location-biased to wherever the caller is and returned
+     * eight Bengaluru apartments and hotels. "Joho Technology" alone finds the
+     * Tokyo office, but the same query with the country also correctly REFUSES
+     * a "Joho Technology" in Auckland. So the hint is appended to the query
+     * either way — it improves recall as a search term — and is additionally
+     * used to verify the country when it maps to one.
+     *
+     * WHAT IS FOUND IS NAMED, NOT ASSUMED. Google's best answer for "Citadel
+     * corporate headquarters" is Citadel Federal Credit Union in Exton,
+     * Pennsylvania — a real company, and almost certainly not the one meant.
+     * The pin therefore carries the name Google matched rather than the name
+     * asked for, the reply says which one it found, and the alternatives are
+     * reported so the question can be narrowed. Pinning it under the requested
+     * name would be the map asserting something nobody verified.
+     */
+    async function showCompany(name, placeHint = null) {
+        const wanted = String(name || '').trim();
+        if (!wanted) return { ok: false, error: 'no company name' };
+        if (!google.available()) {
+            statusBar.setTarget(null, 'Finding a company needs a Google Maps key.');
+            return { ok: false, error: 'company lookup needs a Google Maps key' };
+        }
+
+        if (!active) setActive(true);
+        markers.clear();
+        globe.clearArcs?.();
+        globe.setAutoRotate(false);
+        statusBar.setTarget(wanted, 'Locating...');
+
+        const hit = await google.resolveCompanyHQ(wanted, placeHint || null).catch(() => null);
+        if (!hit || !Number.isFinite(hit.lat)) {
+            /* No pin at all. A company that could not be confirmed is not
+               placed at a country centroid to make the map look complete —
+               that is the rule the head-office crawl already follows. */
+            statusBar.setTarget(null, `I could not confirm where ${wanted} is.`);
+            return { ok: false, error: `could not confirm where ${wanted} is` };
+        }
+
+        /* A single building, so the frame is the building — not the country it
+           happens to be in. Three kilometres reads as a neighbourhood, which is
+           the scale at which an address means anything. */
+        await globe.flyTo(hit.lat, hit.lng, {
+            distance: cameraDistanceFor(3, globe.radius), ms: 1600
+        });
+
+        markers.addMarker({
+            lat: hit.lat, lng: hit.lng,
+            label: String(hit.matchedName || wanted).toUpperCase(),
+            pin: true, boxed: true, priority: 0,
+            meta: {
+                name: hit.matchedName || wanted,
+                placeId: hit.placeId || null,
+                address: hit.address || null,
+                source: 'google-places',
+                confidence: hit.verified ? 'high' : 'medium'
+            }
+        });
+
+        const differs = hit.matchedName
+            && hit.matchedName.toLowerCase() !== wanted.toLowerCase();
+        const alts = hit.alternatives?.length
+            ? ` ${hit.alternatives.length} other match${hit.alternatives.length === 1 ? '' : 'es'} were returned.`
+            : '';
+        statusBar.setTarget(hit.matchedName || wanted, hit.address || '');
+        codeOverlay.log(`company("${wanted}") -> ${hit.matchedName} @ ${hit.lat.toFixed(4)},${hit.lng.toFixed(4)}`
+            + `${hit.verified ? ' [country verified]' : ''}`);
+
+        return {
+            ok: true,
+            company: hit,
+            /* Said out loud when Google's answer is not the name that was
+               asked for, because that is exactly when the map is most likely
+               to be showing the wrong organisation. */
+            note: differs
+                ? `Found "${hit.matchedName}"${hit.address ? ` at ${hit.address}` : ''}.${alts}`
+                : null
+        };
+    }
+
+    /**
      * A LIST OF NAMED COMPANIES on the globe, each at its own head office.
      *
      * The other company search asks "what is near this point". This one starts
@@ -1214,7 +1307,7 @@ export async function createGlobeMode({ scene, camera, renderer }) {
         setActive,
         toggle: () => setActive(!active),
         isActive: () => active,
-        update, showLocation, showRoute, showCompanies, showCompanyList, dispose,
+        update, showLocation, showRoute, showCompanies, showCompany, showCompanyList, dispose,
         cams: camViewer,
         theme: themeManager,
         satellites: { toggle: setSatellites, service: satelliteService, layer: satelliteLayer },
