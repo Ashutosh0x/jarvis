@@ -99,7 +99,45 @@ function persist(force = false) {
 const STOP = new Set(['the', 'and', 'of', 'co', 'company', 'corp', 'corporation', 'inc',
     'ltd', 'limited', 'plc', 'llc', 'llp', 'sa', 'ag', 'nv', 'bv', 'group', 'holdings',
     'holding', 'international', 'global', 'pvt', 'private', 'pte', 'ab', 'as', 'oy',
-    'gmbh', 'spa', 'se', 'kk', 'the', 'a', 's']);
+    'gmbh', 'spa', 'se', 'kk', 'the', 'a', 's',
+    /* What a BUILDING is called. Google signs an office "X Corporate
+       Headquarters", "X Head Office", "X Tower"; none of those words say
+       anything about which company X is, and leaving them in made the matched
+       name look like it carried distinctive content that it did not. */
+    'corporate', 'headquarters', 'headquarter', 'hq', 'head', 'office', 'offices',
+    'building', 'tower', 'campus', 'center', 'centre', 'plaza', 'house']);
+
+/* INDUSTRY WORDS ARE NOT IDENTIFYING, and treating them as if they were is how
+   twenty unrelated banks ended up at one address.
+
+   STOP above holds LEGAL suffixes. These are SECTOR words, and they are a
+   different problem: they are not noise to be dropped — "Bank of America" needs
+   `bank` to match "Bank of America Corporate Center" — they simply cannot be
+   the ONLY evidence. `First Bancorp`, `S&T Bancorp` and `Hope Bancorp` share
+   `bancorp` with `Southern Bancorp Corporate Headquarters` and with each other,
+   and the weak single-token rule below scored that 0.6 against a 0.5 threshold.
+   Twenty companies from twenty states were pinned to one office in Little Rock,
+   and 2 of the 20 were recorded `high` confidence — so confidence did not catch
+   it either.
+
+   Measured on the committed database: 390 companies sit on 167 shared place
+   IDs, and this rule is what admitted the wrong ones. */
+const GENERIC = new Set([
+    'bancorp', 'bancshares', 'bank', 'banking', 'banc',
+    'financial', 'finance', 'capital', 'trust', 'insurance', 'assurance',
+    'securities', 'investment', 'investments', 'asset', 'management', 'partners',
+    'ventures', 'enterprises', 'industries', 'industrial',
+    'technologies', 'technology', 'systems', 'solutions', 'digital', 'data',
+    'energy', 'resources', 'power', 'electric', 'electronics', 'electronic',
+    'petroleum', 'mining', 'materials', 'chemicals', 'chemical',
+    'pharmaceuticals', 'pharmaceutical', 'pharma', 'biosciences', 'bioscience',
+    'healthcare', 'health', 'medical', 'laboratories',
+    'communications', 'telecom', 'telecommunications', 'media', 'networks',
+    'properties', 'realty', 'estate', 'development', 'construction',
+    'engineering', 'manufacturing', 'services', 'products',
+    'foods', 'beverage', 'retail', 'stores', 'airlines', 'airways',
+    'shipping', 'logistics', 'transport', 'transportation', 'motors', 'automotive'
+]);
 
 /* Diacritics are stripped before comparison. "Itōchū Shōji" and "ITOCHU
    Corporation" are the same company and shared not one token until this
@@ -165,17 +203,38 @@ const DOMICILE_ONLY = new Set(['Bermuda', 'Cayman Islands', 'Jersey', 'Guernsey'
 /** Initials of a token list: "Taiwan Semiconductor Manufacturing" -> "tsm". */
 const initials = (toks) => toks.map((t) => t[0]).join('');
 
+/* A sector word is worth a quarter of a distinctive one, on BOTH sides of the
+   ratio.
+
+   Counting every token equally is what put twenty banks in one building:
+   "First Bancorp" against "Southern Bancorp Corporate Headquarters" shares
+   exactly `bancorp`, scored 1 of 2 tokens = 0.50, and the threshold is 0.50.
+   The match rested entirely on a word that thousands of companies share.
+
+   Weighting the DENOMINATOR too is what keeps this from over-correcting. A
+   company whose name is nothing but sector words is not thereby unmatchable —
+   "Technology Solutions" against "Technology Solutions Ltd" is 0.5/0.5 = 1.00,
+   still a match — it just has to match all of them. Worked through:
+
+     First Bancorp   vs Southern Bancorp HQ   0.25 / 1.25 = 0.20  rejected
+     Southern Bancorp vs Southern Bancorp HQ  1.25 / 1.25 = 1.00  kept
+     Bank of America vs Bank of America Ctr   1.25 / 1.25 = 1.00  kept
+*/
+const weightOf = (t) => (GENERIC.has(t) ? 0.25 : 1);
+
 function overlap(a, b) {
     if (!a.length || !b.length) return 0;
     const setB = new Set(b);
-    let hit = 0;
+    let hit = 0, total = 0;
     for (const t of a) {
-        if (setB.has(t)) { hit++; continue; }
+        const w = weightOf(t);
+        total += w;
+        if (setB.has(t)) { hit += w; continue; }
         /* Prefix match catches "Volkswagen" vs "Volkswagenwerk" and
            "Pepsico" vs "PepsiCo Inc" after case folding. */
-        if (b.some((x) => x.startsWith(t) || t.startsWith(x))) hit += 0.75;
+        if (b.some((x) => x.startsWith(t) || t.startsWith(x))) hit += w * 0.75;
     }
-    return hit / a.length;
+    return total ? hit / total : 0;
 }
 
 function nameAgrees(requested, matched) {
@@ -191,6 +250,27 @@ function nameAgrees(requested, matched) {
 
     const variants = [tokens(bare)];
     if (alias) variants.push(tokens(alias));
+
+    /* A NAME THAT SURVIVES AS NOTHING BUT SECTOR WORDS PROVES NOTHING ON ITS
+       OWN. "S&T Bancorp" folds to `s`, `t`, `bancorp`; the single letters are
+       dropped as noise and what is left is one word thousands of banks share.
+       Weighting alone cannot save this — the ratio is 0.25/0.25 = 1.00, a
+       perfect score, because every token it has did match.
+
+       So when the company name reduces to sector words only, the MATCH is asked
+       whether it is about somebody else: a distinctive token on its side that
+       the company does not have means it is. "Southern" does, so S&T Bancorp is
+       refused Southern Bancorp's building. "Technology Solutions Ltd" does not
+       — `ltd` is a stop word — so a company genuinely called Technology
+       Solutions still finds its own office. */
+    const allSector = variants.every((v) => v.length && v.every((t) => GENERIC.has(t)));
+    if (allSector) {
+        const mine = new Set(variants.flat());
+        const theirs = b.filter((t) => !GENERIC.has(t) && !mine.has(t));
+        if (theirs.length) {
+            return { ok: false, score: 0, why: 'sector-word-only-match' };
+        }
+    }
 
     let best = 0;
     for (const a of variants) {
@@ -223,8 +303,18 @@ function nameAgrees(requested, matched) {
         if (b.some((t) => t === joined || t.startsWith(joined) || joined.startsWith(t))) best = Math.max(best, 0.9);
 
         /* The company's most distinctive single token appearing in the match is
-           weak but real evidence — "Schneider" in "Schneider Electric France". */
-        const longest = a.slice().sort((x, y) => y.length - x.length)[0];
+           weak but real evidence — "Schneider" in "Schneider Electric France".
+
+           DISTINCTIVE IS THE LOAD-BEARING WORD. The token has to identify THIS
+           company, so a sector word is skipped and the next-longest real one is
+           used instead: "First Bancorp" is carried by `first`, never by
+           `bancorp`. When a name is nothing but sector words the rule does not
+           fire at all and the match must be earned by one of the stronger rules
+           above — an exact, acronym or concatenation hit — because there is no
+           distinctive token to reason from. */
+        const longest = a.slice()
+            .filter((t) => !GENERIC.has(t))
+            .sort((x, y) => y.length - x.length)[0];
         if (longest && longest.length >= 5 && b.some((t) => t.includes(longest) || longest.includes(t))) {
             best = Math.max(best, 0.6);
         }

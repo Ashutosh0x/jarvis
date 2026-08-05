@@ -46,6 +46,11 @@ const suites = [
        they 404 the moment the app is released again. Nothing else notices:
        the site builds, the links are well-formed, and only a click reveals it. */
     path.join(root, 'webapp-links.test.mjs'),
+    /* The check that decides whether a company's head office is really its own.
+       It shipped letting twenty unrelated banks share one address in Little
+       Rock, because they all contain the word "Bancorp" and the country check
+       cannot tell two US companies apart. */
+    path.join(root, 'hqNameMatch.test.mjs'),
 ];
 
 /* The answer benchmark's grader is the part of it that can silently lie, so its
