@@ -318,6 +318,69 @@ function localHq({ minConfidence = null } = {}) {
 }
 
 /**
+ * The hand-curated named list — quant funds, HFT firms, banks, the Hong Kong
+ * VATP ecosystem — from disk. FREE, offline, and already validated.
+ *
+ * SEPARATE FROM THE RANKING ON PURPOSE. `localRanking` is 11,222 public
+ * companies keyed by ticker. Almost nothing here has a ticker: Citadel
+ * Securities, Jane Street, Jump and DRW are private, and none of them appear
+ * in the market-cap crawl at all. Merging the two would mean inventing a key
+ * for companies that do not have one.
+ *
+ * Only `status: 'ok'` rows are returned. The rejected ones stay in the file
+ * with their reason — a firm Google could not confirm is absent from the globe
+ * rather than approximated onto it — and a caller that wants to know what was
+ * refused can read the file directly.
+ */
+function localNamed({ category = null, minConfidence = null } = {}) {
+    const file = path.join(__dirname, 'data', 'named-companies.json');
+    try {
+        if (!fs.existsSync(file)) return { ok: true, data: { available: false, reason: 'not-resolved' } };
+        const db = JSON.parse(fs.readFileSync(file, 'utf8'));
+        const RANK = { high: 3, medium: 2, low: 1 };
+        const floor = RANK[minConfidence] || 0;
+        const wanted = category
+            ? (Array.isArray(category) ? category : String(category).split(','))
+                .map((c) => c.trim().toLowerCase())
+            : null;
+
+        const companies = [];
+        const categories = {};
+        let rejected = 0;
+        for (const r of Object.values(db.results || {})) {
+            if (r.status !== 'ok' || !Number.isFinite(r.lat)) { rejected++; continue; }
+            categories[r.category] = (categories[r.category] || 0) + 1;
+            if (wanted && !wanted.includes(String(r.category || '').toLowerCase())) continue;
+            if ((RANK[r.confidence] || 0) < floor) continue;
+            companies.push({
+                name: r.name,
+                lat: r.lat, lng: r.lng,
+                matchedName: r.matchedName,
+                address: r.address,
+                placeId: r.placeId || null,
+                category: r.category,
+                countryCode: r.countryCode,
+                confidence: r.confidence,
+                source: r.source || 'google-places'
+            });
+        }
+        return {
+            ok: true,
+            data: {
+                available: true,
+                updatedAt: db.updatedAt || null,
+                total: companies.length,
+                rejected,
+                categories,
+                companies
+            }
+        };
+    } catch (e) {
+        return { ok: false, reason: 'unreadable', detail: e.message };
+    }
+}
+
+/**
  * A photograph of one company's office, fetched on demand and kept.
  *
  * ON DEMAND IS THE WHOLE DESIGN. Two billed Google requests per company —
@@ -375,7 +438,7 @@ function photoStats() {
     }
 }
 
-const METHODS = { ranking, search, details, metricHistory, localRanking, localHq, companyPhoto, photoStats };
+const METHODS = { ranking, search, details, metricHistory, localRanking, localHq, localNamed, companyPhoto, photoStats };
 
 async function invoke(method, params = {}) {
     const fn = METHODS[method];
@@ -384,6 +447,6 @@ async function invoke(method, params = {}) {
 }
 
 module.exports = {
-    invoke, init, isConfigured, cachedPages, toEntry,
+    invoke, init, isConfigured, cachedPages, toEntry, localNamed,
     methods: Object.keys(METHODS), ...METHODS
 };

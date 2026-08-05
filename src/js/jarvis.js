@@ -1415,6 +1415,34 @@ class Jarvis {
         const companyQ = edgarCompany.parseCompanyFilingsQuery(cmd);
         if (companyQ) return { intent: 'COMPANY_FILINGS', ...companyQ };
 
+        /* THE CURATED LIST — "show me the quant firms", "map the HFT firms",
+           "show me the trading firms on the globe".
+
+           FIRST OF THE COMPANY BRANCHES, because it is the most specific and
+           the others would otherwise take it: "show me quant firms" has no
+           place in it, so the "companies in X" branch declines, but "show me
+           hft firms in london" WOULD match that branch and buy a live Places
+           search for something already sitting on disk, resolved and validated.
+
+           No place, or a place that is really a category, means the local list.
+           It costs nothing and answers instantly. */
+        if (/\b(?:quant(?:itative)?|hft|high[- ]frequency|prop(?:rietary)?|trading|market[- ]?mak\w*)\b/i.test(cmd)
+            && /\b(?:firms?|companies|shops?|houses?|funds?)\b/i.test(cmd)
+            && /\b(?:show|map|plot|display|find|where)\b/i.test(cmd)
+            && window.jarvisGlobe?.showNamedCompanies) {
+            return { intent: 'GLOBE_NAMED_COMPANIES', category: 'hft,quant-hft', label: 'quant and HFT firms' };
+        }
+        if (/\b(?:show|map|plot|display)\b/i.test(cmd)
+            && /\b(?:blockchain|crypto|stablecoin|regtech|web3|vatp)\b/i.test(cmd)
+            && /\b(?:firms?|companies|ecosystem|players?)\b/i.test(cmd)
+            && window.jarvisGlobe?.showNamedCompanies) {
+            return {
+                intent: 'GLOBE_NAMED_COMPANIES',
+                category: 'crypto,rwa,custody,vatp,regtech,web3,gcc,exchange',
+                label: 'the blockchain and RegTech ecosystem'
+            };
+        }
+
         /* COMPANIES ON THE GLOBE — "show software companies in Bengaluru",
            "find AI startups in San Francisco". A coordinate-driven Places
            search draws them on the globe; the adjective before the noun
@@ -2066,6 +2094,9 @@ class Jarvis {
                     break;
                 case 'GLOBE_COMPANY_ONE':
                     await this.handleGlobeCompanyOne(intent);
+                    break;
+                case 'GLOBE_NAMED_COMPANIES':
+                    await this.handleGlobeNamedCompanies(intent);
                     break;
                 case 'GLOBE_TOGGLE':
                     await this.handleGlobeToggle(intent);
@@ -7589,6 +7620,32 @@ class Jarvis {
        resolves to the hedge fund, and a map that pins that under the name
        "Citadel" is asserting something nobody checked. When the matched name
        differs from the request, the difference is spoken. */
+    /* The curated list, drawn from disk. Zero credits, so the reply says so —
+       the other company paths all spend money and it is worth knowing which
+       one just ran. */
+    async handleGlobeNamedCompanies({ category, label }) {
+        const globe = window.jarvisGlobe;
+        if (!globe?.showNamedCompanies) {
+            this.speak('The globe view is not available in this build, Sir.');
+            return;
+        }
+        this.haptics.click();
+        if (!globe.isActive()) {
+            for (const m of window.visualizerModes?.meshes || []) if (m) m.visible = false;
+        }
+        try {
+            const r = await globe.showNamedCompanies(category, { label });
+            if (!r.ok) { this.speak(r.error || 'That list is not available, Sir.'); this.haptics.warn(); return; }
+            const cities = (r.topCities || []).slice(0, 3).map(([c, n]) => `${c} ${n}`).join(', ');
+            this.speak(`${r.shown} ${label || 'companies'} on the globe, Sir.`
+                + (cities ? ` Concentrated in ${cities}.` : ''));
+            this.haptics.ok?.();
+        } catch {
+            this.speak('I could not draw that list, Sir.');
+            this.haptics.warn();
+        }
+    }
+
     async handleGlobeCompanyOne({ company, place }) {
         const globe = window.jarvisGlobe;
         if (!globe?.showCompany) {

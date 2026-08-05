@@ -163,10 +163,24 @@ function buildProviders(query, { braveKey = null } = {}) {
        datacentre traffic. Latencies noted are measured, not advertised. */
     const intents = new Set(detectIntents(raw));
 
+    /* ASKING FOR "LATEST" AND SORTING BY ALL-TIME RELEVANCE ARE DIFFERENT
+       QUESTIONS, and every provider below was asking the second one.
+       "latest news on X" went to Hacker News' relevance-ranked index, which
+       happily returns a canonical thread from 2019 because it is the most
+       discussed — correct for "what is X", useless for "what happened this
+       week". Four of these providers offer a recency-sorted endpoint or
+       parameter for free; none of them were being used.
+
+       Applied ONLY when the query asks for it. A recency sort on "how does
+       TCP slow start work" would replace the best answer with the newest one,
+       which is strictly worse — the canonical Stack Overflow answer to a
+       protocol question is usually a decade old and still right. */
     if (intents.has('code')) {
         providers.push({
             id: 'github',            // 1523ms; 60 req/hr unauthenticated
-            url: `https://api.github.com/search/repositories?q=${q}&per_page=5&sort=stars`,
+            /* `updated` is push recency, which is what "is this still alive"
+               means. `stars` is lifetime popularity and cannot fall. */
+            url: `https://api.github.com/search/repositories?q=${q}&per_page=5&sort=${timely ? 'updated' : 'stars'}`,
             headers: { 'User-Agent': BROWSER_UA, Accept: 'application/vnd.github+json' },
             parse: parseGitHub,
         });
@@ -187,7 +201,9 @@ function buildProviders(query, { braveKey = null } = {}) {
     if (intents.has('academic')) {
         providers.push({
             id: 'arxiv',             // 1973ms, Atom not JSON
-            url: `http://export.arxiv.org/api/query?search_query=all:${q}&max_results=5`,
+            /* arXiv defaults to relevance; a preprint question that says "latest"
+               wants the newest submission, not the most cited. */
+            url: `http://export.arxiv.org/api/query?search_query=all:${q}&max_results=5${timely ? '&sortBy=submittedDate&sortOrder=descending' : ''}`,
             headers: { 'User-Agent': BROWSER_UA, Accept: 'application/atom+xml' },
             parse: parseArxiv,
         });
@@ -205,7 +221,9 @@ function buildProviders(query, { braveKey = null } = {}) {
     if (intents.has('code') || intents.has('discuss')) {
         providers.push({
             id: 'stackoverflow',     // 1555ms
-            url: `https://api.stackexchange.com/2.3/search/advanced?order=desc&sort=relevance&q=${q}&site=stackoverflow&pagesize=5`,
+            /* `creation` is newest-first. StackExchange rejects an unknown sort
+               with a 400, so these two are the only values used. */
+            url: `https://api.stackexchange.com/2.3/search/advanced?order=desc&sort=${timely ? 'creation' : 'relevance'}&q=${q}&site=stackoverflow&pagesize=5`,
             headers: { 'User-Agent': BROWSER_UA, Accept: 'application/json' },
             parse: parseStackExchange,
         });
@@ -214,7 +232,10 @@ function buildProviders(query, { braveKey = null } = {}) {
     if (intents.has('discuss')) {
         providers.push({
             id: 'hackernews',        // 831ms
-            url: `https://hn.algolia.com/api/v1/search?query=${q}&hitsPerPage=5`,
+            /* Algolia ships TWO indices and the path is the switch: `search` is
+               ranked by points and comments, `search_by_date` is strictly
+               reverse-chronological. */
+            url: `https://hn.algolia.com/api/v1/${timely ? 'search_by_date' : 'search'}?query=${q}&hitsPerPage=5`,
             headers: { 'User-Agent': BROWSER_UA, Accept: 'application/json' },
             parse: parseHackerNews,
         });

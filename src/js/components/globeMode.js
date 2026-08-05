@@ -988,6 +988,92 @@ export async function createGlobeMode({ scene, camera, renderer }) {
         };
     }
 
+    /* Category colours. Named rather than a palette index, because the legend
+       in the reply has to say the same thing the dots do. */
+    const NAMED_COLOURS = {
+        'hft': 0x2ce8a0, 'quant-hft': 0x2ce8a0,
+        'bank': 0xffb648, 'payments': 0xffb648, 'asset-manager': 0xffb648,
+        'crypto': 0x8f7bff, 'rwa': 0x8f7bff, 'custody': 0x8f7bff, 'vatp': 0x8f7bff,
+        'regtech': 0x5ac8fa, 'auditor': 0x5ac8fa,
+        'regulator': 0xff5c72, 'exchange': 0xff5c72,
+        'tech-park': 0xffb648, 'web3': 0x8f7bff, 'gcc': 0x8f7bff
+    };
+
+    /**
+     * THE CURATED LIST, drawn from disk — quant funds, HFT firms, banks, the
+     * Hong Kong VATP ecosystem. Free, offline, instant.
+     *
+     * "show me the quant firms", "map the HFT firms".
+     *
+     * WHY THIS IS NOT `showCompanyList`. That one starts from names and buys a
+     * live lookup for each, which is right when the list is new and wrong here:
+     * these 143 were resolved once, validated against country and name, and
+     * committed. Re-resolving them on every request would spend money to learn
+     * something already on disk — the same mistake the head-office layer exists
+     * to avoid.
+     *
+     * Every dot carries its place ID, so clicking one opens the same
+     * photograph card as any other company marker.
+     */
+    async function showNamedCompanies(category = null, { label = null } = {}) {
+        const res = await marketCapBridge?.('localNamed', { category }).catch(() => null);
+        if (!res?.ok || !res.data?.available) {
+            statusBar.setTarget(null, 'The curated company list has not been resolved yet.');
+            return { ok: false, error: 'the curated company list is not on disk' };
+        }
+        const list = res.data.companies || [];
+        if (!list.length) {
+            statusBar.setTarget(null, `No companies in the list for "${category}".`);
+            return { ok: false, error: `nothing in the list matches ${category}` };
+        }
+
+        if (!active) setActive(true);
+        markers.clear();
+        globe.clearArcs?.();
+        globe.setAutoRotate(false);
+
+        const what = label || (category ? String(category).split(',')[0] : 'companies');
+        statusBar.setTarget(what, `${list.length} on the map`);
+
+        for (const c of list) {
+            markers.addMarker({
+                lat: c.lat, lng: c.lng,
+                label: (c.name || '').toUpperCase(),
+                kind: 'company',
+                dotColour: NAMED_COLOURS[c.category] ?? 0x8fa6c4,
+                dotPx: 6,
+                priority: 2,
+                meta: {
+                    name: c.name, placeId: c.placeId, address: c.address,
+                    source: c.source, confidence: c.confidence
+                }
+            });
+        }
+
+        /* Frame what came back rather than the whole planet: a quant-firm query
+           is Chicago, New York, London and Amsterdam, and the camera should sit
+           where that actually is. */
+        const spread = clusterFrame(list, globe.radius);
+        if (spread) await globe.flyTo(spread.lat, spread.lng, { distance: spread.distance, ms: 1600 });
+
+        /* The cities, counted from the resolved addresses rather than asserted,
+           so the spoken summary is a measurement. */
+        const cities = {};
+        for (const c of list) {
+            const m = /,\s*([A-Za-z .'-]+?)(?:,|\s+[A-Z]{2}\b|\s+\d)/.exec(c.address || '');
+            const city = (m?.[1] || c.countryCode || 'unknown').trim();
+            cities[city] = (cities[city] || 0) + 1;
+        }
+        const top = Object.entries(cities).sort((a, b) => b[1] - a[1]).slice(0, 4);
+
+        codeOverlay.log(`named(${category || 'all'}) -> ${list.length} drawn from disk, 0 credits`);
+        return {
+            ok: true, companies: list, shown: list.length,
+            categories: res.data.categories, topCities: top,
+            updatedAt: res.data.updatedAt
+        };
+    }
+
     /**
      * A LIST OF NAMED COMPANIES on the globe, each at its own head office.
      *
@@ -1307,7 +1393,7 @@ export async function createGlobeMode({ scene, camera, renderer }) {
         setActive,
         toggle: () => setActive(!active),
         isActive: () => active,
-        update, showLocation, showRoute, showCompanies, showCompany, showCompanyList, dispose,
+        update, showLocation, showRoute, showCompanies, showCompany, showCompanyList, showNamedCompanies, dispose,
         cams: camViewer,
         theme: themeManager,
         satellites: { toggle: setSatellites, service: satelliteService, layer: satelliteLayer },

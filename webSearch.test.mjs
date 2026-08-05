@@ -156,6 +156,49 @@ const check = (n, c) => { c ? pass++ : fail++; console.log(`${c ? 'PASS' : 'FAIL
     check('providers: query is percent-encoded',
         noKey.every((p) => p.url.includes('rust%20async') || p.url.includes('rust+async')));
 
+    /* RECENCY IS A DIFFERENT QUESTION FROM RELEVANCE, and every specialised
+       provider was asking the second one. "latest X" reached Hacker News'
+       points-ranked index, which returns the most-discussed thread — often
+       years old — rather than what happened this week.
+
+       The switch is gated on the query, because a recency sort is strictly
+       WORSE for a timeless question: the canonical Stack Overflow answer on
+       TCP slow start is a decade old and still correct, and sorting by
+       creation would bury it. */
+    {
+        const urlOf = (ps, id) => ps.find((p) => p.id === id)?.url || '';
+
+        const timeless = buildProviders('how does tcp slow start work library api discussion');
+        const latest = buildProviders('latest discussion on tcp library api 2026');
+
+        check('recency: Hacker News uses the points index for a timeless question',
+            urlOf(timeless, 'hackernews').includes('/api/v1/search?'));
+        check('recency: and the by-date index when the query says latest',
+            urlOf(latest, 'hackernews').includes('/api/v1/search_by_date?'));
+
+        check('recency: Stack Overflow sorts by relevance for a timeless question',
+            urlOf(timeless, 'stackoverflow').includes('sort=relevance'));
+        check('recency: and by creation when the query says latest',
+            urlOf(latest, 'stackoverflow').includes('sort=creation'));
+
+        check('recency: GitHub ranks by stars for a timeless question',
+            urlOf(timeless, 'github').includes('sort=stars'));
+        check('recency: and by last push when the query says latest',
+            urlOf(latest, 'github').includes('sort=updated'));
+
+        const paperOld = buildProviders('paper on transformer attention');
+        const paperNew = buildProviders('latest paper on transformer attention 2026');
+        check('recency: arXiv leaves its default relevance order alone',
+            !urlOf(paperOld, 'arxiv').includes('sortBy='));
+        check('recency: and sorts newest-first when the query says latest',
+            urlOf(paperNew, 'arxiv').includes('sortBy=submittedDate&sortOrder=descending'));
+
+        /* The flag is the one already used to add the news provider, so the
+           two cannot drift apart into disagreeing about what "current" means. */
+        check('recency: a "latest" query still reaches the news provider too',
+            latest.some((p) => p.id === 'google-news'));
+    }
+
     const withKey = buildProviders('x', { braveKey: 'secret' });
     check('providers: Brave leads when a key is configured', withKey[0].id === 'brave');
     check('providers: Brave key travels as a header, not in the URL',

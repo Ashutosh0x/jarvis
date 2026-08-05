@@ -384,6 +384,52 @@ routes('remind me about vines1vzrYbzLMRdu58ou5XTby4qAqVRLmqo36NKPTg', null);
         if (hadGlobe === undefined) delete window.jarvisGlobe; else window.jarvisGlobe = hadGlobe;
     }
 
+    /* --- THE CURATED LIST ----------------------------------------------------
+       143 firms already resolved and committed. This branch must win over the
+       live Places search, because "show me hft firms in london" would otherwise
+       BUY a search for coordinates already on disk. */
+    const hadGlobe0 = window.jarvisGlobe;
+    window.jarvisGlobe = {
+        showCompanies() {}, showCompany() {}, showCompanyList() {}, showNamedCompanies() {},
+        resolveLocal: (q) => (/^(tokyo|japan|london|bengaluru)$/i.test(q) ? { name: q, score: 1 } : null)
+    };
+    try {
+        check('named-list: "show me the quant firms" fires',
+            intentOf('show me the quant firms') === 'GLOBE_NAMED_COMPANIES',
+            String(intentOf('show me the quant firms')));
+        check('named-list: "map the HFT firms" fires',
+            intentOf('map the HFT firms') === 'GLOBE_NAMED_COMPANIES',
+            String(intentOf('map the HFT firms')));
+        check('named-list: "show me high frequency trading firms" fires',
+            intentOf('show me high frequency trading firms') === 'GLOBE_NAMED_COMPANIES',
+            String(intentOf('show me high frequency trading firms')));
+        check('named-list: it carries the categories, not a place',
+            parse('show me the quant firms')?.category === 'hft,quant-hft',
+            JSON.stringify(parse('show me the quant firms')));
+        check('named-list: WINS over the live Places search even with a place',
+            intentOf('show me hft firms in london') === 'GLOBE_NAMED_COMPANIES',
+            String(intentOf('show me hft firms in london')));
+        check('named-list: the blockchain ecosystem is its own category set',
+            parse('show me the blockchain companies')?.category?.includes('vatp'),
+            JSON.stringify(parse('show me the blockchain companies')));
+
+        /* And it must not swallow the generic searches. */
+        check('named-list: does NOT steal "companies in Tokyo"',
+            intentOf('show me companies in Tokyo') === 'GLOBE_COMPANIES',
+            String(intentOf('show me companies in Tokyo')));
+        check('named-list: does NOT steal "software companies in Bengaluru"',
+            intentOf('show software companies in Bengaluru') === 'GLOBE_COMPANIES',
+            String(intentOf('show software companies in Bengaluru')));
+        check('named-list: does NOT steal the top-companies list',
+            intentOf('show me the top 40 companies by market cap') === 'GLOBE_COMPANY_LIST',
+            String(intentOf('show me the top 40 companies by market cap')));
+        check('named-list: does NOT fire on a bare place',
+            intentOf('show me Tokyo on map') !== 'GLOBE_NAMED_COMPANIES',
+            String(intentOf('show me Tokyo on map')));
+    } finally {
+        if (hadGlobe0 === undefined) delete window.jarvisGlobe; else window.jarvisGlobe = hadGlobe0;
+    }
+
     /* --- ONE NAMED COMPANY ON THE GLOBE --------------------------------------
        "show me Citadel on map" reached the PLACE geocoder and went looking for
        a town called Citadel, because both company branches above require the
