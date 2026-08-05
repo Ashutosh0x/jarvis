@@ -388,6 +388,624 @@
       "name": "Ernst and Young",
       "country": "UK",
       "category": "auditor"
+    },
+    {
+      "name": "Two Sigma Securities",
+      "country": "USA",
+      "category": "quant-hft",
+      "query": "Two Sigma Securities New York"
+    },
+    {
+      "name": "XR Trading",
+      "country": "USA",
+      "category": "quant-hft",
+      "query": "XR Trading Chicago"
+    },
+    {
+      "name": "Transmarket Group",
+      "country": "USA",
+      "category": "quant-hft",
+      "query": "TransMarket Group Chicago"
+    },
+    {
+      "name": "Eagle Seven",
+      "country": "USA",
+      "category": "quant-hft",
+      "query": "Eagle Seven Chicago"
+    },
+    {
+      "name": "Geneva Trading",
+      "country": "USA",
+      "category": "quant-hft",
+      "query": "Geneva Trading Chicago"
+    },
+    {
+      "name": "Marquette Partners",
+      "country": "USA",
+      "category": "quant-hft",
+      "query": "Marquette Partners Chicago"
+    },
+    {
+      "name": "Nico Trading",
+      "country": "USA",
+      "category": "quant-hft",
+      "query": "Nico Trading Chicago"
+    },
+    {
+      "name": "Consolidated Trading",
+      "country": "USA",
+      "category": "quant-hft",
+      "query": "Consolidated Trading Chicago"
+    },
+    {
+      "name": "Simplex Trading",
+      "country": "USA",
+      "category": "quant-hft",
+      "query": "Simplex Trading Chicago"
+    },
+    {
+      "name": "Spot Trading",
+      "country": "USA",
+      "category": "quant-hft",
+      "query": "Spot Trading Chicago"
+    },
+    {
+      "name": "DV Trading",
+      "country": "USA",
+      "category": "quant-hft",
+      "query": "DV Trading Chicago"
+    },
+    {
+      "name": "Valkyrie Trading",
+      "country": "USA",
+      "category": "quant-hft",
+      "query": "Valkyrie Trading Chicago"
+    },
+    {
+      "name": "Blue Fire Capital",
+      "country": "USA",
+      "category": "quant-hft",
+      "query": "Blue Fire Capital Chicago"
+    },
+    {
+      "name": "Prime Trading",
+      "country": "USA",
+      "category": "quant-hft",
+      "query": "Prime Trading Chicago"
+    },
+    {
+      "name": "Aardvark Trading",
+      "country": "USA",
+      "category": "quant-hft",
+      "query": "Aardvark Trading Chicago"
+    },
+    {
+      "name": "Allston Trading",
+      "country": "USA",
+      "category": "quant-hft",
+      "query": "Allston Trading Chicago"
+    },
+    {
+      "name": "Walleye Capital",
+      "country": "USA",
+      "category": "quant-hft",
+      "query": "Walleye Capital New York"
+    },
+    {
+      "name": "Cutler Group",
+      "country": "USA",
+      "category": "quant-hft",
+      "query": "Cutler Group San Francisco"
+    },
+    {
+      "name": "Volant Trading",
+      "country": "USA",
+      "category": "quant-hft",
+      "query": "Volant Trading New York"
+    },
+    {
+      "name": "Teza Technologies",
+      "country": "USA",
+      "category": "quant-hft",
+      "query": "Teza Technologies Chicago"
+    },
+    {
+      "name": "Vatic Labs",
+      "country": "USA",
+      "category": "quant-hft",
+      "query": "Vatic Labs New York"
+    },
+    {
+      "name": "Kershner Trading Group",
+      "country": "USA",
+      "category": "quant-hft",
+      "query": "Kershner Trading Austin"
+    },
+    {
+      "name": "Tradebot Systems",
+      "country": "USA",
+      "category": "quant-hft",
+      "query": "Tradebot Systems Kansas City"
+    },
+    {
+      "name": "Sculptor Capital",
+      "country": "USA",
+      "category": "quant-hft",
+      "query": "Sculptor Capital New York"
+    },
+    {
+      "name": "Matrix Executions",
+      "country": "USA",
+      "category": "quant-hft",
+      "query": "Matrix Executions New York"
+    },
+    {
+      "name": "Renaissance Technologies",
+      "country": "USA",
+      "category": "quant-hft",
+      "query": "Renaissance Technologies East Setauket"
+    },
+    {
+      "name": "D. E. Shaw",
+      "country": "USA",
+      "category": "quant-hft",
+      "query": "D. E. Shaw New York"
+    },
+    {
+      "name": "AQR Capital Management",
+      "country": "USA",
+      "category": "quant-hft",
+      "query": "AQR Capital Greenwich"
+    },
+    {
+      "name": "Millennium Management",
+      "country": "USA",
+      "category": "quant-hft",
+      "query": "Millennium Management New York"
+    },
+    {
+      "name": "Point72 Asset Management",
+      "country": "USA",
+      "category": "quant-hft",
+      "query": "Point72 Stamford"
+    },
+    {
+      "name": "Citadel",
+      "country": "USA",
+      "category": "quant-hft",
+      "query": "Citadel LLC Miami"
+    },
+    {
+      "name": "Bridgewater Associates",
+      "country": "USA",
+      "category": "quant-hft",
+      "query": "Bridgewater Associates Westport"
+    },
+    {
+      "name": "PDT Partners",
+      "country": "USA",
+      "category": "quant-hft",
+      "query": "PDT Partners New York"
+    },
+    {
+      "name": "Voleon Group",
+      "country": "USA",
+      "category": "quant-hft",
+      "query": "Voleon Berkeley"
+    },
+    {
+      "name": "WorldQuant",
+      "country": "USA",
+      "category": "quant-hft",
+      "query": "WorldQuant Old Greenwich"
+    },
+    {
+      "name": "Schonfeld Strategic Advisors",
+      "country": "USA",
+      "category": "quant-hft",
+      "query": "Schonfeld New York"
+    },
+    {
+      "name": "Balyasny Asset Management",
+      "country": "USA",
+      "category": "quant-hft",
+      "query": "Balyasny Chicago"
+    },
+    {
+      "name": "ExodusPoint Capital",
+      "country": "USA",
+      "category": "quant-hft",
+      "query": "ExodusPoint New York"
+    },
+    {
+      "name": "Verition Fund Management",
+      "country": "USA",
+      "category": "quant-hft",
+      "query": "Verition Greenwich"
+    },
+    {
+      "name": "Graham Capital Management",
+      "country": "USA",
+      "category": "quant-hft",
+      "query": "Graham Capital Rowayton"
+    },
+    {
+      "name": "Campbell and Company",
+      "country": "USA",
+      "category": "quant-hft",
+      "query": "Campbell and Company Baltimore"
+    },
+    {
+      "name": "Crabel Capital Management",
+      "country": "USA",
+      "category": "quant-hft",
+      "query": "Crabel Capital Milwaukee"
+    },
+    {
+      "name": "Quest Partners",
+      "country": "USA",
+      "category": "quant-hft",
+      "query": "Quest Partners New York"
+    },
+    {
+      "name": "Hutchin Hill",
+      "country": "USA",
+      "category": "quant-hft",
+      "query": "Hutchin Hill New York"
+    },
+    {
+      "name": "Coatue Management",
+      "country": "USA",
+      "category": "quant-hft",
+      "query": "Coatue New York"
+    },
+    {
+      "name": "Da Vinci Derivatives",
+      "country": "Netherlands",
+      "category": "quant-hft",
+      "query": "Da Vinci Derivatives Amsterdam"
+    },
+    {
+      "name": "All Options",
+      "country": "Netherlands",
+      "category": "quant-hft",
+      "query": "All Options Amsterdam"
+    },
+    {
+      "name": "Webb Traders",
+      "country": "Netherlands",
+      "category": "quant-hft",
+      "query": "Webb Traders Amsterdam"
+    },
+    {
+      "name": "Nyenburgh Holding",
+      "country": "Netherlands",
+      "category": "quant-hft",
+      "query": "Nyenburgh Amsterdam"
+    },
+    {
+      "name": "Scientific Trading",
+      "country": "Netherlands",
+      "category": "quant-hft",
+      "query": "Scientific Trading Amsterdam"
+    },
+    {
+      "name": "Mako Group",
+      "country": "UK",
+      "category": "quant-hft",
+      "query": "Mako Group London"
+    },
+    {
+      "name": "GSA Capital",
+      "country": "UK",
+      "category": "quant-hft",
+      "query": "GSA Capital London"
+    },
+    {
+      "name": "Marshall Wace",
+      "country": "UK",
+      "category": "quant-hft",
+      "query": "Marshall Wace London"
+    },
+    {
+      "name": "Man Group",
+      "country": "UK",
+      "category": "quant-hft",
+      "query": "Man Group London"
+    },
+    {
+      "name": "Winton Group",
+      "country": "UK",
+      "category": "quant-hft",
+      "query": "Winton London"
+    },
+    {
+      "name": "Squarepoint Capital",
+      "country": "UK",
+      "category": "quant-hft",
+      "query": "Squarepoint Capital London"
+    },
+    {
+      "name": "Aspect Capital",
+      "country": "UK",
+      "category": "quant-hft",
+      "query": "Aspect Capital London"
+    },
+    {
+      "name": "Florin Court Capital",
+      "country": "UK",
+      "category": "quant-hft",
+      "query": "Florin Court London"
+    },
+    {
+      "name": "Systematica Investments",
+      "country": "Switzerland",
+      "category": "quant-hft",
+      "query": "Systematica Investments Geneva"
+    },
+    {
+      "name": "Capital Fund Management",
+      "country": "France",
+      "category": "quant-hft",
+      "query": "Capital Fund Management Paris"
+    },
+    {
+      "name": "Quantica Capital",
+      "country": "Switzerland",
+      "category": "quant-hft",
+      "query": "Quantica Capital Zurich"
+    },
+    {
+      "name": "Transtrend",
+      "country": "Netherlands",
+      "category": "quant-hft",
+      "query": "Transtrend Rotterdam"
+    },
+    {
+      "name": "Lynx Asset Management",
+      "country": "Sweden",
+      "category": "quant-hft",
+      "query": "Lynx Asset Management Stockholm"
+    },
+    {
+      "name": "Brevan Howard",
+      "country": "UK",
+      "category": "quant-hft",
+      "query": "Brevan Howard London"
+    },
+    {
+      "name": "Liquid Capital",
+      "country": "UK",
+      "category": "quant-hft",
+      "query": "Liquid Capital London"
+    },
+    {
+      "name": "Susquehanna International Securities",
+      "country": "Ireland",
+      "category": "quant-hft",
+      "query": "Susquehanna Dublin"
+    },
+    {
+      "name": "Virtu Financial Ireland",
+      "country": "Ireland",
+      "category": "quant-hft",
+      "query": "Virtu Financial Dublin"
+    },
+    {
+      "name": "Eclipse Trading",
+      "country": "Hong Kong",
+      "category": "quant-hft",
+      "query": "Eclipse Trading Hong Kong"
+    },
+    {
+      "name": "Grasshopper Asia",
+      "country": "Singapore",
+      "category": "quant-hft",
+      "query": "Grasshopper Singapore"
+    },
+    {
+      "name": "Vivienne Court Trading",
+      "country": "Australia",
+      "category": "quant-hft",
+      "query": "Vivienne Court Sydney"
+    },
+    {
+      "name": "Tibra Capital",
+      "country": "Australia",
+      "category": "quant-hft",
+      "query": "Tibra Capital Sydney"
+    },
+    {
+      "name": "Optiver Asia Pacific",
+      "country": "Australia",
+      "category": "quant-hft",
+      "query": "Optiver Sydney"
+    },
+    {
+      "name": "IMC Asia Pacific",
+      "country": "Australia",
+      "category": "quant-hft",
+      "query": "IMC Sydney"
+    },
+    {
+      "name": "Akuna Capital Sydney",
+      "country": "Australia",
+      "category": "quant-hft",
+      "query": "Akuna Capital Sydney"
+    },
+    {
+      "name": "Jump Trading Singapore",
+      "country": "Singapore",
+      "category": "quant-hft",
+      "query": "Jump Trading Singapore"
+    },
+    {
+      "name": "Jane Street Hong Kong",
+      "country": "Hong Kong",
+      "category": "quant-hft",
+      "query": "Jane Street Hong Kong"
+    },
+    {
+      "name": "Citadel Securities Hong Kong",
+      "country": "Hong Kong",
+      "category": "quant-hft",
+      "query": "Citadel Securities Hong Kong"
+    },
+    {
+      "name": "Hudson River Trading Singapore",
+      "country": "Singapore",
+      "category": "quant-hft",
+      "query": "Hudson River Trading Singapore"
+    },
+    {
+      "name": "XTX Markets Singapore",
+      "country": "Singapore",
+      "category": "quant-hft",
+      "query": "XTX Markets Singapore"
+    },
+    {
+      "name": "WorldQuant Singapore",
+      "country": "Singapore",
+      "category": "quant-hft",
+      "query": "WorldQuant Singapore"
+    },
+    {
+      "name": "Millennium Singapore",
+      "country": "Singapore",
+      "category": "quant-hft",
+      "query": "Millennium Management Singapore"
+    },
+    {
+      "name": "Optiver Japan",
+      "country": "Japan",
+      "category": "quant-hft",
+      "query": "Optiver Tokyo"
+    },
+    {
+      "name": "Jane Street Japan",
+      "country": "Japan",
+      "category": "quant-hft",
+      "query": "Jane Street Tokyo"
+    },
+    {
+      "name": "High-Flyer Quant",
+      "country": "China",
+      "category": "quant-hft",
+      "query": "High-Flyer Hangzhou"
+    },
+    {
+      "name": "Ubiquant Investment",
+      "country": "China",
+      "category": "quant-hft",
+      "query": "Ubiquant Beijing"
+    },
+    {
+      "name": "Nine Chapters Capital",
+      "country": "China",
+      "category": "quant-hft",
+      "query": "Nine Chapters Capital Beijing"
+    },
+    {
+      "name": "Minghong Investment",
+      "country": "China",
+      "category": "quant-hft",
+      "query": "Minghong Investment Shanghai"
+    },
+    {
+      "name": "Lingjun Investment",
+      "country": "China",
+      "category": "quant-hft",
+      "query": "Lingjun Investment Shanghai"
+    },
+    {
+      "name": "Ruitian Capital",
+      "country": "China",
+      "category": "quant-hft",
+      "query": "Ruitian Capital Shanghai"
+    },
+    {
+      "name": "Baiont Quant",
+      "country": "China",
+      "category": "quant-hft",
+      "query": "Baiont Nanjing"
+    },
+    {
+      "name": "Century Frontier",
+      "country": "China",
+      "category": "quant-hft",
+      "query": "Century Frontier Shanghai"
+    },
+    {
+      "name": "Graviton Research Capital",
+      "country": "India",
+      "category": "quant-hft",
+      "query": "Graviton Research Capital Gurugram"
+    },
+    {
+      "name": "Quadeye Securities",
+      "country": "India",
+      "category": "quant-hft",
+      "query": "Quadeye Gurugram"
+    },
+    {
+      "name": "AlphaGrep Securities",
+      "country": "India",
+      "category": "quant-hft",
+      "query": "AlphaGrep Securities Mumbai"
+    },
+    {
+      "name": "NK Securities Research",
+      "country": "India",
+      "category": "quant-hft",
+      "query": "NK Securities Research Delhi"
+    },
+    {
+      "name": "iRage Capital Advisory",
+      "country": "India",
+      "category": "quant-hft",
+      "query": "iRage Capital Mumbai"
+    },
+    {
+      "name": "Estee Advisors",
+      "country": "India",
+      "category": "quant-hft",
+      "query": "Estee Advisors Gurugram"
+    },
+    {
+      "name": "Dolat Capital",
+      "country": "India",
+      "category": "quant-hft",
+      "query": "Dolat Capital Mumbai"
+    },
+    {
+      "name": "Futures First",
+      "country": "India",
+      "category": "quant-hft",
+      "query": "Futures First Gurugram"
+    },
+    {
+      "name": "Open Futures",
+      "country": "India",
+      "category": "quant-hft",
+      "query": "Open Futures Delhi"
+    },
+    {
+      "name": "Tower Research Capital India",
+      "country": "India",
+      "category": "quant-hft",
+      "query": "Tower Research Capital Gurugram"
+    },
+    {
+      "name": "WorldQuant India",
+      "country": "India",
+      "category": "quant-hft",
+      "query": "WorldQuant Mumbai"
+    },
+    {
+      "name": "D. E. Shaw India",
+      "country": "India",
+      "category": "quant-hft",
+      "query": "D. E. Shaw Hyderabad"
     }
   ],
   "excluded": {
