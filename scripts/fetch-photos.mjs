@@ -115,19 +115,61 @@ if (!process.env.GOOGLE_MAPS_API_KEY) {
 
 // ── the sweep ───────────────────────────────────────────────────────────────
 
-let fetched = 0, missing = 0, failed = 0, spent = 0, stop = null;
+let fetched = 0, missing = 0, failed = 0, throttled = 0, spent = 0, stop = null;
 let cursor = 0;
 const started = Date.now();
 
-async function one(b) {
+/* A PER-MINUTE CAP IS NOT A DEAD END, and the first version of this script
+   treated it as one. It ran at 8 concurrent, hit ~9.9 photos/s — two billed
+   requests each, so ~1,200 requests a minute — and Places answered
+   RESOURCE_EXHAUSTED for 'GetPlaceRequest per minute'. The stop guard matched
+   the word "quota", declared an account limit and gave up 1,224 buildings in,
+   which is exactly the sort of "the crawl died overnight" that a resumable
+   script exists to avoid.
+
+   The two failures look alike in the text and are opposite in kind. A per-MINUTE
+   cap clears in sixty seconds and wants a pause. Billing off, a revoked key or a
+   per-DAY cap does not clear by waiting, and retrying it is how one dead request
+   becomes ten thousand. So the transient one is matched first and specifically,
+   and only what is left is allowed to stop the run. */
+const isPerMinute = (t) => /per minute|rate limit|RESOURCE_EXHAUSTED/i.test(t) && !/per day|daily/i.test(t);
+const isFatal = (t) => /billing|denied|expired|invalid.*key|API key not valid|per day|daily/i.test(t);
+
+/* Requests per minute, spread evenly rather than burst-then-block: a token
+   bucket that refuses to hand out more than the budget in any rolling minute.
+   Two billed requests per photo, so the photo rate is half this. */
+const RPM = Math.max(60, val('rpm', 500));
+let windowStart = Date.now(), issued = 0;
+async function ration(cost = 2) {
+    for (;;) {
+        const now = Date.now();
+        if (now - windowStart >= 60000) { windowStart = now; issued = 0; }
+        if (issued + cost <= RPM) { issued += cost; return; }
+        await new Promise((r) => setTimeout(r, 60000 - (now - windowStart) + 250));
+    }
+}
+
+async function one(b, attempt = 1) {
+    await ration();
     const res = await googleMaps.placePhotoForCompany({ placeId: b.placeId, maxWidthPx: MAX_WIDTH_PX })
         .catch((e) => ({ ok: false, reason: 'threw', detail: e.message }));
 
-    /* An account-level problem is not a data problem, and retrying it 10,000
-       times is how a billing stop becomes an afternoon of errors. */
-    if (!res.ok && /billing|denied|quota|expired|invalid.*key|403|429/i.test(`${res.reason} ${res.detail || ''}`)) {
-        stop = `${res.reason}: ${String(res.detail || '').slice(0, 160)}`;
-        return;
+    if (!res.ok) {
+        const text = `${res.reason} ${res.detail || ''}`;
+        if (isPerMinute(text) && !isFatal(text)) {
+            /* Backing off past the end of the current minute window, because
+               the counter Google is enforcing resets on ITS clock, not ours. */
+            if (attempt <= 4) {
+                await new Promise((r) => setTimeout(r, 15000 * attempt));
+                return one(b, attempt + 1);
+            }
+            throttled++;
+            return;                       // leave it for the next run to pick up
+        }
+        if (isFatal(text)) {
+            stop = `${res.reason}: ${String(res.detail || '').slice(0, 160)}`;
+            return;
+        }
     }
 
     spent += USD_PER_PHOTO;
@@ -139,6 +181,22 @@ async function one(b) {
         fs.writeFileSync(cachePath(b.placeId), JSON.stringify(res.data));
         if (res.data?.found) fetched++; else missing++;
     } else {
+        /* A TIMEOUT IS NOT AN ANSWER. Caching misses is right — a building with
+           no photo has none tomorrow either, and re-asking costs a Details call
+           every run. But that reasoning only holds for a verdict Google
+           actually gave. A timeout, a dropped connection or a 429 is the
+           network failing to deliver a verdict, and writing it to the cache
+           makes a transient blip permanent: the building is never retried and
+           shows no photo forever.
+
+           The first full sweep did exactly that to 38 buildings — 36 timeouts
+           and 2 rate-limited — which the post-run audit caught by reading the
+           reasons back out of the cache. They are simply left unwritten now, so
+           the next run picks them up. */
+        if (/timeout|network|threw|429|5\d\d/i.test(res.reason || '')) {
+            failed++;
+            return;
+        }
         fs.writeFileSync(cachePath(b.placeId),
             JSON.stringify({ found: false, reason: res.reason || 'no-photo' }));
         missing++;
@@ -170,6 +228,7 @@ if (stop) {
 console.log(`photographed  ${fetched}`);
 console.log(`no photo      ${missing}  (recorded, so they are not re-bought)`);
 console.log(`errors        ${failed}`);
+if (throttled) console.log(`rate-limited  ${throttled}  (left for the next run — rerun to pick them up)`);
 console.log(`spent         ≈ $${spent.toFixed(2)}`);
 
 let bytes = 0;
