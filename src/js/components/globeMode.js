@@ -814,16 +814,40 @@ export async function createGlobeMode({ scene, camera, renderer }) {
            fourteen got names, thinned by ground distance. At the altitude this
            function actually flew to, all fourteen landed on the same pixel and
            all fifty-one dots composited into one green disc three pixels wide. */
+        /* THE PLACE ID TRAVELS WITH THE PIN, which is what makes a result
+           clickable. Without it the card has nothing to fetch a photograph
+           with, and the search path silently lost it: 83 markers on screen and
+           not one carried `meta`, so clicking a company found in a city did
+           nothing at all while clicking one from the ranked head-office layer
+           opened a photograph. Same card, same handler, one missing field.
+
+           Places already returns the id — it is `c.id` on every row — so this
+           costs nothing at search time. The photograph itself is still fetched
+           on demand, on click, exactly as it is for the ranked companies. */
+        const asMeta = (p, extra = {}) => ({
+            name: p.name,
+            placeId: p.id || null,
+            address: p.address || null,
+            website: p.website || null,
+            source: 'google-places',
+            /* The classifier's 0-1 score, said in the words the card prints
+               rather than as a bare number that reads like a price. */
+            confidence: p.confidence >= 0.8 ? 'high' : p.confidence >= 0.5 ? 'medium' : 'low',
+            ...extra
+        });
+
         for (const p of parks) {
             markers.addMarker({
                 lat: p.lat, lng: p.lng, label: p.name.toUpperCase(), kind: 'techpark',
-                dotColour: 0xffb648, dotPx: 9, priority: 1
+                dotColour: 0xffb648, dotPx: 9, priority: 1,
+                meta: asMeta(p)
             });
         }
         for (const c of firms) {
             markers.addMarker({
                 lat: c.lat, lng: c.lng, label: c.name.toUpperCase(), kind: 'company',
-                dotColour: 0x2ce8a0, dotPx: 5, priority: 2
+                dotColour: 0x2ce8a0, dotPx: 5, priority: 2,
+                meta: asMeta(c)
             });
         }
 
