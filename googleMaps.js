@@ -184,6 +184,169 @@ async function placesCompanies({ query, pages = 3, lat, lng, radiusM } = {}) {
     return { ok: true, data: { places: results } };
 }
 
+/**
+ * A named company's headquarters — "Stellantis", not "companies near here".
+ *
+ * THE INVERSE OF placesCompanies. That one asks "what businesses are at this
+ * point"; this one asks "where on Earth is this named company", which is what
+ * turns a ranked list of tickers into pins on a globe.
+ *
+ * TWO THINGS MAKE THE ANSWER TRUSTWORTHY, and both were learned from getting
+ * it wrong against the live API:
+ *
+ *  1. The country goes in the QUERY TEXT, not just `regionCode`. regionCode is
+ *     a bias and Places overrides it for a strong global name — "Reliance"
+ *     with regionCode US returned Reliance Retail in Bengaluru, because the
+ *     Indian conglomerate outranks the American steel distributor by every
+ *     signal Google has. Naming the country in the text changes the ranking
+ *     rather than merely nudging it.
+ *  2. `addressComponents` is on the field mask so the ISO country of the
+ *     result can be CHECKED. Without it the caller can only hope; with it, a
+ *     result in the wrong country is detectable and can be refused. A company
+ *     plotted on the wrong continent is worse than a company left off the map.
+ *
+ * Three candidates rather than one, so the caller can walk down the list to
+ * the first that passes its country check instead of throwing the search away.
+ *
+ * The word "corporate headquarters" in the query is what pins the head office
+ * rather than the nearest branch: "Riyad Bank" alone returns a high-street
+ * branch, which is a real place and the wrong one.
+ */
+async function placesCompanyHQ({ name, country, regionCode, bare = false, ticker = null, biasLat = null, biasLng = null } = {}) {
+    const clean = String(name || '').trim();
+    if (!clean) return { ok: false, reason: 'no-name' };
+    const body = {
+        /* `bare` drops the "corporate headquarters" phrasing. That phrasing is
+           what pins a head office instead of a branch and is right nearly
+           everywhere — but it returns zero results for a large block of
+           mainland Chinese listings that Google indexes by name only. The
+           caller falls back to this when the first shape finds nothing, so the
+           precision is kept where it works and recall is recovered where it
+           does not. */
+        /* THREE QUERY SHAPES, tried in order of precision by the caller:
+             1. "<name> corporate headquarters <country>"  — pins the head
+                office rather than a branch. Right nearly everywhere.
+             2. bare: "<name> <country>"                   — recovers mainland
+                Chinese listings Google indexes by name only.
+             3. ticker: "<name> (<TICKER>) corporate headquarters <country>"
+                — the ticker is a strong disambiguator when the trading name
+                and the signage differ. It found Schneider Electric's actual
+                office where shape 1 returned only the town it sits in.
+
+           Shape 3 is NOT safe on its own — it sent "RTX" to an RTX subsidiary
+           in India — which is precisely why the caller runs every shape
+           through the same country and name checks. A stronger query is
+           allowed to find more candidates; it is not allowed to lower the bar
+           they have to clear. */
+        textQuery: ticker
+            ? `${clean} (${String(ticker).split('.')[0]}) corporate headquarters${country ? ` ${country}` : ''}`
+            : bare
+                ? `${clean}${country ? ` ${country}` : ''}`
+                : `${clean} corporate headquarters${country ? ` ${country}` : ''}`,
+        /* EIGHT, NOT THREE — and it costs nothing extra. One Text Search is one
+           billed request whatever the page size, and the country check walks
+           down the list until something matches. With three candidates, a
+           mainland Chinese company whose first three hits are all Hong Kong
+           subsidiaries was rejected outright; ICBC, China Mobile and Bank of
+           Communications all failed exactly that way. More candidates is more
+           chances for the right country to appear, for the same money. */
+        pageSize: 8
+    };
+    /* Bias towards the country asked for. `regionCode` alone is a hint Google
+       overrides for strong global names; a location bias pulls the ranking
+       towards the right landmass as well. */
+    if (Number.isFinite(biasLat) && Number.isFinite(biasLng)) {
+        body.locationBias = {
+            circle: { center: { latitude: biasLat, longitude: biasLng }, radius: 50000 }
+        };
+    }
+    if (regionCode) body.regionCode = String(regionCode).toUpperCase().slice(0, 2);
+    const res = await call('https://places.googleapis.com/v1/places:searchText', {
+        method: 'POST',
+        fieldMask: 'places.id,places.displayName,places.location,places.formattedAddress,places.addressComponents,places.types',
+        body
+    });
+    if (!res.ok) return res;
+    const candidates = [];
+    for (const p of res.data?.places || []) {
+        if (!Number.isFinite(p.location?.latitude)) continue;
+        candidates.push({
+            id: p.id || null,
+            matchedName: p.displayName?.text || clean,
+            lat: p.location.latitude,
+            lng: p.location.longitude,
+            address: p.formattedAddress || null,
+            countryCode: (p.addressComponents || [])
+                .find((c) => (c.types || []).includes('country'))?.shortText || null,
+            type: (p.types || [])[0] || null,
+            /* The FULL type list, not just the first. A caller checking whether
+               a result is a corporate office cannot do it from `types[0]`,
+               which is frequently the generic `point_of_interest`. It is the
+               difference between accepting "Xfinity Corporate Office" as
+               Comcast and accepting a town called Rueil-Malmaison as
+               Schneider Electric. */
+            types: p.types || []
+        });
+    }
+    return { ok: true, data: { candidates } };
+}
+
+/**
+ * A photograph of a place we already have the ID for.
+ *
+ * TWO REQUESTS, AND BOTH ARE BILLED — Place Details for the photo reference,
+ * then the media endpoint for the bytes. That is why this is called ON DEMAND
+ * rather than swept over the whole database: photographing all 10,959 resolved
+ * companies would be roughly $263 and 877 MB of disk, to show pictures nobody
+ * asked to see. Clicking one company costs about half a cent.
+ *
+ * The place ID is already known from the HQ resolution, which is what makes
+ * this two requests instead of three — no search is needed to find the place
+ * again.
+ *
+ * ATTRIBUTION IS NOT OPTIONAL. Google's terms require the author attribution
+ * to be displayed with the image, so a photo whose attribution did not come
+ * back is unusable and is reported as absent rather than shown bare.
+ */
+async function placePhotoForCompany({ placeId, maxWidthPx = 800 } = {}) {
+    const id = String(placeId || '').trim();
+    if (!id) return { ok: false, reason: 'no-place-id' };
+    if (!key()) return { ok: false, reason: 'no-key' };
+
+    const details = await call(`https://places.googleapis.com/v1/places/${encodeURIComponent(id)}`, {
+        fieldMask: 'id,displayName,photos'
+    });
+    if (!details.ok) return details;
+
+    const photos = details.data?.photos || [];
+    if (!photos.length) return { ok: true, data: { found: false, reason: 'no-photos' } };
+
+    const photo = photos[0];
+    const attributions = (photo.authorAttributions || []).map((a) => ({
+        displayName: a.displayName, uri: a.uri
+    }));
+    if (!attributions.length) return { ok: true, data: { found: false, reason: 'no-attribution' } };
+
+    const media = await placePhotoMedia({ photoName: photo.name, maxWidthPx });
+    if (!media.ok) return media;
+
+    return {
+        ok: true,
+        data: {
+            found: true,
+            placeName: details.data?.displayName?.text || null,
+            dataUri: media.data.dataUri,
+            bytes: media.data.bytes,
+            widthPx: photo.widthPx,
+            heightPx: photo.heightPx,
+            attributions,
+            /* How many more exist, so a caller can offer "next photo" without
+               having to buy one to find out. */
+            available: photos.length
+        }
+    };
+}
+
 /** Type-ahead completions. Cheap, and the only endpoint billed per session. */
 async function placesAutocomplete({ input, lat, lng } = {}) {
     const body = { input: String(input || '') };
@@ -532,7 +695,8 @@ const METHODS = {
     geocode, reverseGeocode,
     elevation, timezone, weather, airQuality, pollen,
     route, streetViewMeta, staticMap, dossier,
-    placePhotos, placePhotoMedia, streetViewImage, placesCompanies
+    placePhotos, placePhotoMedia, streetViewImage, placesCompanies, placesCompanyHQ,
+    placePhotoForCompany
 };
 
 async function invoke(method, params = {}) {

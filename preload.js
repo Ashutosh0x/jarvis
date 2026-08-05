@@ -280,6 +280,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
     /* Google Maps Platform. Returns data, never the key that fetched it. */
     googleMaps: (method, params) => ipcRenderer.invoke('google-maps', method, params),
     googleMapsStatus: () => ipcRenderer.invoke('google-maps-status'),
+    /* OpenStreetMap shapes. Keyless, so this is available even when the globe
+       has no Google key at all — the boundary of a campus does not depend on
+       anyone's billing account. */
+    osmGeometry: (method, params) => ipcRenderer.invoke('osm-geometry', method, params),
+    /* CompaniesMarketCap. Metered — one credit per uncached call — so the
+       status channel reports which pages are already bought. */
+    marketCap: (method, params) => ipcRenderer.invoke('marketcap', method, params),
+    marketCapStatus: () => ipcRenderer.invoke('marketcap-status'),
     /* Read-only: the Luma key can cancel events and read guest emails, so the
        write half of that API is not reachable from here. */
     lumaEvents: (method, params) => ipcRenderer.invoke('luma-events', method, params),

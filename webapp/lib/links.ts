@@ -18,7 +18,7 @@
 // ---------------------------------------------------------------------------
 
 /** Must equal the `version` in the repository-root package.json. */
-export const VERSION = "0.9.0";
+export const VERSION = "0.10.0";
 
 export const REPO_URL = "https://github.com/Ashutosh0x/jarvis";
 export const NPM_URL = "https://www.npmjs.com/package/@ashutosh0x/jarvis";

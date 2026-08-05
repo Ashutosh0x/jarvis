@@ -341,6 +341,49 @@ routes('remind me about vines1vzrYbzLMRdu58ou5XTby4qAqVRLmqo36NKPTg', null);
     check('company: does NOT fire on ordinary conversation',
         intentOf('what is the weather like') !== 'COMPANY_FILINGS');
 
+    /* --- COMPANIES ON THE GLOBE ----------------------------------------------
+       This drives detectIntent, NOT the isolated parse regex the globe suite
+       checks — the two disagreed once already. The handler for GLOBE_COMPANIES
+       shipped, the regex was validated in a corner, but nothing wired it into
+       detectIntent, so the live command fell through to the model as an "I am
+       seeing a search query for…" non-answer. These pin the real routing:
+
+         · the intent actually fires (guarded on window.jarvisGlobe.showCompanies)
+         · type and place reach the handler
+         · it wins over the web-search parser, which had claimed
+           "find AI startups in San Francisco" first
+         · it does not steal EDGAR, per-company filings, or a bare place query */
+    const hadGlobe = window.jarvisGlobe;
+    window.jarvisGlobe = { showCompanies() {} };
+    try {
+        check('globe-companies: "show software companies in Bengaluru" fires the intent',
+            intentOf('show software companies in Bengaluru') === 'GLOBE_COMPANIES',
+            String(intentOf('show software companies in Bengaluru')));
+        /* detectIntent lowercases the command before matching, so the place
+           comes through lowercased — the geocoder is case-insensitive. */
+        check('globe-companies: type and place reach the handler',
+            parse('show software companies in Bengaluru')?.companyType === 'software'
+            && parse('show software companies in Bengaluru')?.place === 'bengaluru',
+            JSON.stringify(parse('show software companies in Bengaluru')));
+        check('globe-companies: a bare "companies in Tokyo" fires with an empty type',
+            parse('show me companies in Tokyo')?.intent === 'GLOBE_COMPANIES'
+            && parse('show me companies in Tokyo')?.companyType === '',
+            JSON.stringify(parse('show me companies in Tokyo')));
+        check('globe-companies: WINS over the web search parser',
+            intentOf('find AI startups in San Francisco') === 'GLOBE_COMPANIES',
+            String(intentOf('find AI startups in San Francisco')));
+        check('globe-companies: does NOT steal EDGAR full-text',
+            intentOf('which companies mention stablecoin in their filings') === 'EDGAR_SEARCH',
+            String(intentOf('which companies mention stablecoin in their filings')));
+        check('globe-companies: does NOT steal per-company filings',
+            intentOf('sec filings of google') === 'COMPANY_FILINGS',
+            String(intentOf('sec filings of google')));
+        check('globe-companies: does NOT fire on a bare place query',
+            intentOf('show me Tokyo') !== 'GLOBE_COMPANIES', String(intentOf('show me Tokyo')));
+    } finally {
+        if (hadGlobe === undefined) delete window.jarvisGlobe; else window.jarvisGlobe = hadGlobe;
+    }
+
     /* PREDICTION MARKETS — found by routing a live prompt, not by reading the
        regex. "what are the odds the fed cuts rates" reached the MODEL, which
        has no market data and answers with an invented probability. The old

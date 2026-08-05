@@ -1261,6 +1261,99 @@
       text-shadow: 0 0 9px rgba(0, 229, 153, 0.5), 0 1px 5px rgba(0, 0, 0, 0.9);
     }
 
+    /* ---- company card: the photograph IS the card -----------------------
+       Same idiom as the phone mirror: no frame, no border, no rounded corner,
+       nothing between the image and the screen. Every piece of chrome is an
+       overlay that stays invisible until the pointer is over the panel, so
+       what you see at rest is the building. A border around a photograph is
+       just a smaller photograph. */
+    .company-card {
+      position: fixed; right: 0; top: 96px; width: min(420px, 34vw);
+      z-index: 1006;
+      background: #000;
+      border: none; border-radius: 0;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.8);
+      overflow: hidden;
+      font-family: 'Rajdhani', 'Barlow', sans-serif;
+      color: rgba(255, 255, 255, 0.92);
+      transform: translateX(0);
+      transition: transform 0.3s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.3s ease;
+    }
+    /* The image fills the panel edge to edge. Height follows the photograph so
+       a wide shot does not get letterboxed into a fixed box. */
+    .company-card-photo img {
+      width: 100%; display: block; border: 0; border-radius: 0;
+    }
+    /* Before the photo lands, and when there is none, this is the only thing
+       with any height — otherwise the panel would collapse to the text. */
+    .company-card-photo:empty,
+    .company-card-photo:not(:has(img)) {
+      min-height: 44px; padding: 14px 16px;
+      font-size: 12px; color: rgba(255, 255, 255, 0.45);
+    }
+
+    /* --- All text is an overlay on the image, legible via a scrim --- */
+    .company-card-info {
+      position: absolute; left: 0; right: 0; bottom: 0;
+      padding: 30px 16px 12px;
+      background: linear-gradient(to top,
+        rgba(0, 0, 0, 0.88) 0%, rgba(0, 0, 0, 0.62) 45%, rgba(0, 0, 0, 0) 100%);
+      pointer-events: none;
+    }
+    .company-card-name {
+      font-size: 17px; font-weight: 700; letter-spacing: 0.6px;
+      text-transform: uppercase; text-shadow: 0 1px 6px rgba(0, 0, 0, 0.9);
+    }
+    .company-card-sub {
+      font-size: 11.5px; letter-spacing: 1px; color: rgba(255, 176, 72, 0.9);
+      text-transform: uppercase; margin-top: 1px;
+    }
+    .company-card-figs {
+      display: flex; gap: 12px; align-items: baseline;
+      margin: 6px 0 4px; font-size: 15px; font-weight: 600;
+      text-shadow: 0 1px 6px rgba(0, 0, 0, 0.9);
+    }
+    .company-card-figs .cap { color: rgba(255, 255, 255, 0.97); }
+    .company-card-figs .price { color: rgba(255, 255, 255, 0.7); font-size: 13px; }
+    .company-card-figs .chg.up { color: #2ce8a0; }
+    .company-card-figs .chg.down { color: #ff5c72; }
+    .company-card-addr {
+      font-size: 11.5px; color: rgba(255, 255, 255, 0.62); line-height: 1.35;
+      text-shadow: 0 1px 5px rgba(0, 0, 0, 0.9);
+    }
+
+    /* Close button: invisible until hover, exactly like the mirror's. */
+    .company-card-close {
+      position: absolute; right: 6px; top: 4px; z-index: 2;
+      background: rgba(255, 255, 255, 0.12); border: 0; border-radius: 3px;
+      color: rgba(255, 255, 255, 0.85);
+      font-size: 18px; cursor: pointer; line-height: 1; padding: 2px 8px 4px;
+      opacity: 0; pointer-events: none;
+      transition: opacity 0.2s ease, background 0.15s ease;
+    }
+    .company-card:hover .company-card-close { opacity: 1; pointer-events: auto; }
+    .company-card-close:hover { background: rgba(255, 255, 255, 0.25); }
+
+    /* Attribution is a REQUIREMENT of Google's photo terms, not a caption. It
+       is dim and small, but it is always rendered — never hover-gated, because
+       a licence condition is not chrome. */
+    .company-card-prov {
+      position: absolute; left: 16px; bottom: 3px; right: 40px;
+      font-size: 9.5px; letter-spacing: 0.4px;
+      color: rgba(255, 255, 255, 0.42); text-transform: uppercase;
+      pointer-events: none; white-space: nowrap;
+      overflow: hidden; text-overflow: ellipsis;
+    }
+
+    /* Tech parks: amber and larger than the companies inside them, because they
+       are the campus, not another tenant. Reads as a heading against the green
+       company names at the same zoom. */
+    .globe-label.kind-techpark {
+      color: rgba(255, 205, 130, 0.96);
+      font-size: 13px; font-weight: 700; letter-spacing: 1.1px;
+      text-shadow: 0 0 10px rgba(255, 168, 46, 0.55), 0 1px 5px rgba(0, 0, 0, 0.92);
+    }
+
     .globe-label.kind-satellite {
       color: rgba(190, 235, 255, 0.9);
       font-size: 10px;

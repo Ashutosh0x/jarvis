@@ -42,6 +42,12 @@ files:
   - edgarGuard.js
   - googleCalendar.js
   - googleMaps.js
+  - osmGeometry.js
+  - companiesMarketCap.js
+  # The crawled company database. Read with fs, not require, so no dependency
+  # walk can find it — and without it the globe reports "not-crawled" and draws
+  # nothing, in a build that otherwise launches perfectly.
+  - data/
   - lumaEvents.js
   - aviation.js
   - trafficCams.js

@@ -13,6 +13,26 @@ if (!autostart.claimSingleInstance(() => mainWindow)) {
     app.quit();
     process.exit(0);
 }
+/* TEMPORARY DIAGNOSTIC — remove once the startup exit is understood.
+   The app boots to "Globe ready" and then dies ~15 s later, taking its child
+   processes with it (all `code null`, i.e. killed). before-quit fires, so
+   something CALLS quit; this records who, and whether the process is instead
+   being signalled from outside. */
+if (process.env.JARVIS_TRACE_QUIT) {
+    const realQuit = app.quit.bind(app);
+    app.quit = (...a) => { console.log('[trace] app.quit() called from:\n' + new Error().stack); return realQuit(...a); };
+    const realExit = process.exit.bind(process);
+    process.exit = (...a) => { console.log('[trace] process.exit() called from:\n' + new Error().stack); return realExit(...a); };
+    for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP', 'SIGBREAK']) {
+        try { process.on(sig, () => console.log(`[trace] received ${sig}`)); } catch { /* not on this platform */ }
+    }
+    app.on('will-quit', (e) => console.log('[trace] will-quit, defaultPrevented=' + e.defaultPrevented));
+    app.on('window-all-closed', () => console.log('[trace] window-all-closed'));
+    process.on('exit', (c) => console.log(`[trace] process exit code=${c}`));
+    process.on('uncaughtException', (e) => console.log('[trace] uncaughtException: ' + (e && e.stack)));
+    process.on('unhandledRejection', (e) => console.log('[trace] unhandledRejection: ' + e));
+}
+
 const path = require('path');
 const { exec, execFile, spawn } = require('child_process');
 const os = require('os');
@@ -1169,6 +1189,40 @@ ipcMain.handle('google-maps-status', async () => ({
     configured: googleMaps.isConfigured(),
     methods: googleMaps.methods
 }));
+
+/* OpenStreetMap geometry. NO KEY, and no billing — but a strict rate limit
+   that the module enforces itself, so this handler deliberately does not
+   parallelise or batch. A campus boundary is worth one polite request. */
+/* CompaniesMarketCap, via the user's own parse.bot scraper. EVERY CALL COSTS A
+   CREDIT, so the handler exposes the balance-relevant facts (was it cached?)
+   rather than hiding them — the renderer decides whether a page is worth
+   buying, and it can only decide that if it knows. */
+const marketCap = require('./companiesMarketCap');
+marketCap.init(app.getPath('userData'));
+
+ipcMain.handle('marketcap', async (event, method, params = {}) => {
+    return marketCap.invoke(String(method || ''), params || {});
+});
+
+ipcMain.handle('marketcap-status', async () => ({
+    configured: marketCap.isConfigured(),
+    methods: marketCap.methods,
+    /* Pages already paid for and still inside their TTL. A caller that wants
+       "the top 300" should spend nothing if pages 1-3 are already here. */
+    cachedPages: marketCap.cachedPages()
+}));
+
+const osmGeometry = require('./osmGeometry');
+
+ipcMain.handle('osm-geometry', async (event, method, params = {}) => {
+    const p = params || {};
+    for (const field of ['lat', 'lng']) {
+        if (p[field] !== undefined && !Number.isFinite(Number(p[field]))) {
+            return { ok: false, reason: 'bad-coordinates', detail: field };
+        }
+    }
+    return osmGeometry.invoke(String(method || ''), p);
+});
 
 /* Luma events. Same rule as the maps key, and it matters more here: a Luma
    key can create and cancel events and read every guest's email address. The

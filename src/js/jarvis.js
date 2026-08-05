@@ -1415,6 +1415,51 @@ class Jarvis {
         const companyQ = edgarCompany.parseCompanyFilingsQuery(cmd);
         if (companyQ) return { intent: 'COMPANY_FILINGS', ...companyQ };
 
+        /* COMPANIES ON THE GLOBE — "show software companies in Bengaluru",
+           "find AI startups in San Francisco". A coordinate-driven Places
+           search draws them on the globe; the adjective before the noun
+           becomes the search type, and a bare "companies in X" leaves the
+           type empty rather than failing.
+
+           POSITION IS THE FIX. This was the missing half of the feature —
+           the handler existed but nothing ever returned this intent, so the
+           command fell all the way through to the model and came back as the
+           "I am seeing a search query for…" non-answer. It sits AFTER the
+           EDGAR matchers, so "which companies mention X in their filings"
+           stays a full-text search, and BEFORE parseInputCommand and the web
+           search parser, which would otherwise type the phrase into a window
+           or classify "find AI startups in San Francisco" as a web search.
+           The regex is the one the globe routing tests pin. */
+        /* Strip a trailing "on the globe/map" locally — the shared
+           cmdNoFraming is declared further down, and this branch runs
+           before it exists. */
+        const companyCmd = cmd.replace(/\s+\b(?:on|in|over|at)\b\s+(?:the\s+)?(?:world\s+)?(?:globe|map|earth|world)\b\s*[.?!]?$/i, '').trim();
+        const companyNoun = /\b(?:companies|startups?|firms?|businesses)\b/i;
+        const companyVerb = /\b(?:show|find|list|search|display)\b/i;
+        const companyM = (companyNoun.test(companyCmd) && companyVerb.test(companyCmd))
+            ? /\b(?:show|find|list|search|display)\b\s+(?:me\s+|all\s+|the\s+)*(.*?)\b(?:companies|startups?|firms?|businesses)\b\s+(?:in|at|near|around)\s+(?:the\s+)?([a-z][a-z .'-]{1,40}?)\s*[.?!]?$/i.exec(companyCmd)
+            : null;
+        if (companyM && window.jarvisGlobe?.showCompanies) {
+            return { intent: 'GLOBE_COMPANIES', companyType: companyM[1].trim(), place: companyM[2].trim() };
+        }
+
+        /* THE WORLD'S BIGGEST COMPANIES, each at its own head office —
+           "map the largest companies", "plot the top 40 companies by market
+           cap on the globe". Distinct from the branch above because there is
+           no PLACE in it: the list is the input and the coordinates are what
+           has to be found, one live lookup per company.
+
+           Matched only when a superlative or "market cap" is present, so
+           "show me companies in Bengaluru" cannot fall in here — that one has
+           a place and belongs to the branch above. */
+        if (/\b(?:compan|firms?|corporations?)/i.test(companyCmd)
+            && /\b(?:biggest|largest|top|world'?s|global|market\s*cap(?:italisation|italization)?)\b/i.test(companyCmd)
+            && !/\b(?:in|at|near|around)\s+(?:the\s+)?[a-z]/i.test(companyCmd.replace(/\bin\s+the\s+world\b/i, ''))
+            && window.jarvisGlobe?.showCompanyList) {
+            const n = /\btop\s+(\d{1,4})\b/i.exec(companyCmd);
+            return { intent: 'GLOBE_COMPANY_LIST', limit: n ? Number(n[1]) : 0 };
+        }
+
         // Keyboard/window control ("type ...", "press enter", "close notepad").
         // Checked before the system/network matchers so "close chrome" acts on
         // the window rather than being read as a process question.
@@ -1743,7 +1788,7 @@ class Jarvis {
             return { intent: 'GLOBE_SHOW', place: eventsAt, focus: 'events' };
         }
 
-        const bareShow = /^(?:jarvis[,\s]+)?(?:show|display|pull\s+up|bring\s+up|take\s+me\s+to|go\s+to|fly\s+to|zoom\s+(?:in\s+)?to)\s+(?:me\s+|my\s+|us\s+)?(?:jarvis[,\s]+)?(?:the\s+)?([a-z][a-z .'-]{1,40}?)(?:\s+(?:city|globe|map))?\s*[.?!]?$/i.exec(cmdNoFraming);
+        const bareShow =/^(?:jarvis[,\s]+)?(?:show|display|pull\s+up|bring\s+up|take\s+me\s+to|go\s+to|fly\s+to|zoom\s+(?:in\s+)?to)\s+(?:me\s+|my\s+|us\s+)?(?:jarvis[,\s]+)?(?:the\s+)?([a-z][a-z .'-]{1,40}?)(?:\s+(?:city|globe|map))?\s*[.?!]?$/i.exec(cmdNoFraming);
         if (bareShow && window.jarvisGlobe?.resolveLocal) {
             const candidate = bareShow[1].trim();
             /* WHEN THE USER SAID "ON MAP", THE GAZETTEER DOES NOT GET A VETO.
@@ -1984,6 +2029,9 @@ class Jarvis {
                     break;
                 case 'GLOBE_COMPANIES':
                     await this.handleGlobeCompanies(intent);
+                    break;
+                case 'GLOBE_COMPANY_LIST':
+                    await this.handleGlobeCompanyList(intent);
                     break;
                 case 'GLOBE_TOGGLE':
                     await this.handleGlobeToggle(intent);
@@ -7516,12 +7564,77 @@ class Jarvis {
             const r = await globe.showCompanies(companyType, place);
             if (!r.ok) { this.speak(r.error || 'I could not run that search, Sir.'); this.haptics.warn(); return; }
             const n = r.companies.length;
-            if (!n) { this.speak(`No ${label} found in ${r.place.name}, Sir.`); return; }
+            const parks = r.parks || [];
+            if (!n && !parks.length) { this.speak(`No ${label} found in ${r.place.name}, Sir.`); return; }
             const lead = r.companies.slice(0, 3).map((c) => c.name).join(', ');
-            this.speak(`${n} ${label} in ${r.place.name}, Sir, all on the map. The nearest include ${lead}.`);
+            /* The tech parks are said separately because they are a different
+               kind of answer — the campuses the industry sits inside, not more
+               entries in the same list. */
+            const parkNote = parks.length
+                ? ` I have also marked ${parks.length} tech park${parks.length === 1 ? '' : 's'}, including ${parks.slice(0, 2).map((p) => p.name).join(' and ')}.`
+                : '';
+            this.speak(`${n} ${label} in ${r.place.name}, Sir, every one marked and named at its own coordinates. The nearest include ${lead}.${parkNote}`);
         } catch (e) {
             console.error('Globe companies error:', e);
             this.speak('The company search failed, Sir.');
+            this.haptics.warn();
+        }
+    }
+
+    /* The market-cap ranking, plotted at each company's real head office.
+
+       The spoken reply gives BOTH numbers — located and unresolved — because
+       "seventy companies on the map" when nine of them could not be placed is
+       the kind of rounding that makes a map look authoritative and be wrong. */
+    async handleGlobeCompanyList({ limit }) {
+        const globe = window.jarvisGlobe;
+        if (!globe?.showCompanyList) {
+            this.speak('The globe view is not available in this build, Sir.');
+            return;
+        }
+        const { MARKETCAP_COMPANIES } = await import('./data/marketcapCompanies.js');
+        const { createMarketCapList } = await import('./services/marketCapList.js');
+        const list = createMarketCapList({
+            bridge: (m, p) => window.electronAPI?.marketCap?.(m, p),
+            statusBridge: () => window.electronAPI?.marketCapStatus?.(),
+            fallback: MARKETCAP_COMPANIES
+        });
+        this.haptics.click();
+
+        /* The ranking is fetched BEFORE the globe work so the reply can say
+           where the names came from. A live top-100 and a bundled top-100 look
+           identical on screen; only one of them is current, and the user is
+           entitled to know which they are looking at. */
+        const wanted = limit > 0 ? limit : 100;
+        const feed = await list.topCompanies(wanted);
+        const n = feed.entries.length;
+        if (!n) { this.speak('I could not obtain the company ranking, Sir.'); return; }
+        /* Which of the three sources answered is said out loud, because a
+           crawled database, a live fetch and a bundled fallback look identical
+           on screen and only one of them is both current and free. */
+        const where = feed.source === 'crawled'
+            ? `the local ranking database${feed.totalAvailable ? ` of ${feed.totalAvailable.toLocaleString()} companies` : ''}`
+            : feed.source === 'api' ? 'the live ranking'
+                : 'the bundled list';
+        this.speak(
+            feed.source === 'bundled'
+                ? `Locating ${n} companies from the bundled list, Sir — the ranking is unavailable${feed.degraded === 'no-key' ? ' because no Parse API key is set' : ''}.`
+                : `Locating ${n} of the world's largest companies from ${where}, Sir.`
+        );
+        try {
+            const r = await globe.showCompanyList(feed.entries, {
+                title: `Largest companies by market cap (${feed.source})`
+            });
+            if (!r.ok) { this.speak(r.error || 'I could not run that lookup, Sir.'); this.haptics.warn(); return; }
+            const miss = r.unresolved.length;
+            this.speak(
+                `${r.resolved.length} of ${r.requested} companies are on the globe at their own coordinates, Sir`
+                + `${r.fromCache ? `, ${r.fromCache} of them from cache` : ''}.`
+                + (miss ? ` ${miss} could not be placed with confidence and I have left ${miss === 1 ? 'it' : 'them'} off rather than guess.` : '')
+            );
+        } catch (e) {
+            console.error('Globe company list error:', e);
+            this.speak('The company lookup failed, Sir.');
             this.haptics.warn();
         }
     }

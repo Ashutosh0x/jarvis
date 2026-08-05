@@ -31,6 +31,7 @@ import { createDataFeeds, describeEvent, distanceKm } from '../services/dataFeed
 import { geocode, buildPlaceIndex, findLocal } from '../services/geocode.js';
 import { createLandmarkService, rankLandmarks } from '../services/landmarks.js';
 import { createGoogleServices, describeDossier, cameraDistanceFor } from '../services/googleServices.js';
+import { createOsmShapes } from '../services/osmShapes.js';
 import { createPlaceImages } from '../services/placeImages.js';
 import { createDossierPanel } from './dossierPanel.js';
 import { createCamViewer } from './camViewer.js';
@@ -59,6 +60,10 @@ import searchSrc from '../services/webSearchIntent.js?raw';
 import specSrc from '../services/foundry/sceneSpec.js?raw';
 
 const CODE_SOURCES = ['globeRenderer.js', 'bpyEmitter.js', 'webSearchIntent.js', 'sceneSpec.js'];
+
+/* Mean radius, the same figure `distanceKm` measures with — the two have to
+   agree or a spread measured in kilometres frames to the wrong world size. */
+const EARTH_RADIUS_KM = 6371;
 const CODE_TEXT = {
     'globeRenderer.js': globeSrc,
     'bpyEmitter.js': emitterSrc,
@@ -139,6 +144,82 @@ export async function createGlobeMode({ scene, camera, renderer }) {
        labels themselves, or the whole overlay would swallow the drag that is
        supposed to rotate the globe. */
     window.addEventListener('pointermove', onPointerMove);
+
+    /* ---- click a company, see it ------------------------------------------
+       The photograph is fetched ON CLICK and never before. Two billed Google
+       requests per company means photographing all 10,959 would be about $263
+       and 877 MB of disk for pictures nobody asked to see; one click is about
+       half a cent, and the second click on the same company is free because
+       the main process keeps them. */
+    const companyCard = document.createElement('div');
+    companyCard.className = 'company-card';
+    companyCard.style.display = 'none';
+    mount.appendChild(companyCard);
+
+    function hideCompanyCard() { companyCard.style.display = 'none'; companyCard.innerHTML = ''; }
+
+    async function showCompanyCard(meta) {
+        /* The financials are already in hand, so the card is useful IMMEDIATELY
+           and the photograph fills in when it arrives. Waiting on the network
+           before showing anything makes a click feel broken. */
+        const chg = meta.todayChangeText || '';
+        const up = chg.trim().startsWith('-') ? 'down' : 'up';
+        /* PHOTO FIRST IN THE DOM, text layered over it. The card is the
+           photograph; the figures sit on a scrim at its foot the way the
+           mirror's controls sit on the phone screen. */
+        companyCard.innerHTML = `
+            <button class="company-card-close" aria-label="Close">&times;</button>
+            <div class="company-card-photo"></div>
+            <div class="company-card-info">
+              <div class="company-card-name">${escapeHtml(meta.name || '')}</div>
+              <div class="company-card-sub">${escapeHtml(meta.ticker || '')}${meta.rank ? ` &middot; rank ${meta.rank}` : ''}</div>
+              <div class="company-card-figs">
+                <span class="cap">${escapeHtml(meta.marketCapText || '')}</span>
+                <span class="price">${escapeHtml(meta.priceText || '')}</span>
+                <span class="chg ${up}">${escapeHtml(chg)}</span>
+              </div>
+              <div class="company-card-addr">${escapeHtml(meta.address || '')}</div>
+            </div>
+            <div class="company-card-prov"></div>`;
+        companyCard.style.display = 'block';
+        companyCard.querySelector('.company-card-close').onclick = hideCompanyCard;
+
+        /* Say how good the coordinate is. A city-level Wikidata pin and a
+           street-level Places pin look identical on a globe and are not the
+           same claim. */
+        const prov = companyCard.querySelector('.company-card-prov');
+        prov.textContent = meta.precision === 'city'
+            ? `city-level location (${meta.source || 'wikidata'})`
+            : `${meta.confidence || 'unknown'} confidence · ${meta.source || 'google-places'}`;
+
+        const slot = companyCard.querySelector('.company-card-photo');
+        if (!meta.placeId) { slot.textContent = 'No photograph available for this location.'; return; }
+        slot.textContent = 'Loading photograph...';
+        const res = await marketCapBridge('companyPhoto', { placeId: meta.placeId, maxWidthPx: 640 })
+            .catch(() => null);
+        if (companyCard.style.display === 'none') return;      // closed while loading
+        const d = res?.ok ? res.data : null;
+        if (!d?.found) { slot.textContent = d?.reason === 'no-photos' ? 'No photograph on file.' : 'Photograph unavailable.'; return; }
+        slot.innerHTML = `<img src="${d.dataUri}" alt="${escapeHtml(meta.name || '')}">`;
+        /* Google's terms REQUIRE the author attribution to be shown with the
+           image. A photo without it is not usable, so it is rendered here and
+           not treated as optional decoration. */
+        const credit = d.attributions?.[0];
+        if (credit) prov.textContent += ` · photo: ${credit.displayName}`;
+    }
+
+    const escapeHtml = (s) => String(s).replace(/[&<>"']/g, (c) => (
+        { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+    function onGlobeClick(e) {
+        if (!active) return;
+        hoverPt.x = (e.clientX / window.innerWidth) * 2 - 1;
+        hoverPt.y = -(e.clientY / window.innerHeight) * 2 + 1;
+        hoverRay.setFromCamera(hoverPt, camera);
+        const m = markers.pick(hoverRay);
+        if (m?.meta) showCompanyCard(m.meta);
+    }
+    renderer.domElement.addEventListener('click', onGlobeClick);
     const labelRenderer = new CSS2DRenderer();
     labelRenderer.setSize(window.innerWidth, window.innerHeight);
     labelRenderer.domElement.className = 'globe-label-layer';
@@ -277,6 +358,15 @@ export async function createGlobeMode({ scene, camera, renderer }) {
 
     const landmarkService = createLandmarkService();
     const google = createGoogleServices();
+    /* Keyless and separate from Google on purpose: campus boundaries still
+       draw on a machine with no Maps key at all. */
+    const osm = createOsmShapes({
+        bridge: (method, params) => window.electronAPI?.osmGeometry?.(method, params)
+    });
+    /* The crawled ranking and the resolved coordinates, both read from disk in
+       the main process. Free, offline, and the reason a company list draws
+       instantly instead of buying eleven thousand lookups. */
+    const marketCapBridge = (method, params) => window.electronAPI?.marketCap?.(method, params);
     const placeImages = createPlaceImages();
 
     const feeds = createDataFeeds({
@@ -379,22 +469,16 @@ export async function createGlobeMode({ scene, camera, renderer }) {
             pages: 2, lat: place.lat, lng: place.lng, radiusM: biasRadiusM
         }).catch(() => []);
         clearCompanyMarkers();
-        /* Every company as a dot, a spread-out subset named — same rule as the
-           explicit search. */
+        /* Every company as a named dot — same rule as the explicit search. The
+           marker layer decides how many names fit at the current zoom, so this
+           does not have to pick a subset and cannot pick a wrong one. */
         for (const c of companies) {
             companyMarkers.push(markers.addMarker({
-                lat: c.lat, lng: c.lng, kind: 'company', labelless: true, dotColour: 0x2ce8a0
+                lat: c.lat, lng: c.lng, label: c.name.toUpperCase(), kind: 'company',
+                dotColour: 0x2ce8a0, dotPx: 5, priority: 2
             }));
         }
-        const named = rankLandmarks(companies, {
-            lat: place.lat, lng: place.lng, limit: 14,
-            minSeparationKm: Math.max(0.35, (place.spanKm || 20) / 40),
-            exclude: [{ lat: place.lat, lng: place.lng }]
-        });
-        for (const c of named) {
-            companyMarkers.push(markers.addMarker({ lat: c.lat, lng: c.lng, label: c.name.toUpperCase(), kind: 'company' }));
-        }
-        codeOverlay.log(`companies@${place.name} -> ${companies.length} drawn (${named.length} named)`);
+        codeOverlay.log(`companies@${place.name} -> ${companies.length} drawn, all named`);
         return companies.length;
     }
 
@@ -666,56 +750,297 @@ export async function createGlobeMode({ scene, camera, renderer }) {
         globe.setAutoRotate(false);
         statusBar.setTarget(place.name, `Searching ${companyType || 'companies'}...`);
 
-        const flyDistance = Number.isFinite(place.spanKm)
+        /* An APPROACH, not the final framing. The camera moves to the city
+           while the search runs so the globe is not sitting still for four
+           seconds, and then flies again to fit whatever actually came back. */
+        const approachDistance = Number.isFinite(place.spanKm)
             ? cameraDistanceFor(place.spanKm, globe.radius)
             : globe.radius * 1.9;
         /* Coordinate-driven: the type is the query, the PLACE is a location
            bias, not a string in the query. That is what lets the same call
            work at any city, state or country with nothing hardcoded — and the
            bias radius scales with the place, so a country search is not a
-           5 km circle around its centroid. */
+           5 km circle around its centroid.
+
+           25 km, not 15, when the place carries no extent: the offline
+           gazetteer has no viewport, so a city resolved locally was being
+           searched in a 15 km circle around its centroid and framed from
+           5,700 km up. The default now covers a metro. */
         const query = `${companyType || 'technology'} companies`.trim();
         const biasRadiusM = Number.isFinite(place.spanKm)
             ? Math.min(50000, Math.max(2000, place.spanKm * 500))
-            : 15000;
+            : 25000;
         /* pages:3 is Google's HARD CEILING — Text Search returns at most 60
            results for a query, three pages of twenty, and there is no
            parameter that lifts it. "All" here means all that Google returns for
-           this query, which is the honest most a single search can give. */
-        const [_, companies] = await Promise.all([
-            globe.flyTo(place.lat, place.lng, { distance: flyDistance, ms: 2200 }),
+           this query, which is the honest most a single search can give.
+
+           Tech parks ride alongside as their own query — Google does not return
+           them for "technology companies", and they are what a city's tech
+           industry is physically arranged around. */
+        const [, companies, parks] = await Promise.all([
+            globe.flyTo(place.lat, place.lng, { distance: approachDistance, ms: 1400 }),
             google.searchCompanies(query, {
                 pages: 3, lat: place.lat, lng: place.lng, radiusM: biasRadiusM
+            }).catch(() => []),
+            google.searchTechParks({
+                lat: place.lat, lng: place.lng, radiusM: biasRadiusM
             }).catch(() => [])
         ]);
 
-        markers.addMarker({ lat: place.lat, lng: place.lng, label: labelFor(place.name, place.source), pin: true, boxed: true });
+        /* Tech parks win a name collision with a company of the same name. */
+        const parkKeys = new Set(parks.map((p) => (p.id || p.name.toLowerCase())));
+        const firms = companies.filter((c) => !parkKeys.has(c.id || c.name.toLowerCase()));
 
-        /* EVERY company gets a dot — that is "show them all". Sixty leader-line
-           labels in one city would smear into an unreadable mass, so the dots
-           carry the full set and only a thinned, spread-out subset is labelled.
-           Zoom in and the LOD fade brings more labels within reach. */
-        for (const c of companies) {
+        markers.addMarker({
+            lat: place.lat, lng: place.lng, label: labelFor(place.name, place.source),
+            pin: true, boxed: true, priority: 0
+        });
+
+        /* EVERY result gets a dot AND a name. The names are then decluttered in
+           SCREEN space by the marker layer, so the count on screen is whatever
+           legibly fits at the current zoom and reaches all of them once the
+           camera is down at city level.
+
+           What this replaced: every company got a labelless dot and a fixed
+           fourteen got names, thinned by ground distance. At the altitude this
+           function actually flew to, all fourteen landed on the same pixel and
+           all fifty-one dots composited into one green disc three pixels wide. */
+        for (const p of parks) {
             markers.addMarker({
-                lat: c.lat, lng: c.lng, kind: 'company',
-                labelless: true, dotColour: 0x2ce8a0
+                lat: p.lat, lng: p.lng, label: p.name.toUpperCase(), kind: 'techpark',
+                dotColour: 0xffb648, dotPx: 9, priority: 1
             });
         }
-        const labelled = rankLandmarks(companies, {
-            lat: place.lat, lng: place.lng, limit: 14,
-            minSeparationKm: Math.max(0.35, (place.spanKm || 20) / 40),
-            exclude: [{ lat: place.lat, lng: place.lng }]
-        });
-        for (const c of labelled) {
-            markers.addMarker({ lat: c.lat, lng: c.lng, label: c.name.toUpperCase(), kind: 'company' });
+        for (const c of firms) {
+            markers.addMarker({
+                lat: c.lat, lng: c.lng, label: c.name.toUpperCase(), kind: 'company',
+                dotColour: 0x2ce8a0, dotPx: 5, priority: 2
+            });
         }
 
-        statusBar.setTarget(place.name, companies.length
-            ? `${companies.length} ${companyType || 'companies'} on the map${labelled.length < companies.length ? `, ${labelled.length} named` : ''}.`
-            : `No ${companyType || 'companies'} found here.`);
-        codeOverlay.log(`companies("${query}") -> ${companies.length} drawn (${labelled.length} named)`);
+        /* FRAME THE RESULTS, NOT THE PLACE NAME.
+           The geocoder's idea of "Bengaluru" is a point, and for a locally
+           resolved city not even an extent — so the old code fell back to a
+           whole-planet distance and the answer was invisible. The companies
+           themselves carry the only honest extent available: fly to their
+           centroid, at a distance that fits their actual spread. Costs nothing
+           extra, works at any place on Earth, and needs no table of city
+           sizes. */
+        const spread = clusterFrame([...parks, ...firms], globe.radius);
+        if (spread) {
+            await globe.flyTo(spread.lat, spread.lng, { distance: spread.distance, ms: 1600 });
+        }
 
-        return { ok: true, place, companies, shown: companies.length, named: labelled.length };
+        /* THE CAMPUSES GET THEIR ACTUAL FOOTPRINT.
+           Google returns a tech park as one point; OSM has its boundary. The
+           outlines arrive one per second (Nominatim's published limit, held in
+           the main process) so they fill in over the following few seconds
+           rather than all at once — and any campus OSM has no polygon for
+           simply stays a pin instead of being given an invented circle. */
+        let outlined = 0;
+        osm.outlinesFor(parks, {
+            limit: 10,
+            onShape: (s) => {
+                if (markers.addOutline({ geojson: s.geometry, colour: 0xffb648, opacity: 0.85 })) {
+                    outlined++;
+                    codeOverlay.log(`outline ${s.name} <- ${s.osmClass}=${s.osmType} (${s.pointCount} pts)`);
+                }
+            }
+        }).catch(() => { /* boundaries are an enhancement; pins already drew */ });
+
+        const total = firms.length + parks.length;
+        const parkNote = parks.length ? ` and ${parks.length} tech park${parks.length === 1 ? '' : 's'}` : '';
+        statusBar.setTarget(place.name, total
+            ? `${firms.length} ${companyType || 'companies'}${parkNote} on the map, named.`
+            : `No ${companyType || 'companies'} found here.`);
+        codeOverlay.log(`companies("${query}") -> ${firms.length} firms + ${parks.length} tech parks, all named`);
+
+        return {
+            ok: true, place, companies: firms, parks,
+            shown: total, named: total,
+            framedKm: spread?.spreadKm ?? null
+        };
+    }
+
+    /**
+     * A LIST OF NAMED COMPANIES on the globe, each at its own head office.
+     *
+     * The other company search asks "what is near this point". This one starts
+     * from names — a market-cap ranking, a portfolio, a watchlist — and finds
+     * where on Earth each one actually is. Nothing about the position is
+     * inferred from the ranking: every pin is a coordinate Google returned for
+     * that company, and a company whose coordinates could not be confirmed is
+     * counted and named as unresolved rather than dropped quietly or, worse,
+     * placed at its country's centroid to make the map look complete.
+     *
+     * DRAWN AS THEY ARRIVE. Several hundred lookups take minutes; the globe
+     * fills in continuously and the status bar carries the running count, so
+     * the run is visibly working rather than apparently hung.
+     */
+    async function showCompanyList(entries, { title = 'companies', limit = 0 } = {}) {
+        if (!google.available()) {
+            statusBar.setTarget(null, 'Company lookup needs a Google Maps key.');
+            return { ok: false, error: 'company lookup needs a Google Maps key' };
+        }
+        const list = (entries || []).filter((e) => e && e.name);
+        if (!list.length) return { ok: false, error: 'no companies were supplied' };
+
+        if (!active) setActive(true);
+        markers.clear();
+        globe.clearArcs?.();
+        globe.setAutoRotate(false);
+        /* Start with the whole planet in frame: this list is global, so the
+           first pin could be anywhere and a city-level camera would simply
+           point at empty ocean while the lookups ran. */
+        await globe.flyTo(20, 20, { distance: globe.radius * 3.1, ms: 1200 });
+
+        const wanted = limit > 0 ? Math.min(limit, list.length) : list.length;
+        statusBar.setTarget(title, `Locating ${wanted} companies...`);
+
+        /* MARKET CAP AND THE DAY'S MOVE ARE DRAWN, NOT JUST CARRIED.
+           The ranking gives a real capitalisation and a real percentage move
+           per company, so the marker says both: area scales with the cube root
+           of market cap, and colour is the direction of today's move.
+
+           CUBE ROOT, NOT LINEAR. NVIDIA is five trillion and the thousandth
+           company is a hundred billion — a fiftyfold spread. Scaling a radius
+           linearly would make one dot fifty times wider than another and hide
+           whatever it sat on; a perceptual scale keeps the biggest company
+           roughly three times the smallest instead of fifty, which is the
+           difference between a chart and a blot. */
+        const caps = list.map((e) => e.marketCap).filter((v) => Number.isFinite(v) && v > 0);
+        const maxCap = caps.length ? Math.max(...caps) : 0;
+        const capToPx = (cap) => {
+            if (!Number.isFinite(cap) || cap <= 0 || !maxCap) return 6;
+            return 4 + 10 * Math.cbrt(cap / maxCap);
+        };
+
+        /* PREFER THE FILE. Coordinates for these companies were bought once,
+           validated against the ranking's country, and written to disk. Going
+           back to the live resolver when that file exists would re-buy every
+           one of them on every launch — the single most expensive mistake this
+           feature could make. Live resolution stays as the fallback for a
+           machine that has never run the resolver. */
+        const localHq = await marketCapBridge?.('localHq', {}).catch(() => null);
+        const hqTable = localHq?.ok && localHq.data?.available ? localHq.data.hq : null;
+        if (hqTable) {
+            let drawn = 0, missing = 0;
+            for (const e of list) {
+                const hq = e.ticker ? hqTable[e.ticker] : null;
+                if (!hq) { missing++; continue; }
+                const move = e.todayChangePct;
+                const colour = !Number.isFinite(move) ? 0x8fa6c4
+                    : move > 0 ? 0x2ce8a0 : move < 0 ? 0xff5c72 : 0xffb648;
+                markers.addMarker({
+                    lat: hq.lat, lng: hq.lng,
+                    label: e.name.toUpperCase(), kind: 'company',
+                    dotColour: colour,
+                    dotPx: capToPx(e.marketCap),
+                    priority: 2 + (Number.isFinite(e.rank) ? Math.min(3, e.rank / 400) : 3),
+                    /* Carried so a click can name the company, quote its price
+                       and fetch its photograph without a second lookup. */
+                    meta: {
+                        ticker: e.ticker, name: e.name, rank: e.rank,
+                        marketCapText: e.marketCapText, priceText: e.priceText,
+                        todayChangeText: e.todayChangeText,
+                        placeId: hq.placeId || null,
+                        address: hq.address, confidence: hq.confidence,
+                        precision: hq.precision, source: hq.source
+                    }
+                });
+                drawn++;
+                if (drawn % 500 === 0) statusBar.setTarget(title, `${drawn} plotted...`);
+            }
+            const spread = clusterFrame(list.filter((e) => e.ticker && hqTable[e.ticker])
+                .map((e) => ({ lat: hqTable[e.ticker].lat, lng: hqTable[e.ticker].lng })), globe.radius);
+            if (spread && spread.spreadKm < 4000) {
+                await globe.flyTo(spread.lat, spread.lng, { distance: spread.distance, ms: 1600 });
+            }
+            statusBar.setTarget(title, `${drawn} companies plotted${missing ? `, ${missing} without coordinates` : ''}.`);
+            codeOverlay.log(`companyList("${title}") -> ${drawn} from local HQ database, ${missing} unlocated, 0 lookups`);
+            return {
+                ok: true, source: 'local-hq',
+                resolved: [], unresolved: [], requested: list.length,
+                shown: drawn, missing, fromCache: drawn, billed: 0
+            };
+        }
+
+        const pins = [];
+        const result = await google.resolveCompanyList(list, {
+            limit,
+            concurrency: 4,
+            onResolved: (pin, done, total) => {
+                pins.push(pin);
+                /* Green up, red down, amber when the market is flat or the
+                   figure is missing — an unknown move must not read as a gain. */
+                const move = pin.todayChangePct;
+                const colour = !Number.isFinite(move) ? 0x8fa6c4
+                    : move > 0 ? 0x2ce8a0
+                        : move < 0 ? 0xff5c72 : 0xffb648;
+                markers.addMarker({
+                    lat: pin.lat, lng: pin.lng,
+                    label: pin.name.toUpperCase(), kind: 'company',
+                    dotColour: colour,
+                    dotPx: capToPx(pin.marketCap),
+                    /* Bigger companies win a contested label slot. Rank is the
+                       ordering the source already provides, so the globe does
+                       not invent an importance of its own. */
+                    priority: 2 + (Number.isFinite(pin.rank) ? Math.min(3, pin.rank / 400) : 3)
+                });
+                if (done % 10 === 0 || done === total) {
+                    statusBar.setTarget(title, `${done} of ${total} located...`);
+                }
+            }
+        });
+
+        /* Frame whatever came back. A global ranking stays a planet-wide shot;
+           a list that turns out to be one country frames that country. Same
+           rule either way, no special case for "is this list global". */
+        const spread = clusterFrame(result.resolved, globe.radius);
+        if (spread && spread.spreadKm < 4000) {
+            await globe.flyTo(spread.lat, spread.lng, { distance: spread.distance, ms: 1800 });
+        }
+
+        const missed = result.unresolved.length;
+        statusBar.setTarget(title,
+            `${result.resolved.length} of ${result.requested} located${missed ? `, ${missed} unresolved` : ''}.`);
+        codeOverlay.log(
+            `companyList("${title}") -> ${result.resolved.length}/${result.requested} located `
+            + `(${result.fromCache} cached, ${result.billed} looked up), ${missed} unresolved`
+        );
+
+        return { ok: true, ...result, pins, title };
+    }
+
+    /**
+     * Where to put the camera so a set of results is actually legible.
+     *
+     * Returns the centroid of the points and the camera distance that fits
+     * their spread into the frame. The 90th percentile rather than the maximum,
+     * because one office in an outer suburb should not pull the camera back
+     * until the other fifty are a smudge again — the outlier stays on the map,
+     * it just does not get to decide the zoom.
+     */
+    function clusterFrame(points, radius) {
+        const pts = (points || []).filter((p) => Number.isFinite(p.lat) && Number.isFinite(p.lng));
+        if (!pts.length) return null;
+        const lat = pts.reduce((s, p) => s + p.lat, 0) / pts.length;
+        const lng = pts.reduce((s, p) => s + p.lng, 0) / pts.length;
+        const ds = pts.map((p) => distanceKm(lat, lng, p.lat, p.lng))
+            .filter(Number.isFinite).sort((a, b) => a - b);
+        /* A floor of 0.5 km stops a single result — where the spread is zero —
+           from asking for a camera inside the planet. */
+        const spreadKm = Math.max(0.5, ds[Math.min(ds.length - 1, Math.floor(ds.length * 0.9))] || 0.5);
+        const halfWidth = (spreadKm / EARTH_RADIUS_KM) * radius;
+        /* Fill about two thirds of the vertical field of view, leaving room for
+           the names that hang above their dots. */
+        const halfFov = (45 * Math.PI / 180) / 2 * 0.62;
+        const altitude = halfWidth / Math.tan(halfFov);
+        return {
+            lat, lng, spreadKm,
+            distance: Math.max(radius * 1.0025, Math.min(radius * 4, radius + altitude))
+        };
     }
 
     async function showRoute(fromQuery, toQuery) {
@@ -813,10 +1138,13 @@ export async function createGlobeMode({ scene, camera, renderer }) {
            draggable, not clickable. */
         hoverFrame = (hoverFrame + 1) % 3;
         if (hoverArmed && hoverFrame === 0) {
+            /* One instanced mesh, one intersect. The previous version built an
+               array of every marker's `.dot` mesh on every third frame — with
+               eleven thousand companies that was an eleven-thousand-element
+               allocation twenty times a second, for a cursor. It also read a
+               field that no longer exists once the dots became instances. */
             hoverRay.setFromCamera(hoverPt, camera);
-            const dots = markers.markers.map((m) => m.dot).filter((d) => d && d.visible);
-            const hit = dots.length && hoverRay.intersectObjects(dots, false).length > 0;
-            const cursor = hit ? 'pointer' : '';
+            const cursor = markers.pick(hoverRay) ? 'pointer' : '';
             if (renderer.domElement.style.cursor !== cursor) renderer.domElement.style.cursor = cursor;
         }
         markers.update();
@@ -854,7 +1182,7 @@ export async function createGlobeMode({ scene, camera, renderer }) {
         setActive,
         toggle: () => setActive(!active),
         isActive: () => active,
-        update, showLocation, showRoute, showCompanies, dispose,
+        update, showLocation, showRoute, showCompanies, showCompanyList, dispose,
         cams: camViewer,
         theme: themeManager,
         satellites: { toggle: setSatellites, service: satelliteService, layer: satelliteLayer },

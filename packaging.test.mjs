@@ -142,6 +142,64 @@ check('the built renderer is packaged',
         missing.length === 0);
 }
 
+// ── data directories, which no dependency walk can see ──────────────────────
+//
+// `companiesMarketCap.js` reads `data/companies-ranking.json` with
+// `fs.readFileSync(path.join(__dirname, 'data', ...))`. That is not a require,
+// so every check above is blind to it — and both allowlists were in fact
+// missing `data/` when the companies layer landed.
+//
+// The failure is the quiet kind rather than the loud one that motivated this
+// file. Nothing crashes: `localRanking` finds no file, correctly reports
+// `available: false, reason: 'not-crawled'`, and the globe falls back to the
+// hand-transcribed list. A packaged build would ship 11,222 companies' worth of
+// resolved head offices as 60 names, and look like it was working.
+{
+    const pkg = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf-8'));
+    const npmFiles = new Set(pkg.files || []);
+
+    // Every `path.join(__dirname, 'x', ...)` in a root module, where x is a
+    // directory of pure data.
+    //
+    // The "pure data" filter — every entry is a .json file — is what keeps this
+    // check from firing on `build/`, `static/`, `bin/`, `companion/`,
+    // `resources/` and `dist/`. Those are all joined the same way and all reach
+    // the build by a different route: a glob, `extraResources`, or Vite folding
+    // them into the bundle. A rule that flagged them would be noise, and noise
+    // is how a check stops being read.
+    const isDataDir = (dir) => {
+        const entries = readdirSync(path.join(root, dir), { withFileTypes: true });
+        return entries.length > 0 && entries.every((e) => e.isFile() && e.name.endsWith('.json'));
+    };
+
+    const dataDirs = new Set();
+    for (const file of readdirSync(root).filter((f) => f.endsWith('.js'))) {
+        const src = readFileSync(path.join(root, file), 'utf-8');
+        for (const m of src.matchAll(/path\.join\(\s*__dirname\s*,\s*['"]([A-Za-z0-9_.-]+)['"]\s*,/g)) {
+            if (!existsSync(path.join(root, m[1]))) continue;
+            if (!isDataDir(m[1])) continue;
+            dataDirs.add(`${m[1]}/`);
+        }
+    }
+
+    check(`root modules read from data directories (${[...dataDirs].join(', ') || 'none'})`,
+        dataDirs.size > 0);
+
+    const notNpm = [...dataDirs].filter((d) => !npmFiles.has(d));
+    check(`every data directory is in package.json files${notNpm.length ? ` — MISSING: ${notNpm.join(', ')}` : ''}`,
+        notNpm.length === 0);
+
+    const notBuilder = [...dataDirs].filter((d) => !listed.has(d) && !listed.has(d.replace(/\/$/, '')));
+    check(`every data directory is in electron-builder files${notBuilder.length ? ` — MISSING: ${notBuilder.join(', ')}` : ''}`,
+        notBuilder.length === 0);
+
+    // Named, because this is the one that would have shipped.
+    check('the crawled company ranking exists',
+        existsSync(path.join(root, 'data', 'companies-ranking.json')));
+    check('the resolved head offices exist',
+        existsSync(path.join(root, 'data', 'companies-hq.json')));
+}
+
 // npm's own allowlist has the same failure mode: a root module added to
 // exports/bin but left out of `files` ships a package that cannot start.
 {

@@ -1,7 +1,7 @@
 {
   "name": "@ashutosh0x/jarvis",
-  "version": "0.9.0",
-  "description": "A local-first desktop AI assistant: federated live web search with no API key, semantic capability routing, on-device vision and OCR, neural TTS, live Android screen mirroring with touch control, Spotify search and playback, multimodal feedback, and a self-healing supervisor. Ships as an Electron app and an importable search library.",
+  "version": "0.10.0",
+  "description": "A local-first desktop AI assistant: federated live web search with no API key, semantic capability routing, a vector-globe command centre with live earth layers and 11,222 companies mapped to their head offices, on-device vision and OCR, neural TTS, live Android screen mirroring with touch control, Spotify search and playback, multimodal feedback, and a self-healing supervisor. Ships as an Electron app and an importable search library.",
   "main": "electron.js",
   "scripts": {
     "test": "node scripts/run-tests.mjs",
@@ -56,6 +56,11 @@
     "music",
     "semantic-routing",
     "embeddings",
+    "globe",
+    "threejs",
+    "geospatial",
+    "openstreetmap",
+    "market-cap",
     "jarvis"
   ],
   "author": {
@@ -133,6 +138,9 @@
     "autostart.js",
     "googleCalendar.js",
     "googleMaps.js",
+    "osmGeometry.js",
+    "companiesMarketCap.js",
+    "data/",
     "lumaEvents.js",
     "aviation.js",
     "trafficCams.js",

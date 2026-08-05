@@ -1113,7 +1113,7 @@ check('a null response does not throw', normaliseList(null).length === 0);
         'ollama', 'google', 'openai', 'python', 'webgl',
         'googlecalendar', 'googlemeet', 'auth0', 'webaudio', 'npm',
         'googlemaps', 'openstreetmap', 'wikipedia', 'wikimediacommons',
-        'googleearth', 'nasa', 'airplayaudio', 'esri',
+        'googleearth', 'nasa', 'airplayaudio', 'esri', 'wikidata',
         'spotify', 'android', 'kotlin', 'gradle', 'square', 'socketdotio',
         'windows'
     ]);
@@ -1448,26 +1448,76 @@ check('a null response does not throw', normaliseList(null).length === 0);
     /* The corporate-suffix filter. It must keep real companies and drop the
        hotels and malls a business search drags in — and fail SAFE, missing an
        unsuffixed campus rather than showing a hotel as a company. */
-    const { looksLikeCompany } = await import('../googleServices.js');
-    check('a Pvt Ltd is kept', looksLikeCompany('Salesforce India Pvt Ltd', []));
-    check('an LLC is kept', looksLikeCompany('Acme Robotics LLC', []));
-    check('a corporate_office type is enough on its own', looksLikeCompany('IBM EGL D Block', ['corporate_office']));
-    check('a company word carries an unsuffixed name', looksLikeCompany('ASM Technologies', []));
-    check('a bare well-known name with the office type survives', looksLikeCompany('Google', ['corporate_office']));
-    check('a hotel is dropped', !looksLikeCompany('The Leela Palace Bengaluru', ['lodging']));
-    check('a shopping complex is dropped', !looksLikeCompany('Jayanagar Shopping Complex', []));
-    check('a bank building is dropped', !looksLikeCompany('Mysore Bank Building', []));
+    const { looksLikeCompany, looksLikeTechPark, classifyPlace } = await import('../googleServices.js');
+
+    /* CLASSIFICATION IS BY TAG, AND THE TESTS ARE WRITTEN IN NAMES THAT WOULD
+       FOOL A NAME MATCHER. The previous version of these checks passed strings
+       like "Salesforce India Pvt Ltd" and asserted the suffix carried it —
+       which is exactly the behaviour that could not survive leaving English.
+       These pass tags instead, and deliberately use names that point the wrong
+       way, to prove no name is being read. */
+    check('a corporate_office is a company', looksLikeCompany(['corporate_office']));
+    check('a software_company is a company', looksLikeCompany(['software_company']));
+    check('a manufacturer is a company', looksLikeCompany(['manufacturer']));
+    check('a lodging tag is dropped even with an office-ish name',
+        !looksLikeCompany(['lodging', 'point_of_interest']));
+    check('a shopping_mall is dropped', !looksLikeCompany(['shopping_mall']));
+    check('a restaurant is dropped', !looksLikeCompany(['restaurant', 'food']));
+    check('a bare point_of_interest is not evidence of anything',
+        !looksLikeCompany(['point_of_interest']));
+    /* The measured case: 33 of 60 real results had no type beyond the generic
+       pair, and 51 of 60 had a website. Tag-only classification would have
+       dropped more than half the companies in the city, so a website is
+       accepted as weaker evidence — at a lower confidence that says so. */
+    check('a website carries an otherwise untyped place',
+        looksLikeCompany(['point_of_interest', 'establishment'], { website: 'https://example.com' }));
+    check('and it is reported at reduced confidence, not as certainty',
+        classifyPlace({ types: ['point_of_interest', 'establishment'], website: 'https://x.com' }).confidence < 0.7);
+    check('no type and no website stays unknown rather than being waved through',
+        !looksLikeCompany(['point_of_interest', 'establishment']));
+    check('a website does NOT rescue a restaurant',
+        !looksLikeCompany(['restaurant'], { website: 'https://example.com' }));
+
+    /* The generalisation the regex could never do: these are the tags a
+       German, Japanese or Brazilian campus carries, and no English appears. */
+    check('industrial_park is a campus', looksLikeTechPark(['industrial_park']));
+    check('business_park is a campus', looksLikeTechPark(['business_park']));
+    check('OSM landuse=commercial is a campus',
+        looksLikeTechPark([], { osmClass: 'landuse', osmType: 'commercial' }));
+    check('a city park is NOT a campus', !looksLikeTechPark(['park']));
+    check('a campus tag outranks a company tag on the same place',
+        classifyPlace({ types: ['industrial_park', 'corporate_office'] }).kind === 'campus');
+
+    /* Institutions get their own kind rather than being rejected as venues —
+       they are things the globe should mark, not noise to filter out. */
+    check('a university classifies as university',
+        classifyPlace({ osmClass: 'amenity', osmType: 'university' }).kind === 'university');
+    check('an aerodrome classifies as airport',
+        classifyPlace({ osmClass: 'aeroway', osmType: 'aerodrome' }).kind === 'airport');
+    check('an unknown place is reported as unknown, not guessed',
+        classifyPlace({ types: ['establishment'] }).kind === 'unknown');
+    check('confidence travels with the verdict',
+        classifyPlace({ types: ['corporate_office'] }).confidence > 0.9);
+    check('evidence names its source',
+        classifyPlace({ types: ['corporate_office'] }).evidence.includes('google:corporate_office'));
 
     /* strict filtering is applied in searchCompanies. */
+    /* Note the fixture carries TYPES now, because that is what the filter
+       reads. The company is deliberately given only the generic pair plus a
+       website — the commonest real shape, measured at 33 of 60 live results —
+       so this pins the case that would otherwise silently lose most of them. */
     const filtered = createGoogleServices({
         bridge: async () => ({ ok: true, data: { places: [
-            { id: '1', displayName: { text: 'Foo Technologies Pvt Ltd' }, location: { latitude: 1, longitude: 1 } },
+            { id: '1', displayName: { text: 'Foo Technologies Pvt Ltd' }, location: { latitude: 1, longitude: 1 },
+                types: ['point_of_interest', 'establishment'], websiteUri: 'https://foo.example' },
             { id: '2', displayName: { text: 'Grand Plaza Hotel' }, location: { latitude: 2, longitude: 2 }, types: ['lodging'] }
         ] } })
     });
     const kept = await filtered.searchCompanies('technology companies', { lat: 1, lng: 1 });
     check('searchCompanies keeps the company and drops the hotel',
         kept.length === 1 && kept[0].name === 'Foo Technologies Pvt Ltd');
+    check('the kept result carries its confidence and evidence',
+        kept[0].confidence >= 0.5 && Array.isArray(kept[0].evidence) && kept[0].evidence.length > 0);
     const loose = await filtered.searchCompanies('technology companies', { lat: 1, lng: 1, strict: false });
     check('strict:false keeps everything for callers that want it', loose.length === 2);
 }

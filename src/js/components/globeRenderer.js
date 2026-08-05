@@ -270,7 +270,16 @@ export async function createGlobe({ scene, camera, domElement, loadGeoJson }) {
     controls.enableDamping = true;
     controls.dampingFactor = 0.08;
     controls.enablePan = false;             // panning a globe just loses it
-    controls.minDistance = GLOBE_RADIUS * 1.12;
+    /* CITY SCALE IS A REAL SCALE. The old floor of 1.12 radii held the camera
+       764 km up, where a city's worth of company markers — twenty kilometres
+       across — subtends a third of a degree and every one of them lands on the
+       same three pixels. Fifty-one dots stacked on one dot is not fifty-one
+       dots. The floor is now just above the surface so a street-scale cluster
+       can actually be framed; the surface goes featureless down there because
+       the vector layers are 110m Natural Earth, and that is the honest trade —
+       a blank amber field with fifty-one legible names beats a perfect
+       coastline with one green smudge on it. */
+    controls.minDistance = GLOBE_RADIUS * 1.0015;
     controls.maxDistance = GLOBE_RADIUS * 6;
     controls.rotateSpeed = 0.45;
     controls.zoomSpeed = 0.8;
@@ -425,12 +434,31 @@ export async function createGlobe({ scene, camera, domElement, loadGeoJson }) {
 
         syncSunUniform();
         controls.update();
+        syncNearPlane();
+    }
+
+    /* THE NEAR PLANE HAS TO FOLLOW THE CAMERA DOWN.
+       The shared camera is built for the orb at near = 0.1, which is twenty
+       times further out than the camera itself sits when it is framing a city
+       — everything, globe included, falls in front of the near plane and is
+       clipped away to nothing. Tying it to altitude keeps the depth buffer's
+       precision where the geometry is instead of spending it on empty space.
+       Restored on the way out so orb mode gets the camera it started with. */
+    const baseNear = camera.near;
+    function syncNearPlane() {
+        const altitude = camera.position.length() - GLOBE_RADIUS;
+        const want = Math.min(baseNear, Math.max(0.0002, altitude * 0.08));
+        if (Math.abs(camera.near - want) > want * 0.2) {
+            camera.near = want;
+            camera.updateProjectionMatrix();
+        }
     }
 
     function setVisible(on) {
         group.visible = on;
         controls.enabled = on;
-        if (on) controls.update();
+        if (on) { controls.update(); syncNearPlane(); }
+        else if (camera.near !== baseNear) { camera.near = baseNear; camera.updateProjectionMatrix(); }
     }
 
     function dispose() {
