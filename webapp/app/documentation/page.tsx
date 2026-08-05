@@ -5,7 +5,7 @@ import { ArrowLeft } from "lucide-react";
 export const metadata: Metadata = {
   title: "Documentation - JARVIS",
   description:
-    "How JARVIS works in detail: architecture, the voice pipeline, hybrid retrieval, cognitive memory, deterministic finance and on-chain engines, and the Android companion.",
+    "How JARVIS works in detail: architecture, the voice pipeline, hybrid retrieval, cognitive memory, deterministic finance and on-chain engines, the vector-globe command centre with 11,222 companies mapped to their head offices, and the Android companion.",
 };
 
 // ---------------------------------------------------------------------------
@@ -103,6 +103,8 @@ const toc = [
   { id: "calendar", label: "Calendar and meetings" },
   { id: "companion", label: "Android companion" },
   { id: "mirror", label: "Screen mirror" },
+  { id: "globe", label: "Globe" },
+  { id: "companies", label: "Companies on the globe" },
   { id: "ports", label: "Network ports" },
   { id: "privacy", label: "Privacy model" },
   { id: "install", label: "Install & run" },
@@ -916,7 +918,146 @@ You     yes`}</Code>
             </p>
           </Section>
 
-          <Section id="ports" eyebrow="21" title="Network ports">
+          <Section id="globe" eyebrow="21" title="Globe">
+            <p>
+              Press <Term>F3</Term>, or ask for a place, and the orb becomes a command
+              centre: a dark sphere with a glowing amber vector network, a pin on the
+              target, labelled landmarks on leader lines, and live seismic ripples. Press{" "}
+              <Term>L</Term> for the layer switchboard, <Term>T</Term> to cycle the amber,
+              ghost and tactical themes.
+            </p>
+            <Code>{`show me Japan on map
+show me MG Road Bengaluru
+what is flying over Tokyo
+show me AI companies in San Francisco`}</Code>
+            <p>
+              <strong>Vectors, not satellite imagery.</strong> The obvious build is 16 MB of
+              NASA Blue Marble textures on a sphere. Vectors won on all three axes: 2.2 MB of
+              public-domain Natural Earth GeoJSON ships in the repo and works offline; lines
+              stay sharp at city zoom where an 8K equirectangular is roughly 2 km per pixel;
+              and photoreal reads as Google Earth rather than as a command centre. The globe
+              is a group inside the orb&apos;s <em>existing</em> scene, driven from the
+              existing render loop — one WebGL context, one camera.
+            </p>
+            <p>
+              <strong>Framing is measured, not tabulated.</strong> There is no table mapping
+              country to a zoom level. Google&apos;s geocoding response carries a viewport,
+              and the camera distance is derived from the extent it reports — Japan measures
+              3,331 km across, a street 2 km — through one continuous curve. The same
+              measurement scales the landmark ring, because ten kilometres around Japan finds
+              one suburb of Tokyo and calls it the country.
+            </p>
+            <Table
+              head={["Layer", "Key needed", "Ships on"]}
+              rows={[
+                ["USGS earthquakes", "none", "Yes"],
+                ["OpenSky aircraft", "none", "Yes"],
+                ["Satellites, SGP4 from CelesTrak", "none", "Yes"],
+                ["Aurora / Kp index (NOAA)", "none", "Yes"],
+                ["Road cameras (TfL, Singapore LTA)", "none", "Yes"],
+                ["NASA EONET: volcanoes, storms, ice", "none", "Yes"],
+                ["Company head offices (11,222)", "none — crawled to disk", "Yes"],
+                ["OSM campus shapes (Nominatim)", "none", "Yes"],
+                ["Windy webcams worldwide", "free key", "Needs key"],
+                ["NASA FIRMS wildfires", "free MAP_KEY", "Needs key"],
+                ["Luma events", "Luma Plus", "Needs key"],
+              ]}
+            />
+            <p>
+              An off layer costs nothing: polling runs only while a layer is visible, and a
+              hidden feed contributes nothing to the ticker, the ripples or proximity search
+              — switching it off stops the work rather than hiding the result. A layer that
+              refuses to switch on leaves its switch off, because a panel showing
+              &ldquo;on&rdquo; over an empty sky would be a lie about what is drawn.
+            </p>
+            <p>
+              <strong>Satellites are propagated, not plotted.</strong> A TLE is not a
+              position — it is a set of orbital elements valid at an epoch, so turning it
+              into &ldquo;where is the ISS now&rdquo; means running SGP4. Drawing a satellite
+              at its epoch sub-point instead is wrong by thousands of kilometres within
+              minutes; the ISS covers 7.7 km every second. Verified against live CelesTrak
+              data at ~423 km altitude and ~415 km of ground track per minute.
+            </p>
+            <p>
+              <strong>What the aircraft layer will not claim.</strong> OpenSky&apos;s state
+              vectors carry callsign, position, altitude, heading and speed — no origin and
+              no destination. So a route query draws the great-circle corridor and says how
+              many aircraft are over it, and says out loud that it cannot confirm where they
+              are going. Some of them are simply crossing.
+            </p>
+          </Section>
+
+          <Section id="companies" eyebrow="22" title="Companies on the globe">
+            <p>
+              Switch the Companies layer on and the world&apos;s public companies appear
+              where their head offices actually are — sized by market capitalisation,
+              coloured by the day&apos;s move. Click one for its price, rank, address and a
+              photograph of the office.
+            </p>
+            <p>
+              This is a <strong>local database, not a live dependency</strong>. Two crawls
+              were paid for once and committed to the repository, so the layer reads from
+              disk and works offline.
+            </p>
+            <Table
+              head={["Step", "Cost", "Result"]}
+              rows={[
+                ["Ranking crawl", "113 API credits", "11,222 companies across 81 countries"],
+                ["Head-office resolution", "14,144 Places lookups, ≈ $453", "10,995 resolved coordinates"],
+                ["Wikidata fallback", "free", "36 city-level coordinates Places refused"],
+              ]}
+            />
+            <p>
+              <strong>Every coordinate is validated, not assumed.</strong> A merely plausible
+              coordinate is worse than none: it puts a real company at a real place that is
+              the wrong place, and nothing downstream can tell. Two checks must pass. The ISO
+              country on the result must equal the country the ranking recorded — this is
+              what stops <em>Reliance</em>, ticker <Term>RS</Term> and an American steel
+              distributor, being pinned to Mumbai, since Google ranks the Indian conglomerate
+              first for that name whatever region you bias toward. And the matched place name
+              must share a meaningful token with the company name.
+            </p>
+            <p>
+              Anything failing either check is recorded as rejected <em>with its reason</em>,
+              not silently dropped and not quietly kept — 106 name mismatches, 78 with no
+              candidate, 42 in the wrong country. Those 226 companies are absent from the
+              globe rather than approximated.
+            </p>
+            <p>
+              The crawl is resumable and budgeted, because a $453 script that is neither is a
+              script that spends the money twice. Results are written as they land, keyed by
+              ticker, so a crash at company 9,000 does not re-buy 9,000 lookups. Negative
+              results are cached too, or every rerun re-buys every failure forever. The
+              lookup budget defaults to 200 rather than &ldquo;all&rdquo;, because the
+              expensive default is the one that gets run by accident.
+            </p>
+            <p>
+              <strong>Photographs are fetched on demand.</strong> Each is two billed requests,
+              so sweeping all 10,959 would be roughly $263 and 877 MB of pictures nobody
+              asked for. One click is about half a cent, and the second click on the same
+              company is free — photos cache to disk rather than memory, because they are
+              large, they never change, and a cache that empties on restart re-buys them
+              every launch.
+            </p>
+            <p>
+              A separate live search answers the different question, <em>what companies are
+              here</em>. Nothing is baked: the query is biased to the target&apos;s
+              coordinates and the bias radius scales with the place, so a country is not
+              searched as a 5 km circle around its centroid. Sixty results is Google&apos;s
+              hard ceiling per query, so the reply says &ldquo;N on the map&rdquo; rather
+              than claiming to have found every company in the city. That layer is off by
+              default, because each navigation with it on is a billed search.
+            </p>
+            <p>
+              The original design here was a 5,000-row spreadsheet of &ldquo;verified&rdquo;
+              companies for eight Indian cities, baked into the globe. It was rejected: that
+              is stale the day it is written, answers only its eight cities, and is
+              unverifiable — a model generating 5,000 verified companies is exactly the
+              fabrication this project forbids.
+            </p>
+          </Section>
+
+          <Section id="ports" eyebrow="23" title="Network ports">
             <p>
               Every listener binds locally or to the LAN. None is exposed to the internet.
             </p>
@@ -938,7 +1079,7 @@ You     yes`}</Code>
             </p>
           </Section>
 
-          <Section id="privacy" eyebrow="22" title="Privacy model">
+          <Section id="privacy" eyebrow="24" title="Privacy model">
             <p>
               Privacy is the architecture, not a setting. Your microphone, screen captures,
               and conversations stay on local disk because there is no provider server to
@@ -961,7 +1102,7 @@ You     yes`}</Code>
             </p>
           </Section>
 
-          <Section id="install" eyebrow="23" title="Install & run">
+          <Section id="install" eyebrow="25" title="Install & run">
             <p>
               The fastest path is npm. This installs the app and its Electron runtime,
               and puts a <Term>jarvis</Term> command on your PATH.

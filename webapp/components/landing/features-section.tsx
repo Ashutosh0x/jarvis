@@ -42,11 +42,17 @@ const features = [
   {
     number: "07",
     title: "A globe that answers",
-    description: "Say \"show me Tokyo\" and the orb becomes a command centre — a dark sphere of glowing amber coastlines, a pin on the target, live earthquake ripples, satellites propagated to where they actually are, and public webcams near the target. A switchboard (press L) turns each data layer on or off. On arrival it reports what is true there: local time, weather, elevation, air quality, and real photographs with their attribution.",
+    description: "Say \"show me Tokyo\" and the orb becomes a command centre — a dark sphere of glowing amber coastlines, a pin on the target, live earthquake ripples, satellites propagated to where they actually are, volcanoes and storms from NASA, and public webcams near the target. A switchboard (press L) turns each data layer on or off; T cycles three themes. On arrival it reports what is true there: local time, weather, elevation, air quality, and real photographs with their attribution.",
     visual: "globe",
   },
   {
     number: "08",
+    title: "Eleven thousand companies, where they actually are",
+    description: "Switch on the Companies layer and the world's public companies appear at their head offices, sized by market cap and coloured by the day's move. Click one for its price, rank, address and a photograph of the office. Every one of the 10,995 coordinates was validated against the country and the name before it was kept — the 226 that failed are recorded with the reason and left off the globe rather than approximated.",
+    visual: "globe",
+  },
+  {
+    number: "09",
     title: "Private by design",
     description: "No hosted model, no model API keys, no conversation data leaving your disk. Outbound traffic is limited to live-data lookups — a search, a quote, a block — each carrying only the subject of the question. Per-query cost is zero.",
     visual: "security",

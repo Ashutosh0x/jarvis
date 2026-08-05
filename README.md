@@ -41,6 +41,14 @@
 </p>
 
 <p align="center">
+  <img src="https://img.shields.io/badge/NASA%20EONET-0B3D91?style=for-the-badge&logo=nasa&logoColor=white" alt="NASA EONET" />
+  <img src="https://img.shields.io/badge/Wikidata-006699?style=for-the-badge&logo=wikidata&logoColor=white" alt="Wikidata" />
+  <img src="https://img.shields.io/badge/CelesTrak%20SGP4-1B4C7E?style=for-the-badge" alt="CelesTrak SGP4" />
+  <img src="https://img.shields.io/badge/NOAA%20SWPC-005EB8?style=for-the-badge" alt="NOAA Space Weather Prediction Center" />
+  <img src="https://img.shields.io/badge/11%2C222%20companies%20mapped-2CA02C?style=for-the-badge" alt="11,222 companies mapped" />
+</p>
+
+<p align="center">
   <img src="https://img.shields.io/badge/Spotify-1DB954?style=for-the-badge&logo=spotify&logoColor=white" alt="Spotify Web API" />
   <img src="https://img.shields.io/badge/Android-34A853?style=for-the-badge&logo=android&logoColor=white" alt="Android" />
   <img src="https://img.shields.io/badge/Kotlin-7F52FF?style=for-the-badge&logo=kotlin&logoColor=white" alt="Kotlin" />
@@ -738,6 +746,7 @@ can read and why one is missing.
 | `LUMA_API_KEY` | Globe: events from one Luma calendar (needs Luma Plus) | No events layer; every other globe feature is unaffected |
 | `AVIATIONSTACK_API_KEY` | Globe: real flight routes with origin and destination | Live aircraft still shown from OpenSky, but a route query reports traffic over the corridor rather than named flights |
 | `WINDY_WEBCAMS_API_KEY` | Globe: ~70,000 opt-in public webcams worldwide | Camera layer still covers London and Singapore road cameras |
+| `PARSE_API_KEY` | Globe: refreshing the company ranking, and per-company revenue history. **Metered — one credit per uncached call** | The 11,222-company crawl in `data/` still draws in full; it is a snapshot rather than today's prices |
 
 Networks are **discovered, not assumed**: each candidate endpoint must return
 the chain ID it claims before it is used. On the free Alchemy tier this
@@ -1265,9 +1274,11 @@ show me Karnataka
 take me to Tokyo
 show me MG Road Bengaluru
 show me what's happening in San Francisco
+show me AI companies in San Francisco
 ```
 
-Country, state, city, street and building all resolve. Full reference:
+Country, state, city, street and building all resolve. Press **L** for the layer
+switchboard and **T** to cycle themes. Full reference:
 **[docs/GLOBE.md](docs/GLOBE.md)**.
 
 ### Vectors, not satellite imagery
@@ -1333,28 +1344,95 @@ dropped rather than shown bare. If nothing has a picture, nothing is shown.
 | Satellites (CelesTrak SGP4) | none | ✅ |
 | Aurora / Kp (NOAA) | none | ✅ |
 | Road cameras (TfL, Singapore) | none | ✅ |
+| NASA EONET (volcanoes, storms, ice) | none | ✅ |
+| Company head offices (11,222) | none — crawled to `data/` | ✅ |
+| OSM campus shapes (Nominatim) | none | ✅ |
 | Windy webcams (worldwide) | free key | needs key |
 | NASA FIRMS wildfires | free MAP_KEY | needs key |
+| Companies at a place (Places) | Google | needs key |
 | Luma events | Luma Plus | needs key |
 | Flight routes (AviationStack) | free tier | needs key |
 
-Every layer is toggleable from a glass switchboard — press **L**. A layer
-switched off stops its polling and contributes nothing downstream; one that
-fails to load shows the reason on its row rather than an empty, silent map.
-A feed with no credentials reports itself unconfigured **with the reason** and
-never polls.
+Every layer is toggleable from a glass switchboard — press **L**, and cycle the
+amber / ghost / tactical themes with **T**. A layer switched off stops its
+polling and contributes nothing downstream; one that fails to load shows the
+reason on its row rather than an empty, silent map. A feed with no credentials
+reports itself unconfigured **with the reason** and never polls.
 
-Two of these are new and worth a line. **Satellites** are propagated with SGP4
-from live CelesTrak elements — the ISS is drawn where it actually is
-(~423 km, ~415 km/min), not at the sub-point of its element epoch. **Cameras**
-are public road cameras and opt-in Windy webcams, fetched entirely in the main
-process so no third-party camera URL ever reaches the renderer; nothing scans
-for private IP cameras.
+Three of these are worth a line. **Satellites** are propagated with SGP4 from
+live CelesTrak elements — the ISS is drawn where it actually is (~423 km,
+~415 km/min), not at the sub-point of its element epoch. **Cameras** are public
+road cameras and opt-in Windy webcams, fetched entirely in the main process so
+no third-party camera URL ever reaches the renderer; nothing scans for private
+IP cameras. **EONET** deliberately fetches only the categories Jarvis lacks —
+its open feed is ~7,000 events of which ~6,950 are wildfires, which the FIRMS
+layer already draws from a better feed.
 
 Luma events deserve one caution: their API is **scoped to a single calendar**
 and has no search endpoint — 66 endpoints, none of them discovery. It shows
 *your* events wherever they are, not the world's, and the feed is named "Luma
 (my calendar)" so nothing implies otherwise.
+
+### Companies, at their head offices
+
+Switch the **Companies** layer on and the world's public companies appear where
+they actually are — sized by market capitalisation, coloured by the day's move,
+green up and red down. Click one for its price, rank, address and a photograph
+of the office.
+
+This is a **local database**, not a live dependency. Two crawls, paid for once:
+
+| Step | Cost | Result |
+| --- | --- | --- |
+| `scripts/fetch-ranking.mjs` | 113 API credits | 11,222 companies across 81 countries |
+| `scripts/resolve-hq.mjs` | 14,144 Places lookups, ≈ $453 | 10,995 resolved coordinates |
+
+Both ship in `data/`, are read from disk, and work offline. The globe must
+prefer them over resolving live — a launch that re-buys eleven thousand lookups
+already sitting in a file is the most expensive mistake this feature could make.
+
+**Every coordinate is validated, not assumed.** A merely plausible coordinate is
+worse than none: it puts a real company at a real place that is the wrong place,
+and nothing downstream can tell. The ISO country must match the one the ranking
+recorded — this is what stops *Reliance* (ticker `RS`, an American steel
+distributor) being pinned to Mumbai — and the matched place name must share a
+meaningful token with the company. Failures are **recorded with their reason**,
+not silently dropped and not quietly kept:
+
+```
+10,995 resolved      10,959 building-level (Places) · 36 city-level (Wikidata)
+   226 rejected      106 name mismatch · 78 no candidates · 42 wrong country
+```
+
+Photographs are fetched **on demand** — two billed requests each, so sweeping all
+10,959 would be about $263 and 877 MB of pictures nobody asked for. One click is
+half a cent, and the second click is free because photos cache to disk.
+
+A separate live search answers the other question, *"what companies are here"*:
+
+```
+show me AI companies in San Francisco
+find fintech companies in London
+```
+
+Nothing is baked. The query is biased to the target's coordinates and the bias
+radius scales with the place, so a country is not searched as a 5 km circle
+around its centroid. Sixty results is Google's hard ceiling per query, and the
+reply says *"N on the map"* rather than claiming to have found every company in
+the city. That layer is off by default because each navigation with it on is a
+billed search.
+
+### Shapes, not just points
+
+Google returns Manyata Tech Park — a 120-hectare campus with fifty buildings —
+as one pin the same size as a coffee shop. OpenStreetMap has it as a polygon
+with its real boundary. So Google finds it and OSM shapes it, keylessly.
+
+Built on **Nominatim rather than Overpass**: four Overpass endpoints were probed
+and all four returned 504 or timed out, and a globe that goes blank when a
+volunteer server is busy is not a globe. Nominatim's one-request-per-second
+policy is enforced by a serialised queue in code, so it cannot be violated by a
+caller who forgets it.
 
 ### The key stays in the main process
 
@@ -1364,6 +1442,17 @@ process** and never crosses the bridge; the renderer sends a whitelisted method
 name and receives data back. Enabling Google also obliges their logo on a
 non-Google map and forbids caching place content, both of which the
 implementation honours.
+
+`PARSE_API_KEY` follows the identical rule in `companiesMarketCap.js`, and adds
+one of its own: because every uncached call costs a credit, nothing in that
+module paginates on its own. `ranking()` takes an explicit page, and a caller
+wanting ten pages has to ask for ten. Successes cache to disk for twelve hours;
+**failures are never cached**, because a failure was not charged and caching it
+would hide a transient problem for half a day.
+
+`osmGeometry.js` needs no key at all — the boundary of a campus should not
+depend on anyone's billing account — but it is still main-process only, for the
+same reason: the renderer gets results, never the network surface.
 
 ---
 
@@ -1585,6 +1674,30 @@ on port 5173.
 | `npm run smoke` | Launch the packaged app and assert it starts |
 | `npm run electron:build` | Legacy alias for a plain `electron-builder` run |
 
+### The data crawls
+
+Not npm scripts, and deliberately so: these **spend money**, and the results are
+already committed to `data/`. Nobody needs to run them to use the globe — they
+exist so the database can be refreshed, and so its provenance is reproducible
+rather than asserted.
+
+| Command | Cost | Effect |
+| --- | --- | --- |
+| `node scripts/fetch-ranking.mjs --status` | none | What is already crawled |
+| `node scripts/fetch-ranking.mjs --pages 3` | 3 credits | Three pages, 300 companies |
+| `node scripts/fetch-ranking.mjs --all --max-credits 120` | ≤ 120 credits | The full 11,222-company ranking |
+| `node scripts/resolve-hq.mjs --status` | none | Resolution progress and spend so far |
+| `node scripts/resolve-hq.mjs --top 500` | ≈ $16 | Head offices for the richest 500 |
+| `node scripts/resolve-hq.mjs --all` | ≈ $360 | Every remaining company |
+| `node scripts/resolve-hq-wikidata.mjs --dry-run` | none | City-level fallback for what Places refused |
+
+Every one of them defaults to the cheap behaviour. `resolve-hq.mjs` stops at
+`--max-lookups 200` unless told otherwise, because the expensive default is the
+one that gets run by accident. All are **resumable** — results are written as
+they land, keyed by ticker, so an interrupt at company 9,000 does not re-buy
+9,000 lookups — and all print the running spend in dollars, so stopping is an
+informed decision rather than a guess.
+
 ---
 
 ## Configuration
@@ -1640,11 +1753,13 @@ GOOGLE_MAPS_API_KEY=  # globe: geocoding, places, weather, air quality
 LUMA_API_KEY=         # globe: events from ONE Luma calendar (Luma Plus)
 AVIATIONSTACK_API_KEY= # globe: real flight routes (free tier ~100-500/month)
 WINDY_WEBCAMS_API_KEY= # globe: ~70k opt-in webcams worldwide (free key)
+PARSE_API_KEY=        # globe: refresh the company ranking (metered, 1 credit/call)
 ```
 
-`GOOGLE_MAPS_API_KEY` is read only in the main process and never crosses the
-IPC bridge — see [Globe](#globe). Without it the globe runs on the bundled
-gazetteer, Nominatim, Wikipedia and USGS, all keyless.
+`GOOGLE_MAPS_API_KEY` and `PARSE_API_KEY` are read only in the main process and
+never cross the IPC bridge — see [Globe](#globe). Without either, the globe runs
+on the bundled gazetteer, Nominatim, Wikipedia, USGS, NASA EONET and the crawled
+company database in `data/`, all keyless and all offline.
 
 ### Connecting Google Calendar
 

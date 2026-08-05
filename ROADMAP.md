@@ -168,6 +168,42 @@ is the weakest part of the system.
 
 ---
 
+## Globe — shipped in 0.10.0, and what it still owes
+
+Recorded here because each of these is a known gap in something already
+shipping, not an idea. What landed: NASA EONET environment events, three
+themes, the 11,222-company ranking crawled to disk with 10,995 validated head
+offices, on-demand office photographs, and OSM campus polygons via Nominatim.
+
+- [ ] **The company ranking goes stale and cannot refresh itself.** Prices and
+      market caps are a snapshot of 5 Aug 2026. The layer is honest about the
+      date, but "honest about being stale" is not the same as current. A
+      refresh path that spends credits deliberately — on the visible page only,
+      not all 113 — is the fix.
+- [ ] **226 companies have no coordinate.** They are correctly absent rather
+      than approximated, and `data/companies-hq.json` records which and why.
+      The 106 name mismatches are the tractable share: a matcher that
+      understands legal suffixes across scripts would recover most of them
+      without loosening the country check that stops the *Reliance* class of
+      error.
+- [ ] **The two company answers do not talk to each other.** The crawled layer
+      knows where NVIDIA is headquartered; the Places search knows what is in
+      an office park in Pune. Neither can answer a question spanning both, and
+      joining them needs an identity link that does not exist yet.
+- [ ] **`data/` is 10 MB in git and grows with every recrawl.** Fine once,
+      wrong as a habit. Either the crawl output moves to a release asset
+      fetched on first run, or the file is stored in a form that diffs — the
+      current single-line JSON replaces wholesale every time.
+- [ ] **The fly-to can still land off-target through the typed-command path.**
+      Called directly it is exact; through the intent router it has been
+      observed 51–68° off. The world-space quaternion fix was necessary and is
+      not sufficient, and the cause is still not found. This is the oldest open
+      globe bug.
+- [ ] **Labels are thinned but not viewport collision-tested,** so an oblique
+      camera angle can still overlap two leader lines.
+
+---
+
 ## Windows 11 platform (2026) — assessed, not adopted
 
 - [ ] **`InputHapticsManager`.** Real, and the natural third channel for the
