@@ -494,16 +494,42 @@ export function createGoogleServices({
      * Filtered by `looksLikeCompany` to keep incorporated entities and drop the
      * hotels, malls and civic buildings a business search picks up around them.
      */
-    async function searchCompanies(query, { pages = 2, lat, lng, radiusM, strict = true, keep = 'company' } = {}) {
+    async function searchCompanies(query, {
+        pages = 2, lat, lng, radiusM, strict = true, keep = 'company', maxKm = null
+    } = {}) {
         if (!bridge) return [];
         const res = await bridge('placesCompanies', { query: String(query || 'companies'), pages, lat, lng, radiusM });
         if (!res?.ok) return [];
         const out = [];
         const seen = new Set();
+        let discarded = 0;
         for (const p of res.data?.places || []) {
             const plat = p?.location?.latitude, plng = p?.location?.longitude;
             const name = p?.displayName?.text;
             if (!Number.isFinite(plat) || !Number.isFinite(plng) || !name) continue;
+
+            /* LOCATION BIAS IS A HINT, NOT A FENCE, and Google means it. A
+               London-biased search for "IT park software technology park"
+               returned 6 of 8 results in India, up to 8,366 km away, because
+               "Software Technology Parks of India" simply outranks anything in
+               London for that string. "tech park" biased to London returned UA
+               Tech Park in Tucson, 8,532 km out.
+
+               Nothing downstream could survive that. The caller frames the
+               camera on the CENTROID of what comes back, so a handful of
+               transcontinental strays drag the view into the North Atlantic and
+               the real London results become a sub-pixel speck off-screen — the
+               count is honest and the map shows nothing.
+
+               Why not `locationRestriction`, which is a real fence: its circle
+               caps at 50 km, so it cannot express "companies in India". The
+               bound therefore lives here, scaled by the caller to the place it
+               actually asked about, and strays are COUNTED rather than silently
+               dropped. */
+            if (Number.isFinite(maxKm) && Number.isFinite(lat) && Number.isFinite(lng)) {
+                if (haversineKm(lat, lng, plat, plng) > maxKm) { discarded++; continue; }
+            }
+
             const key = p.id || name.toLowerCase();
             if (seen.has(key)) continue;      // Google can repeat across pages
             seen.add(key);
@@ -542,7 +568,20 @@ export function createGoogleServices({
                 evidence: cls.evidence
             });
         }
+        if (discarded) {
+            console.log(`[places] ${discarded} result(s) beyond ${Math.round(maxKm)} km of the target discarded`);
+        }
         return out;
+    }
+
+    /* Great-circle distance. Local rather than imported so this module keeps
+       its single dependency on the bridge and stays testable in node. */
+    function haversineKm(lat1, lng1, lat2, lng2) {
+        const R = 6371, toRad = (d) => (d * Math.PI) / 180;
+        const dLat = toRad(lat2 - lat1), dLng = toRad(lng2 - lng1);
+        const s = Math.sin(dLat / 2) ** 2 +
+            Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+        return 2 * R * Math.asin(Math.sqrt(s));
     }
 
     /**
@@ -556,7 +595,7 @@ export function createGoogleServices({
      * around. Two pages rather than three: there are tens of these in a city,
      * not hundreds, and the third page is a billed request for nothing.
      */
-    async function searchTechParks({ lat, lng, radiusM } = {}) {
+    async function searchTechParks({ lat, lng, radiusM, maxKm = null } = {}) {
         /* These are SEARCH TERMS, not classification rules — the distinction
            the old code got wrong. Google needs words to search with, and
            there is no tag-based "list everything tagged industrial_park near
@@ -568,7 +607,7 @@ export function createGoogleServices({
         const queries = ['tech park', 'IT park software technology park'];
         const merged = new Map();
         for (const q of queries) {
-            const found = await searchCompanies(q, { pages: 2, lat, lng, radiusM, keep: 'techpark' })
+            const found = await searchCompanies(q, { pages: 2, lat, lng, radiusM, keep: 'techpark', maxKm })
                 .catch(() => []);
             for (const p of found) merged.set(p.id || p.name.toLowerCase(), p);
         }

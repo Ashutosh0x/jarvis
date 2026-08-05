@@ -537,6 +537,60 @@ check('an empty route yields null', describeRoute({ routes: [] }) === null);
         (await offline.dossier(1, 2)) === null);
 }
 
+/* ------------------------------------------------------- the location fence
+   Google's `locationBias` RANKS, it does not restrict. Measured live: a
+   London-biased search for "IT park software technology park" returned 6 of 8
+   results in India (up to 8,366 km away), and "tech park" returned UA Tech Park
+   in Tucson at 8,532 km. The caller frames the camera on the CENTROID of what
+   comes back, so those strays dragged the view 1,018 km into the North Atlantic
+   and the real results became a sub-pixel speck — the count was honest and the
+   map showed nothing.
+
+   The coordinates below are the real ones from that measurement. */
+{
+    const LONDON = { lat: 51.5074, lng: -0.1278 };
+    const places = [
+        { id: '1', displayName: { text: 'Fintech Technologies Limited' }, location: { latitude: 51.5149, longitude: -0.1236 }, types: ['corporate_office'], websiteUri: 'https://a.example' },
+        { id: '2', displayName: { text: 'Plum Fintech Ltd' }, location: { latitude: 51.5231, longitude: -0.1045 }, types: ['corporate_office'], websiteUri: 'https://b.example' },
+        /* The real strays, at their real distances. */
+        { id: '3', displayName: { text: 'UA Tech Park' }, location: { latitude: 32.2226, longitude: -110.9747 }, types: ['corporate_office'], websiteUri: 'https://c.example' },
+        { id: '4', displayName: { text: 'Software Technology Parks of India' }, location: { latitude: 12.9716, longitude: 77.5946 }, types: ['corporate_office'], websiteUri: 'https://d.example' }
+    ];
+    const svc = createGoogleServices({
+        bridge: async () => ({ ok: true, data: { places } })
+    });
+
+    const unbounded = await svc.searchCompanies('fintech companies', {
+        pages: 1, lat: LONDON.lat, lng: LONDON.lng, radiusM: 25000
+    });
+    check('without a bound the transcontinental strays survive',
+        unbounded.length === 4);
+
+    const bounded = await svc.searchCompanies('fintech companies', {
+        pages: 1, lat: LONDON.lat, lng: LONDON.lng, radiusM: 25000, maxKm: 50
+    });
+    const names = bounded.map((c) => c.name);
+    check('a 50 km bound keeps the London results', bounded.length === 2);
+    check('and drops Tucson, 8,532 km away', !names.includes('UA Tech Park'));
+    check('and drops Bengaluru, 8,366 km away',
+        !names.includes('Software Technology Parks of India'));
+
+    /* The bound must SCALE, or "companies in India" becomes a 50 km circle
+       around a centroid. A country-sized maxKm keeps a country-sized spread. */
+    const countryWide = await svc.searchCompanies('companies', {
+        pages: 1, lat: 22.0, lng: 79.0, radiusM: 50000, maxKm: 3000
+    });
+    check('a country-scale bound still reaches across the country',
+        countryWide.some((c) => c.name === 'Software Technology Parks of India'));
+
+    /* No bound at all must stay backwards compatible — some callers legitimately
+       want whatever Google ranked highest. */
+    const nullBound = await svc.searchCompanies('companies', {
+        pages: 1, lat: LONDON.lat, lng: LONDON.lng, radiusM: 25000, maxKm: null
+    });
+    check('an absent bound is not treated as zero', nullBound.length === 4);
+}
+
 /* Caching: the same dossier twice must cost one round trip. */
 {
     let calls = 0;

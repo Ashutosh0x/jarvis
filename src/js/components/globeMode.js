@@ -778,13 +778,21 @@ export async function createGlobeMode({ scene, camera, renderer }) {
            Tech parks ride alongside as their own query — Google does not return
            them for "technology companies", and they are what a city's tech
            industry is physically arranged around. */
+        /* HOW FAR IS STILL "HERE". The bias above only ranks; this bounds. It
+           is derived from the place's own extent so it means the same thing at
+           every scale — a city keeps a metro's worth of results, a country
+           keeps the country — with a 50 km floor so a point-resolved city from
+           the offline gazetteer (which carries no viewport) still gets its
+           suburbs. Without it, "fintech companies in London" framed itself on
+           tech parks in Arizona, Georgia and India. */
+        const maxKm = Number.isFinite(place.spanKm) ? Math.max(50, place.spanKm) : 50;
         const [, companies, parks] = await Promise.all([
             globe.flyTo(place.lat, place.lng, { distance: approachDistance, ms: 1400 }),
             google.searchCompanies(query, {
-                pages: 3, lat: place.lat, lng: place.lng, radiusM: biasRadiusM
+                pages: 3, lat: place.lat, lng: place.lng, radiusM: biasRadiusM, maxKm
             }).catch(() => []),
             google.searchTechParks({
-                lat: place.lat, lng: place.lng, radiusM: biasRadiusM
+                lat: place.lat, lng: place.lng, radiusM: biasRadiusM, maxKm
             }).catch(() => [])
         ]);
 
